@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/dualeai/c2pa-text/security/advisories/new
+    about: Do NOT open a public issue. Report privately; see SECURITY.md.
+  - name: Specification question
+    url: https://github.com/dualeai/c2pa-text/blob/main/docs/deviations.md
+    about: Where C2PA 2.4 is ambiguous and how we read it — check here first.

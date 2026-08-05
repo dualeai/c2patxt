@@ -1,0 +1,157 @@
+name: CodSpeed
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  # CodSpeed dispatches this to backfill a baseline over historical commits when a
+  # benchmark has no history yet. It is not a substitute for the push trigger above:
+  # a pull request is compared against the run for its BASE commit, so if nothing
+  # benchmarks the default branch, every pull request has nothing to compare to.
+  workflow_dispatch:
+
+# Deny by default, as in test.yml. A compromised third-party action cannot scrape a
+# broad GITHUB_TOKEN out of runner memory if the token has no scopes to begin with.
+permissions: {}
+
+concurrency:
+  group: codspeed-${{ github.ref }}
+  # Superseded PR runs are cancelled; runs on main and develop are NOT. A cancelled
+  # run on the default branch leaves that commit with no measurement, and every pull
+  # request based on it then reports "no baseline" rather than a comparison. This is
+  # the one place the test.yml pattern does not transfer.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  benchmarks:
+    name: benchmarks
+    # Matches the Linux leg of the test matrix. Treat this as a pin rather than a
+    # preference: a measurement is only comparable with measurements taken on the same
+    # OS and architecture, so changing it later restarts every benchmark's history
+    # instead of continuing it.
+    #
+    # arm64 IS packaged for: memtrack ships memtrack-aarch64-unknown-linux-gnu and the
+    # runner carries a pinned (Ubuntu2404, Arm64) valgrind sha256. An earlier comment
+    # here called arm64 "unproven upstream", which conflated "CodSpeed's own CI does not
+    # exercise it" with "it is not built for it". Prior art also exists on a sibling
+    # repository, dualeai/hpke-http -- though under action v4.12.1 on Python 3.13 where
+    # this pins v5.0.2 on 3.12, and that repository is PUBLIC where this is INTERNAL, so
+    # it is prior art for the runner/OS/mode combination and not for this configuration.
+    #
+    # If the memory instrument ever fails here, drop to `mode: simulation` rather than
+    # moving to x64: changing architecture discards every benchmark's history, and x64
+    # would not have been the reason it failed.
+    runs-on: ubuntu-24.04-arm
+    # Higher than the 15 the test job uses, for two compounding reasons: simulation
+    # runs the suite under a CPU simulator far slower than native, and it runs once
+    # per instrument, so `simulation,memory` is two passes. `make test-bench` also
+    # blanks addopts, which discards the --timeout=30 that bounds a hung test
+    # everywhere else -- this number is the only thing left between a hang and the
+    # six-hour default.
+    timeout-minutes: 30
+    permissions:
+      contents: read # For actions/checkout.
+      # OIDC upload. This repository is INTERNAL, so CodSpeed's tokenless path -- which
+      # is public-repositories-only -- is not available, and the alternative is a
+      # long-lived CODSPEED_TOKEN secret. Scoped to this job rather than the workflow:
+      # GitHub does not restrict the OIDC permission by audience, so granting it at
+      # workflow level would let every other job mint tokens for unrelated services.
+      id-token: write
+
+    env:
+      # Abort a sync BEFORE any install-time code executes if a package is flagged.
+      UV_MALWARE_CHECK: "1"
+      # EMPTIED DELIBERATELY. pytest prepends PYTEST_ADDOPTS to argv independently of
+      # the ini option, so `-o "addopts="` in the Makefile CANNOT clear it. Verified
+      # against the command the Makefile actually runs:
+      #
+      #   PYTEST_ADDOPTS="--timeout=1" ... --codspeed --no-cov -p no:xdist -o "addopts="
+      #   E  Failed: Timeout (>1.0s) from pytest-timeout.
+      #
+      # so the variable reaches the measured region. Nothing sets it today; an
+      # organisation-level default or one careless edit would, silently.
+      #
+      # THE EXAMPLE HERE USED TO BE `--cov=c2patxt`, AND IT DID NOT REPRODUCE: the
+      # Makefile also passes `--no-cov`, which wins, so coverage does NOT come back
+      # (measured: no coverage table, 11 tests collected). Coverage was the strongest
+      # case for this guard and it was the one case the guard did not need. Anything
+      # that changes what runs inside the timing region still does.
+      PYTEST_ADDOPTS: ""
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          # Caching is on here and off in release.yml, and the difference is deliberate:
+          # nothing this job produces is published or attested, so a poisoned cache
+          # entry costs a wrong number rather than a signed compromised artefact.
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        # ONE version, fixed. The interpreter moves the instruction count, and CodSpeed
+        # cannot aggregate a benchmark that runs more than once per run -- so the
+        # 5-version matrix in test.yml would produce five conflicting histories rather
+        # than five data points.
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: make install-deps
+
+      - name: Run benchmarks
+        # runner-version is deliberately NOT set, so the action uses the version it
+        # pins in .codspeed-runner-version and verifies against its checked-in
+        # SHA-256 manifest. (An earlier comment here claimed that naming ANY version
+        # opts out of that check. It does not: a plain N.N.N is classified as a
+        # release and takes the same verified branch. Verification is skipped only for
+        # `latest`, prereleases, `branch:` and `rev:`.) Omitting it is still right --
+        # it is one fewer thing to keep in step with the pinned action SHA.
+        uses: CodSpeedHQ/action@0ca9cbbf4623b599a6c3ed4fc8a922942705d9f1 # v5.0.2
+        with:
+          # WHAT THE SECOND PASS BUYS, AND WHAT IS NOT ESTABLISHED ABOUT IT. For most
+          # benchmarks the peak is one dominant str/bytes equal to the pinned input, so
+          # the memory leg is an extra-full-copy detector and reports a flat constant
+          # otherwise. The one benchmark with real movement is duplicate-actions: its
+          # Python-level peak goes 1.77 MiB -> 38.22 MiB by tracemalloc when both halves
+          # of its fix are removed, where every other benchmark moves at most 0.1%.
+          #
+          # THAT IS A PYTHON-LEVEL MEASUREMENT AND WE HAVE NOT SHOWN memtrack REPORTS IT.
+          # Two reasons to doubt it, both traced to pinned upstream source rather than
+          # inferred. First, memtrack attaches to libc malloc/calloc/realloc/free plus
+          # mmap/munmap/brk; the simulation executor forces PYTHONMALLOC=malloc but the
+          # memory executor does not, so this pass runs under pymalloc and every object
+          # below 512 B is served from an arena that never reaches a hooked symbol.
+          # Second, pytest-codspeed's AnalysisInstrument calls the benchmark once
+          # unmeasured to warm CPython's perf map and measures the SECOND call: locally,
+          # peak RSS growth on this input is 1.64 MiB on the first call and 0.05 MiB on
+          # the second, a 33x difference on the call that counts.
+          #
+          # This comment previously stated "0.94 MiB -> 37.4 MiB (41x)" while the
+          # benchmark's own docstring said 38.63 MiB -- 39.8x and 41.1x from the same
+          # premise, neither recomputed by anything.
+          #
+          # THE PROPERTY NO LONGER RIDES ON THIS MODE.
+          # tests/test_regressions.py::test_a_repeated_actions_link_allocates_a_bounded_
+          # multiple_of_its_input asserts the peak as a RATIO of integer byte counts --
+          # 3.35x pristine against 72.17x with the defect restored, bounded at 5x -- so
+          # it holds on any machine with no baseline and no threshold to tune. KEEP THIS
+          # MODE ONLY WHILE SOMEONE CAN POINT AT A CI RUN WHERE THE MEMORY LEG MOVED.
+          # If nobody can, drop to `mode: simulation` and delete this block: the
+          # assertion is what carries the guarantee.
+          #
+          # AND IT IS NOT FREE TO FAIL. The runner loops over modes and aborts the whole
+          # run on the first error, before uploading -- so a memory-pass failure discards
+          # the simulation results too. On a push to main that leaves the commit with no
+          # measurement at all, and every PR based on it then reports "no baseline".
+          mode: simulation,memory
+          # make test-bench, not the pytest line it wraps. The -o "addopts=" that keeps
+          # coverage's trace hook out of the instruction count lives in the Makefile
+          # beside the reason it exists; repeating it here is how the two drift apart.
+          run: make test-bench

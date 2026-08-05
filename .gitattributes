@@ -1,0 +1,4 @@
+# Vector files carry byte offsets and byte-exact payloads; CRLF translation would
+# silently corrupt them. mt4.cbor in particular contains 0x0A/0x0D with no NUL, so
+# git classifies it as text and would rewrite it on a Windows checkout.
+tests/vectors/** -text
