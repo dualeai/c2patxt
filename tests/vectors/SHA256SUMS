@@ -14,11 +14,15 @@ a0791b06dda96c5b6fb8489536b9fafebfbb2fa910a9394b82f84a1421d8d615  ./cbor/mt5.cbo
 015bee0b85efb857a17ea377ec3304c9b12c2052422761d7563ef28f6285cafb  ./cbor/mt5.edn
 d0b173059ee943047752e30d734c71471fcf1d55f13072c43a2aca365c795a32  ./cbor/mt6.cbor
 25ffcb8bcf18bbb61af3078585052e1dcad75a60aad3867d7fbbf3a04cd3ec9a  ./cbor/mt6.edn
-37ae2d0c2528cfe42c13ae8443393ed1e5b4021fdc0cffff6d433202ca84d51c  ./cbor/PROVENANCE.md
+7bdc2fa7dd23b5c11765fecf6eeb201a4219e85f22dfd00ae029080acc0af18e  ./cbor/mt7-float.cbor
+87e17eb74e43254490c5b02542adf0c9ba3e4f0e2c6d44276c79326d25d1fd3c  ./cbor/mt7-float.edn
+4e2aabbbfd4524a7d87c0e916366a1c12301b67188bfd715bd3ed0d9ad8c08a3  ./cbor/mt7-simple.cbor
+0d9724573caaabaacfcec40feb5fbc0311f3ebb36d299a4938fa261ec3740ed5  ./cbor/mt7-simple.edn
+49edb16b6349a12b1f7f9e10c67a95bebab0503ca648a3a132abd417baf66849  ./cbor/PROVENANCE.md
 e679c0be5ed4e9e7fcc5664ba2b64f2a662bc0f3aba6fec189d4fb408103a912  ./cose/eddsa-01.json
 fc5129133b9c7a892f4fd68b603828552a0e94750b54ce9fd666f2a853b4d543  ./cose/eddsa-sig-01.json
 da1a720b57c68ad185483b4c404facf21df3ecd3739b62d21427f739399cdbb9  ./cose/eddsa-sig-02.json
-87dd9763f7f1d0ba1b9f7169fd6e50a96938bbdf21432c5145e8c92ed7cb6452  ./cose/PROVENANCE.md
+87ef7aa073aea36c8972b47af21849de2f56c4d22948e9b0f14036b06afc90ac  ./cose/PROVENANCE.md
 cb4cad0b8d68bb33e8db82bf33e0aca7d1bbfc03e486752dd87abff6850fa6d1  ./cose/sign-fail-01.json
 ae40d945b904b92b856b26db3c1c81aa57169b363667283fcc822c8aa06bf069  ./cose/sign-fail-02.json
 0f0f2eedaa4274bdb4934bc19df53b78d85820dee29c1dea0cf99e06daf3a5f5  ./cose/sign-fail-03.json
@@ -30,6 +34,7 @@ d3b0fb02f6ef8cfa2b69f22c4467d437f58da8943af4d5439225fb67641f6fe8  ./cose/sign-pa
 509d60bde2cba0b8ef1e4b06b85b5d00fea4e5ced2026e607fa76f99b83eb7f2  ./cose/sign-pass-03.json
 ccea024c71136a7e7b1e75f2e685123305d28061c7508192133f329f749e6f3c  ./LICENSE
 a3d2bd57080598261e75cd7cf015cf990b019d7afccd9df7a318e55192311a4a  ./loader.py
-9f64695370ed6b1b61763622f34ff255dd60b5413c3a90168e69489648de70a8  ./README.md
+961404e4453f24807be22c6b06d16e2a4db2dfdbcf66dfb01023237e5dcf1470  ./README.md
 2d1dcfa8eae018b320856a5cd10837a044c09a299e1f18d994044206e3e42ffc  ./third_party/encypher-golden-vectors.json
+168ce288f6f0b3201099a8f6ae619b2cd183c1a210b02edd05ce21fe6a486986  ./third_party/PROVENANCE.md
 19840d053148924115ab189ebaedee392d9b7c0491f369f5d1b72b59b3deba6f  ./third_party/writerslogic-a8-variation-selector.json

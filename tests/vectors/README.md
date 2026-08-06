@@ -22,9 +22,15 @@ corrupted by editors, terminals, diff viewers and review tools. Unicode's own
 
 ## Licence
 
-**CC0 1.0** — see `LICENSE` in this directory. Deliberately more permissive than the
-Apache-2.0 package around it, so any implementation under any licence can vendor
-these without an attribution obligation.
+**The conformance file is CC0 1.0** — `A8ConformanceTest-*.txt` and `SHA256SUMS`, see
+`LICENSE` in this directory. Deliberately more permissive than the Apache-2.0 package
+around it, so any implementation under any licence can vendor it without an
+attribution obligation.
+
+**The vendored corpora are not.** `cbor/` is BSD-2-Clause and `cose/` is Unlicense,
+neither carrying an attribution obligation; `third_party/` is MIT and Apache-2.0, which
+do. Each directory's `PROVENANCE.md` carries its licence and its upstream commit. Take
+the conformance file alone if you want the unencumbered set.
 
 ## Integrity
 
