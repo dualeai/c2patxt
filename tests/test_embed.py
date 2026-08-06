@@ -260,7 +260,7 @@ def test_the_manifest_carries_no_operator_identity(signer: Signer) -> None:
 
 
 def test_the_published_size_figures_are_still_true(signer: Signer) -> None:
-    """The README, CHANGELOG and platform handoff all publish size numbers.
+    """The README, the release notes and the platform handoff all publish size numbers.
 
     They went stale once, silently: adding the `c2pa.metadata` assertion required by
     the text conformance rubric grew the manifest by ~570 bytes, and three documents

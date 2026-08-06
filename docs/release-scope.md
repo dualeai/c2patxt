@@ -81,7 +81,7 @@ decisions.
 | Memo says | We ship | Why |
 | --- | --- | --- |
 | §2 distribution `duale-c2pa-text`, import `duale_c2pa_text` | `c2patxt` | Renamed on the owner's instruction. The wrapper's own magic number is ASCII `C2PATXT\0`, so the name is the format's. |
-| §2 "a cryptography library and a CBOR library" | `cryptography` only | C2PA 10.1 mandates RFC 8949 §4.2.1 bytewise map ordering; `cbor2`'s `canonical=True` implements §4.2.3 length-first. A dependency that cannot express the required encoding is not a shortcut. See the CHANGELOG. |
+| §2 "a cryptography library and a CBOR library" | `cryptography` only | C2PA 10.1 mandates RFC 8949 §4.2.1 bytewise map ordering; `cbor2`'s `canonical=True` implements §4.2.3 length-first. A dependency that cannot express the required encoding is not a shortcut. |
 | §3 `embed(text, manifest)` | `embed(text, signer, disclosure)` | A caller who must construct a `ManifestStore` must know C2PA. `ManifestStore` is now output-only. |
 | §3 `Verdict` with four booleans, and "`if verify(text):` should get something useful" | four-state `Provenance`; `__bool__` **raises** | Any single boolean collapses `UNMARKED` and `INVALID`, which renders unmarked text as forged. See `verdict.py`. |
 | §5 "ship our published root **in the package**" | **zero** trust anchors | A bundled root makes `TRUSTED` reachable without the caller ever choosing whom to trust. Trust is a caller-supplied seam. |

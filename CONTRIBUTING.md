@@ -100,12 +100,18 @@ Publishing is triggered by a **GitHub Release**, not by pushing a tag. `git push
 runs nothing: the workflow's `push` trigger filters on `branches: [main]`, and a branch
 filter excludes tag pushes.
 
-1. Land everything on `main`, **including the `CHANGELOG.md` edit** — move the
-   unreleased section under the new version. It is a change like any other and has to
-   be on `main` before there is a commit worth tagging.
+1. Land everything on `main`. There is no changelog file to edit: **the release notes
+   are the changelog**, written on the Release itself, so nothing about them can go
+   stale in a checkout.
 2. Tag that commit `vX.Y.Z` and push the tag. Nothing runs yet; the tag exists so the
    next step can point at it, and so `cicd/version.sh` can find it.
-3. Create a GitHub Release for that tag. **This is the step that publishes.**
+3. Create a GitHub Release for that tag. **This is the step that publishes.** Write the
+   notes there, and say what was evaluated and rejected as well as what shipped — a
+   release nobody can read the reasoning for gets the same question asked again.
+
+The workflow file is read from the **tagged commit**, not from `main`. A fix landed on
+`main` after the tag does nothing for that release, and re-running the failed run
+re-reads the same broken file: move the tag, or cut the next version.
 
 What then happens. Every job needs `build`, and the publish chain is sequential:
 
