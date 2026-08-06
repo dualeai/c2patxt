@@ -68,8 +68,12 @@ $ gh api repos/CodSpeedHQ/action/commits/v5.0.2 --jq '.sha'
 ```
 
 `commits/<tag>` resolves both kinds. `git ls-remote <repo> refs/tags/<tag>^{}` also
-works. zizmor's `unpinned-uses` audit catches a tag REFERENCE but cannot catch a
-syntactically valid SHA that happens to be a tag object, so this one is on the author.
+works.
+
+**Nothing in CI checks this.** A `zizmor` job ran `unpinned-uses` here until 2026-08-06,
+when it was removed — the action is not on the enterprise allowlist. It would not have
+caught the subtle half anyway: a SHA that is really a tag OBJECT is syntactically a
+valid pin. Both halves are now on the author, enforced by review.
 
 A tag is mutable; a SHA is not. For a package whose whole argument is supply-chain
 verifiability, a mutable reference in the release path would undercut the claim.
