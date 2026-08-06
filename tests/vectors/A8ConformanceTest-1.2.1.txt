@@ -1,4 +1,4 @@
-# A8ConformanceTest-1.2.0.txt
+# A8ConformanceTest-1.2.1.txt
 # Date: 2026-08-06
 # C2PA Technical Specification 2.4 (2026-04-01), HTML build c7e55d5a,
 # Annex A.8 "Embedding Manifests into Unstructured Text".
@@ -138,7 +138,7 @@ X0003;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a0
 X0004;extract;446f632e;;;NONE;no-wrapper # no U+FEFF present; absence is not a failure
 #
 
-@Part0b # Embed: Unicode coverage (memo 6.1 minimum set)
+@Part0b # Embed: Unicode coverage -- combining marks, astral planes, CJK, RTL
 E0002;embed;63616665cc8120f09f9880;deadbeef;63616665cc8120f09f9880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884f3a0878ef3a0869df3a086aef3a0879f;OK;combining,astral,nfd-input # NFD "cafe"+U+0301 plus U+1F600. The WIRE PRIMITIVE does not normalize: A.8.6.1 requires NFC for HASHING, not for wrapper placement. An SDK's public embed() may still normalize before marking, and ours does -- see rule 2
 E0003;embed;e6bca2e5ad97e38386e382ade382b9e38388;deadbeef;e6bca2e5ad97e38386e382ade382b9e38388efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884f3a0878ef3a0869df3a086aef3a0879f;OK;cjk # CJK ideographs and katakana
 E0004;embed;d985d8b1d8add8a8d8a720d7a9d79cd795d79d;deadbeef;d985d8b1d8add8a8d8a720d7a9d79cd795d79defbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884f3a0878ef3a0869df3a086aef3a0879f;OK;rtl # Arabic and Hebrew; bidi display order must not affect byte order

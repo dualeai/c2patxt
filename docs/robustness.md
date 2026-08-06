@@ -5,7 +5,7 @@ Measured, not estimated. Reproduce with:
 ```console
 $ curl -sSL -o train.jsonl \
     "https://zenodo.org/records/18620130/files/train.jsonl?download=1"
-$ md5sum train.jsonl   # 777a1f5376eb6e0d5b54db2acff8c3ff
+$ md5 -q train.jsonl   # 777a1f5376eb6e0d5b54db2acff8c3ff  (md5sum on Linux)
 $ uv run python -m tools.robustness train.jsonl
 ```
 
@@ -27,7 +27,7 @@ Measured 2026-08-05.
 | typos in 5% of tokens | 0.000 | 1.000 |
 | paraphrase | 0.000 | 1.000 |
 | translate round-trip | 0.000 | 1.000 |
-| markdown round-trip (reflow) | 0.500 | 1.000 |
+| whitespace collapse (NBSP folding) | 0.500 | 1.000 |
 
 The two bolded cells are the only ones that gate a build. Everything else is a
 measurement and gates nothing.
@@ -40,13 +40,14 @@ that unless both columns are shown.
 - **Mark still found** asks whether the variation-selector run survived.
 - **Still verifies** asks whether the hard binding held.
 
-The reflow row is the case that makes the distinction concrete: a `pandoc md → html →
-md` pass, or an email MIME round trip, leaves every selector intact and reflows the
-visible text. The mark is still there, and where the bytes it covers changed the binding
-correctly fails.
+The **whitespace collapse (NBSP folding)** row is where the distinction bites, and it
+is also the row whose name had to change. It was added to model a transform that leaves
+every selector intact while rewriting the visible text — a `pandoc md → html → md` pass,
+or an email MIME round trip — so the mark is still found and the binding correctly fails.
 
-**It reads 0.500, and the row does not measure reflow at all.** Measured against the
-corpus above:
+**On this corpus it models no such thing.** It reads 0.500, and what it measures is
+whitespace collapse and nothing else, which is what it is now named for. Measured
+against the corpus above:
 
 | | count |
 | --- | ---: |
@@ -55,12 +56,13 @@ corpus above:
 | containing U+00A0 | **150** (444 occurrences) |
 | altered by `" ".join(text.split())` | **150** |
 
-`tools/robustness.py:149` implements reflow as `" ".join(visible.split())`. Every
+`tools/robustness.py:157` implements the transform as `" ".join(visible.split())`. Every
 document in this corpus is already a single line, so there is no line structure to
 reflow — and `str.split()` splits on U+00A0 as well as ASCII whitespace. The 150
-documents that fail are exactly the 150 containing a non-breaking space. **The row
-measures NBSP folding**, and its label is wrong for this corpus. A transform that
-genuinely rewrapped lines would change nothing here and the row would read 1.000.
+documents that fail are exactly the 150 containing a non-breaking space, which is what
+the row is named for. It was once labelled "markdown round-trip (reflow)", and that
+label was wrong for this corpus: a transform that genuinely rewrapped lines would change
+nothing here and the row would read 1.000.
 
 ## Why almost every row is 0.000, and why that is not a defect
 
@@ -68,7 +70,7 @@ genuinely rewrapped lines would change nothing here and the row would read 1.000
 bytes. Any edit to the visible text invalidates it — that is the entire mechanism, and
 a row that survived paraphrase would mean the binding was not doing its job.
 
-EU AI Act Article 50(2) requires marking to be effective "to the extent this is
+EU AI Act Article 50(2) requires marking to be effective "as far as this is
 technically feasible", and a hash binding is the technically feasible option that
 gives a third party a *verifiable* answer rather than a probabilistic one. A
 statistical watermark survives paraphrase and cannot tell you who generated the text

@@ -86,7 +86,8 @@ download-vectors:
 # COSE_Sign1 examples from the COSE working group. Unlicense (public domain).
 # eddsa-* use Ed25519 (alg -8), the only algorithm THIS PACKAGE accepts. 13.2.1's
 # list is wider; within EdDSA it permits no instance but Ed25519.
-# sign1-* add three passing and six FAILING cases.
+# sign1-tests/ adds three passing and six FAILING cases, flattened to sign-pass-* and
+# sign-fail-* on disk. See tests/vectors/cose/PROVENANCE.md.
 download-vectors-cose:
 	@echo "Downloading COSE_Sign1 vectors (cose-wg/Examples, Unlicense)..."
 	@mkdir -p $(vectors_dir)/cose

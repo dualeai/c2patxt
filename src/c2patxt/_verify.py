@@ -165,6 +165,12 @@ def _hash_binding_bytes(encoded: bytes, start: int, length: int) -> bytes:
     ("Normalization") in practice: the hash covers the NFC form of the visible text
     with the wrapper's byte range removed, and nothing else.
 
+    THIS ORDER IS CORRECT AND MUST NOT BE "FIXED" to match A.8.7.3. A.8.5 designates
+    15.12.1.3.1 as the normative procedure and A.8.7.3 contradicts it; the module
+    docstring works the contradiction through with a counterexample. Both other public
+    A.8 implementations chose this order too. It has very nearly been inverted once, on
+    the strength of reading A.8.7.3 alone.
+
     Takes the document ALREADY ENCODED. Taking the ``str`` and encoding it here makes
     ``_binding_status`` -- which needs the encoded length two lines earlier for the
     suffix rule -- encode the same document twice and throw one result away, 10-12% of
@@ -207,7 +213,11 @@ def _single_exclusion(hash_data: dict[str, CborValue]) -> tuple[int, int] | None
 
 
 def _compare_digest(encoded: bytes, algorithm: str, start: int, length: int, expected: bytes) -> StatusCode:
-    """Hash the text with the wrapper removed and compare (15.12.1.3.1 steps 5-9)."""
+    """Hash the text with the wrapper removed and compare.
+
+    15.12.1.3.1 steps 5-9, which is A.8.6.1 ("Validating a data hash") in practice:
+    A.8.6.1 states the requirement and delegates the procedure to the validation clause.
+    """
     try:
         digest = HASH_ALGORITHMS[algorithm](_hash_binding_bytes(encoded, start, length)).digest()
     except UnicodeDecodeError:
@@ -596,6 +606,14 @@ def _hashed_uri_list(raw: CborValue) -> list[dict[str, CborValue]] | None:
         # CBOR permits int and bytes map keys; a hashed-uri-map uses text keys, and a
         # non-text key is not addressable by name. Narrowing here rather than at each
         # lookup keeps the attacker-controlled shape checked in exactly one place.
+        #
+        # HELD BY tests/test_negative.py, the `_hashed_uri_list` case of
+        # test_attacker_cbor_of_the_wrong_shape_narrows_rather_than_raising: an entry
+        # keyed by an integer must come back EMPTY, not carrying the integer key. A
+        # mutation audit once filed this as a provably-equivalent mutant and a comment
+        # here said so; dropping the narrowing fails that test, which has existed since
+        # the initial commit. Asserting that nothing holds a line, without running the
+        # suite against its removal, is how a live guard gets documented as untestable.
         links.append({key: value for key, value in entry.items() if isinstance(key, str)})
     return links
 

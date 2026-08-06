@@ -9,13 +9,38 @@ listed below is one you can open in the spec and compare against the code. If yo
 find a clause listed here that we do not actually implement, that is a bug in this
 file and we want the report.
 
-**Nothing automated checks it.** Grading prose is not the test suite's job, so the
-tables below are a claim maintained by hand. Read them as one — and report a row you
-cannot find in the code.
+**Two things about the tables are checked, and no more.**
+`tests/test_compatibility.py` holds that every row's "Where" column names a file citing
+that clause, and that the CORE clause table is in clause order — the shorter A.8 table
+above it is not order-checked. Neither says the clause is
+correctly implemented, and nothing checks the reverse direction — a clause cited in
+`src/` and missing from these tables goes unnoticed. The tables are a claim maintained
+by hand; report a row you cannot find in the code.
 
 For the places where the specification is ambiguous or self-contradictory and we had
 to choose, see [deviations.md](deviations.md). This file says *what* we implement;
 that one says *how we read it where it was unclear*.
+
+## Why this exists: EU AI Act Article 50(2)
+
+Article 50(2) obliges providers of AI systems generating synthetic text to mark it in a
+machine-readable form and make it detectable as artificially generated. The Commission's
+Guidelines on Article 50 (C(2026) 5054 final, para 76) say a provider "must rely on
+publicly-available industry standard detection solutions that allow any third party to
+implement detection". C2PA 2.4 Annex A.8 is such a standard for text, and this package
+implements it — which is what the tables below record, clause by clause.
+
+**Those Guidelines do not bind.** They are issued under Art. 96, and the accompanying
+Communication says they apply only once adopted in all language versions, which has not
+happened. Read them as the Commission's stated expectation. No standard is mandated: the
+Code of Practice on Transparency of AI-generated Content (10 June 2026) names none, and
+mentions neither C2PA nor Content Credentials.
+
+What that leaves undecided is most of it. Whether a given deployment satisfies Article
+50(2) depends on the system, the exemptions in the Article's own text, and advice this
+package cannot give. Marking is one obligation among several in Article 50, and nothing
+here speaks to the others. The claim in this document is narrow on purpose: it says what
+of A.8 is implemented and what is excluded, and nothing about anyone's compliance.
 
 ## Why the claim cites a build hash and not just "2.4"
 
@@ -27,8 +52,13 @@ unverifiable. The facts, each independently checked:
 - **2.4 is published,** as HTML and as a PDF (8,139,117 bytes, last modified
   2026-04-23; page 1 reads "2.4, 2026-04-01"). But 2.4 does not appear in the
   specification site's own Download navigation.
-- **Eleven distinct 2.4 HTML builds exist.** We verified against build `c7e55d5a`
-  (2026-04-23).
+- **Several distinct 2.4 HTML builds exist**, all published under the same version
+  number. We verified against build `c7e55d5a`
+  (2026-04-23). The build hash is a commit in `c2pa-org/specifications`, which is what
+  publishes the HTML; the hash is not recorded in the HTML itself. Resolve it with
+  `gh api repos/c2pa-org/specifications/commits/c7e55d5a`, which returns
+  `c7e55d5a3c1e758eeabad058e501fadbb8cfe777`, committed 2026-04-23T17:38:51Z — three
+  minutes before the published PDF's last-modified time.
 - **Annex A.8 changed exactly once across those builds:** commit `666bdf8f`
   (2026-04-01) added the sentence "It remains under review and may be subject to
   change based on implementation feedback and interoperability testing." Clause
@@ -37,9 +67,8 @@ unverifiable. The facts, each independently checked:
   numbers, the two texts are identical apart from that added sentence. Citing the 2.3
   PDF would therefore give a reader the wrong clause letter for the same content.
 
-Naming a version alone would leave you unable to tell which of eleven documents we
-built against. Naming the build makes the claim falsifiable, which is the only kind
-worth making.
+Naming a version alone would leave you unable to tell which of those documents we
+built against. Naming the build makes the claim falsifiable.
 
 ## Two different version numbers
 
@@ -57,17 +86,18 @@ the wrapper version — so neither number predicts the other.
 
 ## What this claim covers
 
-Clauses implemented, with the 2.4 titles as published:
+Clauses implemented. The Title column is a gloss of what we take from each clause, not
+the published heading — open the clause number to read that.
 
 ### Annex A.8 — text marking
 
 | Clause | Title | Where |
 | --- | --- | --- |
-| A.8.2.1 | Wrapper quantity — "Zero or one" per asset | `_verify.py`, `_locate.py` |
+| A.8.2.1 | Wrapper quantity — "Zero or one" per asset | `_verify.py` |
 | A.8.2.2 | The C2PATextManifestWrapper Structure — Syntax | `constants.py`, `_selectors.py` |
 | A.8.3.1 | Byte-to-Variation-Selector Conversion | `_selectors.py` |
 | A.8.3.2 | Variation-Selector-to-Byte Conversion | `_selectors.py` |
-| A.8.4.1 | Placement Rules | `_embed.py` |
+| A.8.4.1 | Placement Rules | `_embed.py`, `_selectors.py`, `_locate.py`, `constants.py` |
 | A.8.4.2 | Detection Algorithm | `_locate.py` |
 | A.8.5 | Content Binding with Data Hash | `_verify.py` |
 | A.8.6.1 | Validating a data hash | `_verify.py` |
@@ -79,7 +109,11 @@ Clauses implemented, with the 2.4 titles as published:
 
 | Clause | Title | Where |
 | --- | --- | --- |
-| 6.6 | Assertion salts (`c2sh`) — read tolerance only, never emitted | `_jumbf.py` |
+| 5.1 | Versioning — `specVersion` declaration, and deprecation semantics: a deprecated construct may be read, never written | `manifest.py`, `_verify.py` |
+| 6.2.2 | Namespacing of entity-specific values | `signing.py` |
+| 6.4 | Multiple Instances — the `__N` label convention, honoured when counting | `_verify.py` |
+| 6.6 | Assertion salts (`c2sh`) — read tolerance only, never emitted | `_jumbf.py`, `_embed.py` |
+| 6.9 | Date/time values as CBOR tag 0 (`tdate`) | `_cbor.py`, `manifest.py` |
 | 8.1 | Unique Identifiers — the `urn:c2pa:` ABNF for manifest labels | `manifest.py` |
 | 8.4.2.1 | `self#jumbf` URIs — manifest-relative and store-relative forms | `_verify.py` |
 | 8.4.2.3 | Hashing JUMBF Boxes — what every hashed URI covers | `_extract.py`, `manifest.py`, `_verify.py` |
@@ -89,50 +123,46 @@ Clauses implemented, with the 2.4 titles as published:
 | 10.2.3.2 | Generator Info Map — `name`, optional `version`, `specVersion` | `manifest.py` |
 | 10.3.2.4 | Signing a Claim | `_cose.py` |
 | 10.4 | Multiple Step Processing | `_fixpoint.py` |
-| 11.1.2 | Processing Rules (unknown-UUID skip) | `_jumbf.py`, `_extract.py` |
+| 11.1.2 | Processing Rules (unknown-UUID skip) | `_extract.py` |
 | 11.1.4 | C2PA Box details — labels, toggles, boxes, assertion content types | `_jumbf.py`, `manifest.py`, `_extract.py` |
 | 11.2.2 | Standard Manifests — read under `c2ma` or `c2md`; see note | `_extract.py` |
-| 14.3 | Validation states — *Valid* (14.3.5) and *Trusted* (14.3.6) | `verdict.py`, `_verify.py` |
 | 13.1 | Hashing | `manifest.py` (`HASH_ALGORITHMS`) |
 | 13.2.1 | Signature Algorithms | `signing.py` (Ed25519 only) |
 | 13.2.2 | Use of COSE | `_cose.py` |
 | 13.2.3 | Computing the Signature | `_cose.py` (`Sig_structure`, `external_aad`) |
 | 14.2 | Identity of Signers | `signing.py` |
+| 14.3 | Validation states — *Valid* (14.3.5) and *Trusted* (14.3.6) | `verdict.py`, `_verify.py` |
 | 14.4.1 | `c2pa-kp-claimSigning` EKU (OID 1.3.6.1.4.1.62558.2.1) — exported for producers; NOT required on read, see note | `signing.py` |
 | 14.5 | X.509 Certificates — `x5chain` at label 33 *and* the string label; protected bucket only, see [deviations](deviations.md) | `_cose.py` |
 | 14.5.1.1 | Certificate Profiles — see note for the two rules that cannot apply | `trust.py` |
-| 5.1 | Versioning — `specVersion` declaration, and deprecation semantics: a deprecated construct may be read, never written | `manifest.py`, `_verify.py` |
-| 6.2.2 | Namespacing of entity-specific values | `signing.py` |
-| 6.4 | Multiple Instances — the `__N` label convention, honoured when counting | `_verify.py` |
 | 15.1.2 | Validation phases are "listed in no particular order" | `_verify.py` |
 | 15.2.1 | Status-code enumeration | `status.py` |
 | 15.2.2 | Success and informational status codes | `status.py` |
+| 15.2.2.3 | Failure codes | `status.py` |
 | 15.4.1 | Hash algorithm for the hard binding, inherited from the claim | `_verify.py` |
 | 15.4.2 | Hash algorithm for a `hashed-uri`, resolved through the enclosing structure | `_verify.py` |
-| 15.2.2.3 | Failure codes | `status.py` |
 | 15.5.1 | The last manifest superbox is the active manifest | `_extract.py` |
 | 15.5.2.1 | Plural embedded manifest stores are invalid | `_embed.py` |
-| 15.5.2.5 | Special Considerations for Unstructured Text | `_locate.py`, `_verify.py` |
+| 15.5.2.5 | Special Considerations for Unstructured Text | `_locate.py` |
 | 15.6.1 | Locating (the claim box) | `_extract.py` |
 | 15.6.2 | Validating (required claim fields, and the generator icon reference) | `_extract.py`, `_verify.py` |
 | 15.7 | Validate the Signature | `_verify.py` |
-| 15.10.1.2 | Exactly one hard binding, and exactly one inception action | `_verify.py` |
 | 15.8 | Validity period of the signing certificate and every CA above it | `_verify.py` |
+| 15.10.1.2 | Exactly one hard binding, and exactly one inception action | `_verify.py` |
 | 15.10.3.1 | Validation of assertion hashed URIs | `_verify.py` |
 | 15.10.3.2.3 | Actions — inception action rules and icon references; see note | `_verify.py` |
 | 15.10.3.3 | Validation of References (`hashedURI.missing` / `hashedURI.mismatch`) | `_verify.py` |
 | 15.11.3.3 | `claim.missing` when the claim cannot be located | `_extract.py` |
 | 15.12.1.1 | Validating a data hash — General | `_verify.py` |
 | 15.12.1.3.1 | Validating a text data hash | `_verify.py` |
-| 15.12.1.3.2 | Handling Corrupted Wrappers | `exceptions.py`, `_selectors.py` |
+| 15.12.1.3.2 | Handling Corrupted Wrappers | `exceptions.py`, `_extract.py`, `status.py` |
 | 15.12.1.3.4 | Partial Text Extraction — the `shall` only; see note | `_selectors.py` |
-| 6.9 | Date/time values as CBOR tag 0 (`tdate`) | `_cbor.py`, `manifest.py` |
-| 18.1 | Standard assertion labels | `manifest.py` |
+| 18.1 | Standard assertions are deterministic CBOR (RFC 8949 4.2.1) | `_cbor.py` |
 | 18.4 | Assertion content types — CBOR, and JSON-LD for metadata | `_extract.py`, `manifest.py` |
 | 18.5.2 | `data-hash-map` (`c2pa.hash.data`) | `manifest.py` |
+| 18.6 | Box byte order (big-endian), which A.8.2.2 omits | `_jumbf.py`, `constants.py` |
 | 18.15 | Actions — emits `c2pa.actions.v2`, reads it and v1 `c2pa.actions` (5.1), and `digitalSourceType` on `c2pa.created` | `manifest.py`, `_verify.py` |
 | 18.17 | Metadata assertions — `c2pa.metadata` carrying `dc:format` | `manifest.py` |
-| 18.6 | Box byte order (big-endian), which A.8.2.2 omits | `constants.py`, `_jumbf.py` |
 | 18.21.1 | Table 12 — the model-type vocabulary `c2pa.ai-disclosure` draws on | `signing.py` |
 | 18.28 | `c2pa.ai-disclosure` — emitted, and `modelType` validated on read | `manifest.py`, `signing.py`, `_verify.py` |
 
@@ -232,7 +262,12 @@ emit. All five we use match:
 2.4 additionally pins the ISO year for the description-box rules — "ISO 19566-5:2023,
 A.3" — where 2.0 did not. That also tells you the `jumd` description box is Annex A.3
 of that standard, which is how the toggle bits were cross-checked without buying the
-document.
+document: JPEG WG1's JLINK WD 3.0 publishes a toggle table giving bits 0-3 as
+Requestable, Label, ID and Signature, and reserving the rest. Bit 4, Private, comes
+straight from C2PA 11.1.4.1.2, which gives it as the mask `xxx1xxxx`. The JLINK draft
+is a different standard, so it corroborates bits 0-3 without establishing that
+19566-5 A.3 is worded identically — see
+[known-divergences.md](known-divergences.md).
 
 ## What this claim does NOT cover
 
@@ -251,10 +286,14 @@ an overclaim.
   redaction (`c2sh` salt boxes).** We emit exactly one standard manifest describing
   one act of generation. There is no ingredient to reference and nothing to redact.
 - **Certificate revocation (14.5.2).** Offline, so no CRL or OCSP fetch.
-- **Certification.** There is none to claim: of the 152 products on the C2PA
-  conformance list, none is certified above specification 2.2 and none declares a
-  valid text media type -- one declares a bare non-IANA `txt` token. This package is not a C2PA consortium release and carries no
-  conformance certification.
+- **Certification.** There is none to claim. No product on the C2PA conformance list is
+  certified above specification 2.2, and none declares a valid text media type — one
+  declares a bare non-IANA `txt` token. Checked against
+  `conforming-products/conforming-products-list.json` in `c2pa-org/conformance-public`
+  at commit `7d19b332` — 156 entries, every one `specVersion: ["2.2"]` and
+  `status: conformant`. The file syncs more than once a day, so it is pinned by commit
+  rather than by date. This
+  package is not a C2PA consortium release and carries no conformance certification.
 
 ## The text conformance rubric
 
@@ -276,7 +315,7 @@ matter more than the pass:
 - Neither `manifest.text.corruptedWrapper` nor `manifest.text.multipleWrappers` is
   referenced anywhere in it.
 - There are **no wire vectors**. That gap is what
-  `tests/vectors/A8ConformanceTest-1.2.0.txt` exists to fill.
+  `tests/vectors/A8ConformanceTest-1.2.1.txt` exists to fill.
 
 The rubric is also the only authority partitioning media types — A.8 names none at
 all:

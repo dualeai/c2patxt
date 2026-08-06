@@ -92,8 +92,8 @@ def test_the_manifest_holds_assertion_store_claim_and_signature() -> None:
 def test_construction_is_deterministic() -> None:
     """No clock read, no RNG, no UUID generated inside. Byte-stable by construction.
 
-    Every varying input is a parameter, which is what makes memo 6.3's byte-stable
-    re-embed test satisfiable at all.
+    Every varying input is a parameter, which is what makes a byte-stable re-embed
+    testable at all.
     """
     assert len({_store() for _ in range(20)}) == 1
 
@@ -108,7 +108,7 @@ def test_changing_any_input_changes_the_bytes() -> None:
 
 
 def test_the_created_action_declares_trained_algorithmic_media() -> None:
-    """RFC-136 4: the one fact the mark exists to carry."""
+    """The one fact the mark exists to carry."""
     payload = claim_payload_bytes(
         disclosure=_disclosure(),
         digest=DIGEST,
@@ -205,7 +205,7 @@ def test_only_the_three_permitted_hash_algorithms_exist() -> None:
 
 
 def test_the_manifest_carries_no_identifying_fields() -> None:
-    """RFC-136 5, enforced in code rather than by review.
+    """Our marking policy, enforced in code rather than by review.
 
     Three independent legal grounds forbid tenant, agent, account, end-user, author,
     prompt and conversation content. Because embed() takes a closed Disclosure, none

@@ -1,18 +1,76 @@
 # Deviations and ambiguity resolutions
 
 Where C2PA 2.4 is ambiguous, self-contradictory, or silent, we had to choose. This
-document records each choice and the reasoning behind it — reasoning that exists
-nowhere else in the repository and cannot be recovered by reading the code.
+document records each choice and why.
 
 All quotations are from **C2PA Technical Specification 2.4 (2026-04-01), HTML build
 `c7e55d5a`**, re-checked against that build on 2026-08-05. See
 [c2pa-compatibility.md](c2pa-compatibility.md) for why the claim cites a build hash.
 
-There is deliberately **no clause-to-code-to-test matrix** here. A thirty-row table
-duplicating what test names and docstrings already encode goes stale on the first
-refactor, and an auditor stops trusting the whole document the first time a path is
-wrong. The compatibility document carries the clause inventory; this one carries the
+The compatibility document carries the clause inventory; this one carries the
 reasoning.
+
+**Which of these matter.** Most are wire-format choices no reader will ever hit. The
+ones where a conforming peer reading the specification the other way disagrees with us
+on the bytes are **1** (hash ordering), **2** and **28** (which wrappers are rejected),
+**3** and **4** (what the exclusion covers, and byte order) and **8** (where the padding
+lives). **21** differs only in what we emit: every reader involved accepts both forms,
+so nothing breaks. The one that bears on the Article 50(2) disclosure itself is **23**:
+we reject a mark whose AI disclosure discloses nothing, where the specification obliges
+no validator to. Everything else is internal.
+
+---
+
+## Index by clause
+
+Which deviations touch a given clause. Generated from the sections below and held by
+`tests/test_deviations_index.py`, so it cannot drift from them.
+
+| Clause | Deviations |
+| --- | --- |
+| 6.2.2 | 23 |
+| 6.4 | 19, 23 |
+| 8.4.2.1 | 21, 26 |
+| 10.1 | 20, 27 |
+| 10.2.2 | 21 |
+| 10.2.3.2 | 26 |
+| 10.4 | 8 |
+| 10.4.4 | 8 |
+| 13.2.1 | 11 |
+| 14.3.5 | 12 |
+| 14.3.6 | 12 |
+| 14.5 | 18 |
+| 14.5.1.1 | 11 |
+| 15.2.1 | 14 |
+| 15.4 | 20 |
+| 15.5.2.1 | 2 |
+| 15.6.2 | 20 |
+| 15.7 | 12 |
+| 15.10.1.2 | 19 |
+| 15.10.3.1 | 20, 27 |
+| 15.10.3.2 | 23 |
+| 15.10.3.2.3 | 19, 25 |
+| 15.10.3.3 | 26, 29 |
+| 15.12.1.1 | 9, 22 |
+| 15.12.1.3.1 | 1, 2, 14, 17 |
+| 15.12.1.3.2 | 5 |
+| 15.12.1.3.3 | 14 |
+| 18.5.1 | 7 |
+| 18.5.2 | 8 |
+| 18.15.2 | 24, 25 |
+| 18.15.6.1 | 24 |
+| 18.28.2 | 13, 23 |
+| 18.28.4 | 23 |
+| A.8.2.1 | 2 |
+| A.8.2.2 | 3, 4, 5 |
+| A.8.4.1 | 2 |
+| A.8.4.2 | 3, 15 |
+| A.8.5 | 1 |
+| A.8.7.1 | 2, 14 |
+| A.8.7.3 | 1, 28 |
+
+Numbers are stable: five files cite deviations by ordinal, including `src/`, so a
+withdrawn item keeps its number rather than closing the gap.
 
 ---
 
@@ -26,20 +84,23 @@ normalize the remainder to NFC, encode UTF-8, hash.
 These produce different bytes. **We follow 15.12.1.3.1**, because A.8.5 delegates to
 it in so many words — "refer to the Validation clause for the normative procedure" —
 and because both other public A.8 implementations independently chose the same.
+Throughout this document those two are `encypherai/c2pa-text` and
+`writerslogic/c2pa-text-binding`, pinned to the commits we read in
+[tests/vectors/third_party/PROVENANCE.md](../tests/vectors/third_party/PROVENANCE.md).
 
-The divergence is real, not theoretical. Computed from the Unicode Character Database:
+Computed from the Unicode Character Database:
 
-| Text | Remove first | Normalize first | |
-| --- | --- | --- | --- |
-| `a` + wrapper + U+0301 | `c3 a1` | `61 cc 81` | differ |
-| U+1100 + wrapper + U+1161 | `ea b0 80` | `e1 84 80 e1 85 a1` | differ (3 vs 6 bytes) |
-| `A` + wrapper + U+030A | `c3 85` | `41 cc 8a` | differ |
+| Text | Remove first | Normalize first |
+| --- | --- | --- |
+| `a` + wrapper + U+0301 | `c3 a1` | `61 cc 81` |
+| U+1100 + wrapper + U+1161 | `ea b0 80` | `e1 84 80 e1 85 a1` (3 vs 6 bytes) |
+| `A` + wrapper + U+030A | `c3 85` | `41 cc 8a` |
 
 The cause is that U+FEFF is a **starter** — combining class 0 — so it blocks
 composition across itself. Removing it first lets `a` + U+0301 compose to U+00E1;
 normalizing first cannot.
 
-**We also design the problem away.** `embed()` always places the wrapper as a suffix,
+**`embed()` avoids the question.** It always places the wrapper as a suffix,
 so there is nothing after it to compose with and both readings hash the same bytes.
 A verifier that reads A.8.7.3 the other way still agrees with us. Guarded by
 `tests/test_normalization.py`.
@@ -131,10 +192,10 @@ field, and nothing says how a two-pass producer reserves space.
 slack bytes go. It is inside the signed claim, so it cannot be tampered with, and it
 is a field every C2PA implementation already knows to ignore.
 
-Both public A.8 implementations instead invented a padding mechanism in the selector
-run itself (`encode_wrapper_padded`, and a "specified deterministic padding" for
-which A.8 specifies none). Those inventions are outside the signature and are not
-guaranteed to agree with each other. See
+`encypherai/c2pa-text` instead pads the selector run itself, in
+`encode_wrapper_padded`, which puts the slack outside the signature;
+`writerslogic/c2pa-text-binding` declares `pad` and leaves it empty. Three
+implementations, three answers — tabulated as item 8 in
 [known-divergences.md](known-divergences.md).
 
 **Our `pad` is not zero-filled, and that is a deviation.** The CDDL comment reads
@@ -170,7 +231,8 @@ does, and it lists `text/plain`, `text/csv` and `text/tab-separated-values`.
 **We accept any `text/*` type**, including `text/markdown`. Markdown is
 rendering-invariant under zero-width insertion in exactly the way A.8 requires, and
 the rubric's omission of it reads as an oversight rather than an exclusion. This is a
-deliberate deviation from the rubric and is flagged as such in RFC-136.
+deliberate deviation from the rubric, pinned by
+`tests/test_rubric.py::test_markdown_is_marked_under_a8_as_a_deliberate_deviation`.
 
 ## 11. No Ed25519 SPKI constraint in the certificate profile
 
@@ -209,8 +271,8 @@ returns only docstrings saying so.
 
 ## 14. `manifest.text.*` codes are absent from the normative CDDL enum
 
-The `$status-code` socket in 15.2.1 carries 114 declarations. Verified on 2026-08-05:
-**none** of them is `manifest.text.corruptedWrapper` or
+The `$status-code` socket in 15.2.1 declares its codes as a CDDL group. Verified on
+2026-08-05, reading the socket in build `c7e55d5a`: **none** of them is `manifest.text.corruptedWrapper` or
 `manifest.text.multipleWrappers`, though both are defined in prose at A.8.7.1 and
 15.12.1.3.3 and used normatively at 15.12.1.3.1.
 
@@ -236,24 +298,17 @@ elsewhere in the text from being found. Otherwise anyone able to prepend text �
 mail client adding a quoted header, a CMS adding a byline — could make a marked
 document read as `UNMARKED`, which invites no investigation at all.
 
-## 16. Broken cross-references in the published build
+## 16. Withdrawn
 
-A.1 and A.9.2 both contain a literal unresolved xref:
-
-> "HTML Refer to `[_embedding_manifests_into_html]` for more information."
-
-Confirmed present in build `c7e55d5a`. Cosmetic, affects no wire format, recorded
-because it is evidence about how carefully the annexes have been reviewed — which is
-itself relevant to how much weight to put on A.8's prose. A.8 says of itself that it
-"remains under review and may be subject to change based on implementation feedback
-and interoperability testing."
+A cosmetic unresolved cross-reference in the published build, affecting no wire
+format. Filed as one of the items in [upstream-filing.md](upstream-filing.md); it was
+never a deviation. The number stays because five files cite these by ordinal.
 
 ## 17. `locate()` reports as-stored offsets, not NFC-frame offsets
 
-The project's own founding memo specifies that `locate` returns the wrapper's byte
-range **"in the NFC-normalized UTF-8 encoding"**. We return offsets into the
-**as-stored** encoding of the string the caller handed us, and the field names say so:
-`Span.utf8_start`, `Span.utf8_stop`, not `nfc_utf8_start`.
+`locate()` returns offsets into the **as-stored** encoding of the string the caller
+handed us, and the field names say so: `Span.utf8_start`, `Span.utf8_stop`, not
+`nfc_utf8_start`. An NFC-frame reading was considered and rejected.
 
 **The specification decides it.** 15.12.1.3.1 step 5 removes the wrapper bytes
 *according to the exclusion range*, and only step 6 normalizes what remains. An
@@ -310,33 +365,16 @@ Pinned by `tests/test_cose.py::test_the_unprotected_bucket_is_still_refused`, as
 the exact message rather than merely a rejection, so the refusal cannot become
 incidental.
 
-## 19. The inception-action failure code is the specification's, not ours
+## 19. Withdrawn
 
-It said 15.10.1.2 "names no failure code" for a missing or duplicated inception action,
-and that `assertion.action.malformed` was therefore ours to adopt from a neighbouring
-clause by judgement. 15.10.1.2 indeed names none — but 15.10.3.2.3 states the whole
-rule, the code included:
-
-> "For each action in the actions list: If the action field is either `c2pa.created`
-> or `c2pa.opened`, then the claim shall be rejected with a failure code of
-> `assertion.action.malformed` unless all of the following are true: the assertion is
-> the first actions assertion in the created_assertions or gathered_assertions array
-> (of a v2 claim), or the first actions assertion in the assertions array of a v1
-> claim, and the action is the first element in the actions array in this assertion."
-
-So there is nothing here to deviate from. The code we report is the one the
-specification names, and the strictness we described as our own reading — "both a
-created and an opened action is a rejection, as is two created actions" — follows from
-the clause, because the second inception action cannot be the first element.
-
-Two rules were missing as a result of reading only 15.10.1.2, and both are now
-implemented: the inception action must be **first in its assertion's actions array**
-(an array beginning `c2pa.edited` was accepted, and an asset cannot be edited before it
-exists), and it must be in the **first actions assertion** the claim links, counted
-across 6.4's `__N` instances (`c2pa.actions.v2` and `c2pa.actions.v2__1` each carrying
-one inception action were accepted).
-
-Read the neighbouring clause before recording a gap.
+Recorded as a deviation on a reading of 15.10.1.2 alone, which names no failure code
+for a missing or duplicated inception action. 15.10.3.2.3 states the whole rule
+including the code, so `assertion.action.malformed` is the specification's and there
+was nothing to deviate from. The rules it implies — the inception action first in its
+assertion's `actions` array, in the first actions assertion the claim links, counted
+across 6.4's `__N` instances — are implemented and documented at
+[c2pa-compatibility.md](c2pa-compatibility.md). The number stays because five files
+cite these by ordinal.
 
 ## 20. We decline the v1 `c2pa.claim` label, which 10.1 says we *should* accept
 
@@ -368,13 +406,29 @@ The two clauses read against each other. 8.4.2.1 defines exactly two forms for a
 `self#jumbf` URI — manifest-relative and store-relative — and both are *relative* in
 the ordinary sense; "absolute URI reference" in 10.2.2 most plausibly means the
 store-relative form, which is absolute *within the manifest store*, but the
-specification does not say so. **c2pa-rs emits the manifest-relative form for the
-signature field**, so the reference implementation reads it as we do.
+specification does not say so.
 
-We do not change signed bytes on an ambiguous reading when the reference
-implementation agrees with us. **We ACCEPT both forms on read** (see `_verify.py`'s
-`_signature_uri_resolves`), so a producer that reads 10.2.2 the other way verifies
-here regardless. Raised upstream in [upstream-filing.md](upstream-filing.md).
+**c2pa-rs emits the store-relative form** — `sdk/src/jumbf/labels.rs:79` at
+`9b6b2e52` builds
+`{to_manifest_uri}/c2pa.signature`, pinned by its own test to
+`self#jumbf=/c2pa/acme::urn:uuid::123:456:789/c2pa.signature` — and accepts the
+manifest-relative form on read: `to_normalized_uri` strips the prefix and
+`verify_claim`'s catch-all arm (`sdk/src/claim.rs:1910-1913`, commented "relative
+signature box") takes it from there. So the two producers disagree and both readers cope.
+
+**We ACCEPT both forms on read** (see `_verify.py`'s `_signature_uri_resolves`), so a
+producer that reads 10.2.2 either way verifies here.
+
+**Why we emit the form we emit, honestly.** The original reason recorded here was that
+c2pa-rs emitted the same form. It does not, and that reason is withdrawn. What holds the
+choice now is the wire-format rule: what we emit is a MAJOR version of this package and
+of the vector file, so changing it costs a major bump and buys nothing measurable, since
+both readers accept both forms. The manifest-relative form is also the shorter one and
+does not repeat the manifest label. If 10.2.2 is ever clarified against us, that is the
+version to change it in.
+
+Not filed upstream: with both readers accepting both forms, the ambiguity costs nobody
+anything.
 
 ## 22. Multiple exclusion ranges are rejected, not reported as informational
 
@@ -435,13 +489,9 @@ so the twenty-four literals are a union with any text string, exactly as its sib
 `$asset-type-choice` is, under a rule the specification comments as "one of the listed
 choices **or a custom value**". The membership test refused
 `ai.duale.types.model.generative` — 6.2.2 entity-specific namespacing, which `signing.py`
-itself notes the specification permits — along with any framework Table 12 predates. It
-was removed. `signing.MODEL_TYPES` keeps the twenty-four as the **producer's**
-vocabulary; the read side accepts any non-empty string.
-
-The correction is worth keeping visible: the mitigation cited `known-divergences.md`'s
-over-strictness rule while committing exactly that error, because the CDDL socket had not
-been read past the prose sentence above it.
+itself notes the specification permits — along with any framework Table 12 predates.
+`signing.MODEL_TYPES` keeps the twenty-four as the **producer's** vocabulary; the read
+side accepts any non-empty string.
 
 `scientificDomain` is not checked at all: 18.28.2 constrains it to the arXiv taxonomy,
 which would mean vendoring that taxonomy, and nothing here resolves over the network.
@@ -465,9 +515,9 @@ specification's own Example 9 does exactly that while the actions carry none. Re
 action alone rejected that example.
 
 `c2pa.opened` is exempt, by the clause's own next sentence: "No `digitalSourceType` field
-is required in conjunction with a `c2pa.opened` action" — which is a NOTE admonition
-rather than a numbered rule, so we are reading a non-normative note as scoping a
-`shall`. (Both the quotation above and this note are 18.15.2.)
+is required in conjunction with a `c2pa.opened` action" — which is a note, not a
+numbered rule, so we let a non-normative note narrow a `shall`. (Both the quotation
+above and this note are 18.15.2.)
 
 ---
 
@@ -541,7 +591,8 @@ there. So every tag is carried as an opaque `Tagged`, and floats are decoded —
 needs tag 37 for `instanceID` and floats for `coordinate-map` and `shape-map`.
 
 `dumps` is unchanged and stays narrow: major types 0–5, three simple values, tags 0 and
-18, no floats. What we EMIT is a wire commitment under CLAUDE.md's versioning rule;
+18, no floats. What we EMIT is a wire commitment under CONTRIBUTING.md's versioning
+rule;
 what we ACCEPT is governed by the clause. Recognising a tag and accepting its bytes are
 different questions, and only the second is the decoder's — whether a tag is permitted
 in a given position is a CDDL question, answered by validation.
@@ -577,14 +628,10 @@ kills it.
 
 ---
 
-## 29. Four smaller rules that are ours, not the specification's
+## 29. Three smaller rules that are ours, not the specification's
 
-Each is defensible and none is recorded elsewhere; grouped because each needs a
-sentence rather than a section.
+Each needs a sentence rather than a section.
 
-- **`gathered_assertions` is not searched for the inception action.** 15.10.3.2.3
-  allows it there; we check `created_assertions` only. This is deviation 25, recorded
-  separately because the clauses genuinely disagree.
 - **Self-signed is decided by issuer == subject**, which is strictly self-*issued*. A
   certificate issued under its own name by a different key would be treated as
   self-signed. It would then fail signature verification anyway, so the looser test

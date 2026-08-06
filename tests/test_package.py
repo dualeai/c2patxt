@@ -40,7 +40,7 @@ def test_import_pulls_no_optional_trust_backend() -> None:
 def test_no_log_records_are_emitted_while_doing_real_work(caplog: pytest.LogCaptureFixture) -> None:
     """This library emits NO log records, ever -- asserted over actual codec work.
 
-    RFC-136 9 requires the detection surface to expose "a verdict and the manifest
+    The detection surface is required to expose "a verdict and the manifest
     fields only, with no similarity score or partial-match detail". A library that
     logged intermediate hash comparisons, candidate wrapper offsets, or certificate
     subjects would undercut that guarantee from underneath, inside a process the

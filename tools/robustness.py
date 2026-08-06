@@ -137,17 +137,25 @@ def translate_round_trip(text: str) -> str:
     return paraphrase(text)
 
 
-def markdown_round_trip(text: str) -> str:
+def whitespace_collapse(text: str) -> str:
     """CARRIER SURVIVAL IS NOT PROVENANCE SURVIVAL.
 
     A pandoc md -> html -> md pass, or an email MIME round trip, leaves every
     variation selector intact and REFLOWS the visible text. The mark is still found;
     the hard binding fails on the NFC data hash. That distinction is invisible in a
     table headed "survival" unless it is called out.
+
+    NAMED FOR WHAT IT DOES, NOT FOR WHAT IT MODELS. ``str.split()`` splits on U+00A0 as
+    well as on ASCII whitespace, so on a corpus whose documents are already single lines
+    this measures NBSP folding and no reflow at all -- see docs/robustness.md, which
+    works the numbers through. The row was labelled "markdown round-trip (reflow)" and
+    that label was wrong for the corpus it was run against.
     """
     visible, _, mark = text.partition(MARKER)
-    reflowed = " ".join(visible.split())  # collapse newlines, the reflow pandoc does
-    return reflowed + MARKER + mark if mark else reflowed
+    # Collapses ASCII whitespace AND U+00A0, which is why the row is named for the
+    # latter: see the docstring above.
+    collapsed = " ".join(visible.split())
+    return collapsed + MARKER + mark if mark else collapsed
 
 
 ATTACKS: dict[str, Callable[[str], str]] = {
@@ -161,7 +169,7 @@ ATTACKS: dict[str, Callable[[str], str]] = {
     "typos in 5% of tokens": typos_in_5_percent,
     "paraphrase": paraphrase,
     "translate round-trip": translate_round_trip,
-    "markdown round-trip (reflow)": markdown_round_trip,
+    "whitespace collapse (NBSP folding)": whitespace_collapse,
 }
 
 #: Rows that GATE, and WHICH COLUMN each gates on. Everything else is a measurement.
@@ -211,9 +219,10 @@ def main(path: pathlib.Path) -> int:
         "corpus. No natural-language process emits that sequence."
     )
 
-    print("\nCARRIER SURVIVAL IS NOT PROVENANCE SURVIVAL. Compare the two columns: the reflow")
-    print("row keeps the mark LOCATABLE while the binding fails, because the visible bytes")
-    print("changed. A table headed 'survival' hides that unless both columns are shown.")
+    print("\nCARRIER SURVIVAL IS NOT PROVENANCE SURVIVAL. Compare the two columns: the")
+    print("whitespace-collapse row keeps the mark LOCATABLE while the binding fails,")
+    print("because the visible bytes changed. A table headed 'survival' hides that")
+    print("unless both columns are shown.")
 
     for failure in failures:
         print(f"\nFAIL: {failure}", file=sys.stderr)

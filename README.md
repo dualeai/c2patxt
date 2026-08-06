@@ -10,37 +10,6 @@ exactly as the original: the mark is zero-width.
 This is Duale AI's implementation of C2PA text marking. It is **not** a C2PA
 consortium release and carries no conformance certification.
 
-## Why this exists
-
-EU AI Act Article 50(2) obliges providers of generative AI systems to mark synthetic
-content in a machine-readable form and make it detectable as artificially generated,
-**"as far as this is technically feasible"** — and it exempts systems performing an
-assistive function for standard editing, systems that do not substantially alter the
-input or its semantics, and use authorised by law for law enforcement. It applies from
-**2 August 2026** (Reg. (EU) 2024/1689, Art. 113). Systems **placed on the market**
-before that date get a four-month transitional period, to 2 December 2026 (Art. 111(4),
-as inserted by Reg. (EU) 2026/1744) — a deferral, not an exemption.
-
-The Commission's [Guidelines on Article 50](https://digital-strategy.ec.europa.eu/en/library/guidelines-transparency-obligations-providers-and-deployers-ai-systems)
-(C(2026) 5054 final, 20 July 2026), para (76), say providers "must rely on
-publicly-available industry standard detection solutions that allow any third party to
-implement detection … **Where such standards are not available** … the provider may
-rely on its own detection solution". That is the design brief here, and the escape
-hatch is why: the format is a published specification, the vectors are CC0, and
-verification needs this package or any other A.8 implementation — not us.
-
-Guidelines under Art. 96 do not bind, and these are **not yet formally adopted**: the
-accompanying Communication says they apply only once adopted in all language versions.
-Read them as the Commission's stated expectation, not as law.
-
-**What this does not do.** It does not make anyone compliant, and no standard is
-mandated: the Code of Practice on Transparency of AI-generated Content (10 June 2026)
-names no marking or detection standard, and mentions neither C2PA nor Content
-Credentials. Marking is one
-obligation among several in Article 50, and this package implements marking for text.
-Whether your deployment satisfies the Article is a question for your counsel, not for a
-library.
-
 ```console
 $ pip install c2patxt
 ```
@@ -53,6 +22,14 @@ Or from a checkout:
 $ git clone https://github.com/dualeai/c2patxt && cd c2patxt
 $ make install
 ```
+
+**[Five minutes](#five-minutes)** — working code, and the certificate rules people get
+wrong · **[Why this exists](#why-this-exists)** — the AI Act obligation ·
+**[What this proves](#what-this-proves-and-what-it-does-not)** ·
+**[Rendering the verdict](#rendering-the-verdict)** — read this before you print
+anything to a user · **[Limits](#limits)** ·
+**[Security review](#security-review)** ·
+**[Specification status](#specification-status)**
 
 ---
 
@@ -104,7 +81,8 @@ def build_leaf(key):
             ),
             critical=True,
         )
-        # Omit this line entirely and Signer refuses to construct (14.5.1.1).
+        # Omit this line and Signer refuses to construct (14.5.1.1), unless you
+        # also pass allow_nonconformant=True.
         .add_extension(x509.ExtendedKeyUsage([C2PA_CLAIM_SIGNING_EKU]), critical=False)
         .sign(key, None)  # None: Ed25519 prehashes internally (RFC 8032)
     )
@@ -134,11 +112,14 @@ match result.state:
 `strip(text)` removes a mark. `extract(text)` returns the manifest without validating
 it. `locate(text)` returns the wrapper's byte span without decoding the manifest.
 
-Those five are the working surface. `__all__` exports thirty names in all — the rest
-are the exception types, the two context objects that buy determinism (`EmbedContext`,
-`VerifyContext`), the verdict and status types, the three allocation bounds, and the
-version strings. Read `c2patxt.__all__` for the list; anything not in it is private and
-may change without notice.
+Those five are the call surface, and producing a mark also needs `Signer`, `Disclosure`
+and `ModelType`. `__all__` exports thirty names in all: those eight, plus five
+exceptions, the two context objects that buy determinism (`EmbedContext`,
+`VerifyContext`), five verdict and status types, `ManifestStore` and `Span` for what
+`extract` and `locate` return, `TrustEvaluator`, `MODEL_TYPES`,
+`C2PA_CLAIM_SIGNING_EKU`, the three allocation bounds, and two version strings. Read
+`c2patxt.__all__` for the list; anything not in it is private and may change without
+notice.
 
 **`strip(embed(x))` is not always `x`.** `embed` normalizes to NFC before marking,
 because the hard binding is defined over the NFC form; `strip` only removes the
@@ -151,7 +132,8 @@ The leaf **must** carry an EKU extension, present and non-empty (C2PA 14.5.1.1),
 not assert `cA` or `keyCertSign`, and must assert `digitalSignature`. Miss any of those
 and every verifier — including this one — rejects it as `signingCredential.invalid`.
 `Signer` refuses a non-conformant certificate at construction, so you find out now
-rather than after the bytes ship.
+rather than after the bytes ship — unless you pass `allow_nonconformant=True`, which
+exists so the verifier can be tested against credentials it must reject.
 
 The `c2pa-kp-claimSigning` OID itself is **not** required by 14.5.1.1, which names no
 claim-signing OID — the OIDs it does name are `anyExtendedKeyUsage` (forbidden),
@@ -162,11 +144,44 @@ whatever else is right about it. A leaf carrying only `id-kp-emailProtection` ve
 here as `VALID` (untrusted).
 
 The builder is in [Five minutes](#five-minutes) above, annotated. Every extension
-there is one of the four rules in this section; drop any of them and `Signer`
-refuses to construct.
+there is one of the four rules in this section; drop any of them and `Signer` refuses
+to construct, unless you pass `allow_nonconformant=True`.
 
 `C2PA_CLAIM_SIGNING_EKU` is `1.3.6.1.4.1.62558.2.1`. You need the number, not the name,
 if you mint the leaf with OpenSSL or a CA rather than with the code above.
+
+---
+
+## Why this exists
+
+EU AI Act Article 50(2) obliges providers of AI systems generating synthetic text to
+mark it in a machine-readable form and make it detectable as artificially generated,
+**"as far as this is technically feasible"** — and it exempts systems performing an
+assistive function for standard editing, systems that do not substantially alter the
+input or its semantics, and use authorised by law for law enforcement. It applies from
+**2 August 2026** (Reg. (EU) 2024/1689, Art. 113). Systems **placed on the market**
+before that date get a four-month transitional period, to 2 December 2026 (Art. 111(4),
+as added by Reg. (EU) 2026/1744) — a deferral, not an exemption.
+
+The Commission's [Guidelines on Article 50](https://digital-strategy.ec.europa.eu/en/library/guidelines-transparency-obligations-providers-and-deployers-ai-systems)
+(C(2026) 5054 final, 20 July 2026), para (76), say providers "must rely on
+publicly-available industry standard detection solutions that allow any third party to
+implement detection … **Where such standards are not available** … the provider may
+rely on its own detection solution". That is the design brief here, and the escape
+hatch is why: the format is a published specification, the vectors are CC0, and
+verification needs this package or any other A.8 implementation — not us.
+
+Guidelines under Art. 96 do not bind, and these are **not yet formally adopted**: the
+accompanying Communication says they apply only once adopted in all language versions.
+Read them as the Commission's stated expectation, not as law.
+
+**What this does not do.** It does not make anyone compliant, and the law mandates no
+standard: the Code of Practice on Transparency of AI-generated Content (10 June 2026)
+names no marking or detection standard, and mentions neither C2PA nor Content
+Credentials. Marking is one
+obligation among several in Article 50, and this package implements marking for text.
+Whether your deployment satisfies the Article is a question for your counsel, not for a
+library.
 
 ---
 
@@ -211,16 +226,14 @@ verdict.raise_for_state(Provenance.VALID)  # -> None, or raises ValueError
 
 `verdict.codes()` returns `tuple[StatusCode, ...]` across all three buckets.
 
-That third wrong line is the subtle one. `claimSignature.validated` is genuinely
-present on a document whose text was rewritten — the signature over the *claim* really
-is intact; only its binding to the text broke.
+The third is the subtle one: `claimSignature.validated` is genuinely present on a
+document whose text was rewritten. The signature over the *claim* really is intact;
+only its binding to the text broke.
 
-The second line is wrong in both directions, which is why it is not a usable test.
-`verdict.manifest` is present whenever the manifest **parsed**, so it is there on most
-failures — but it is `None` for unmarked text, a corrupt wrapper, more than one
-wrapper, and any structural failure inside the manifest. `verdict.span` is `None` in
-those cases too. Reaching straight for `verdict.manifest.assertions` raises
-`AttributeError` on exactly the hostile inputs where you most need it not to.
+`verdict.manifest` is `None` for unmarked text, a corrupt wrapper, more than one
+wrapper, and any structural failure inside the manifest, so
+`verdict.manifest.assertions` raises `AttributeError` on exactly the hostile inputs
+where you most need it not to. `verdict.span` is `None` in those cases too.
 
 | State | Say | Never say |
 | --- | --- | --- |
@@ -236,6 +249,8 @@ reach `TRUSTED`, supply both through `VerifyContext` — anchors as a PEM bundle
 evaluator that decides whether a chain reaches one:
 
 ```python
+import pathlib
+
 from c2patxt import VerifyContext, verify
 
 verdict = verify(
@@ -267,17 +282,16 @@ success : assertion.hashedURI.match, assertion.dataHash.match,
 failure : signingCredential.untrusted
 ```
 
-So `if verdict.failure:` is a fourth wrong line, and the most tempting one — it reads
-like exactly the check you want and paints a red error on the normal outcome. **`state`
-is the answer to "is this good".** The buckets say which rules were evaluated and how
-each came out — `signingCredential.untrusted` is a finding, not a fault, for the reason
-given above.
+So `if verdict.failure:` is a fourth wrong line, and the most tempting one: it reads
+like the check you want and paints a red error on the normal outcome. **`state` is the
+answer to "is this good".** The buckets say which rules were evaluated and how each came
+out.
 
 Reaching `TRUSTED` needs `VerifyContext(anchors_pem=...)` **and** a `trust_evaluator`.
 `anchors=` is not a keyword you can pass: it is derived, and passing it is a
 `TypeError`.
 
-### Three of the four functions raise
+### `verify` never raises; `extract`, `strip` and `locate` do
 
 `verify` is total: absent, corrupt and invalid marks are all `Verdict`s. The other
 three are not. On a malformed wrapper — the 13-byte header declaring a 4 GiB manifest
@@ -293,9 +307,10 @@ locate   -> raises MarkCorruptError
 Catch `C2paTextError`; `MarkCorruptError`, `AlreadyMarkedError`,
 `UnencodableTextError` and `ProfileError` all derive from it. `ProfileError` is the one
 most integrators meet first — it is what `Signer(...)` raises for a non-conformant
-certificate. Catch the base class rather than the four subclasses; the list can grow. The reason this matters on a verification endpoint is in
-[SECURITY.md](https://github.com/dualeai/c2patxt/blob/main/SECURITY.md). The same
-split applies when a limit trips — `verify` returns `INVALID`, the other three raise.
+certificate. Catch the base class rather than the four subclasses; the list can grow. An uncaught
+`MarkCorruptError` on a public verification endpoint is a disclosure surface — see
+[SECURITY.md](https://github.com/dualeai/c2patxt/blob/main/SECURITY.md). The same split
+applies when a limit trips: `verify` returns `INVALID`, the other three raise.
 
 ## Limits
 
@@ -309,8 +324,8 @@ split applies when a limit trips — `verify` returns `INVALID`, the other three
 | Network access | None, ever. No revocation fetch, no OCSP, no timestamp authority |
 | Determinism | Only with `VerifyContext(now=...)`. By default `verify` reads the clock — see below |
 | Signature algorithm | Ed25519 only — our narrowing; 13.2.1 also allows ES256/384/512 and PS256/384/512 |
-| Size cost | 3.90 UTF-8 bytes per manifest byte, measured; 7,001 B per mark under a pinned context, 7,153–7,161 B with a real UUID and clock. The spread is the DER length of a random serial number, and the figure moves with your certificate |
-| Thread safety | Safe to share. Every public type is a frozen dataclass, the digest cache is per-call, and there is no module-level mutable state. A `Signer` wraps a `cryptography` `Ed25519PrivateKey`, whose signing operation is safe to call from multiple threads |
+| Size cost | **3.90 UTF-8 bytes per manifest byte, measured** — that ratio is the stable figure, and the manifest is dominated by your certificate chain. One reproducible point: 7,001 B per mark for a single self-signed Ed25519 leaf, under the test suite's pinned context AND its pinned key (`tests/conftest.py` seeds both; `tests/test_embed.py` asserts the 1,797 B store). Vary the key alone and the same configuration spans 6,993-7,009 B, because the signature's own bytes cost 3 or 4 UTF-8 bytes each. Your own total moves with the serial length, the subject name and the chain depth, so measure it rather than budgeting from ours |
+| Thread safety | Safe to share, exercised by `tests/test_embed.py::test_one_signer_marks_correctly_from_many_threads`. Every public type is a frozen dataclass, the digest cache is per-call, and there is no module-level mutable state. A `Signer` wraps a `cryptography` `Ed25519PrivateKey`, whose signing operation is safe to call from multiple threads |
 | Maximum input length | **None, deliberately — body-size limiting is yours.** See below |
 
 **Decomposing a marked document breaks it, with nothing visibly edited.** The mark
@@ -359,16 +374,24 @@ bounds, all of which are ours rather than the specification's:
 | `MAX_JUMBF_DEPTH` | 32 | Unbounded recursion in JUMBF *and* in CBOR |
 
 **There is no limit on the length of the text you pass in, and that is deliberate** —
-this library cannot know what your endpoint considers a reasonable request. Budget
-roughly 0.1 ms of CPU per MB of unmarked text and about 4x the document size in peak
-memory for a marked one, and cap the body size at your edge.
+this library cannot know what your endpoint considers a reasonable request. Cap the
+body size at your edge. Two figures to budget from, each with the fixture it was taken
+under:
+
+- **Unmarked text: about 0.10 ms of CPU per MB**, linear to 4.32 MB. What is pinned is
+  the mechanism rather than the timing — one `str.find` and one encode per call, held
+  by `tests/test_regressions.py::test_verify_walks_unmarked_text_exactly_once`.
+- **Marked text: peak memory about 3.4x the manifest store**, not the document — 1.77
+  MiB peak on a 0.53 MiB store, `tracemalloc`. Held as a ratio by
+  `tests/test_regressions.py::test_a_repeated_actions_link_allocates_a_bounded_multiple_of_its_input`.
 
 Per-attack survival rates are in **[docs/robustness.md](https://github.com/dualeai/c2patxt/blob/main/docs/robustness.md)** (PAN'26
-corpus, 300 documents, CC-BY-4.0, DOI 10.5281/zenodo.18620130). Read both columns:
+Text Watermarking task dataset, 300 documents, CC-BY-4.0, DOI
+10.5281/zenodo.18620130). Read both columns:
 **carrier survival is not provenance survival.** A transform can leave every selector
 intact, so the mark is still found, while the covered bytes changed and the binding
-correctly fails. Read the notes beside the rows before quoting a figure — one of them
-does not measure what its label says.
+correctly fails. Read the notes beside the rows before quoting a figure: each row says
+what transform it actually applies, which is not always what its name suggests.
 
 Copy-paste survival through Slack, Notion, Discord and Google Docs is **untested**. We
 do not repeat vendor claims about it.
@@ -377,77 +400,47 @@ do not repeat vendor claims about it.
 
 ## Security review
 
-Everything an AppSec questionnaire asks, without contacting us.
-
-- **Licence.** Apache-2.0, including its express patent grant. See [LICENSE](https://github.com/dualeai/c2patxt/blob/main/LICENSE).
-- **Dependencies.** Exactly one at runtime:
-  ```console
-  $ python -c "from importlib.metadata import requires; \
-      print([r for r in requires('c2patxt') if 'extra ==' not in r])"
-  ['cryptography~=48.0']
-  ```
-  The optional `[trust]` extra adds `pyhanko-certvalidator` for callers building their
-  own `TrustEvaluator`; nothing in this package imports it.
-- **Offline.** No network, no environment scanning, no credential store, no config
-  discovery, no log records. The suite runs with `--disable-socket`, so egress fails
-  the build.
-- **Supported Python.** 3.10 – 3.14, CPython.
-- **Vulnerability reporting.** [SECURITY.md](https://github.com/dualeai/c2patxt/blob/main/SECURITY.md) — a CRA Article 24(1)
-  steward policy: 48h acknowledgement, 90-day coordinated disclosure.
-- **SBOM and provenance.** Every release carries CycloneDX **and** SPDX SBOMs, both
-  attested, plus SLSA build provenance. All three are attached to the GitHub release.
-
-Verify a release yourself:
-
-```console
-$ gh attestation verify ./c2patxt-X.Y.Z-py3-none-any.whl -R dualeai/c2patxt
-$ pypi-attestations verify pypi --repository https://github.com/dualeai/c2patxt <url>
-$ uv export --frozen --no-emit-project -o requirements.txt
-$ pip install --require-hashes -r requirements.txt
-```
-
-The first proves artifact → commit (SLSA). The second proves artifact → publisher
-(PEP 740) and needs no GitHub account. The third pins the tree by hash.
-
-In PyPI's own words: *"An attestation will tell you where a PyPI package came from,
-but not whether you should trust it."* Neither `pip` nor `uv` gates installation on
-attestations. Verification is a step you run, not an assumption you inherit.
+Everything an AppSec questionnaire asks is in
+[SECURITY.md](https://github.com/dualeai/c2patxt/blob/main/SECURITY.md): the security
+properties and what holds each, the one runtime dependency with the command to check
+it, the supply-chain attestations with the commands to verify a release yourself, and
+the CRA Article 24(1) reporting policy. In short: Apache-2.0, one runtime dependency,
+CPython 3.10–3.14, no network, no ambient configuration, no log records.
 
 ---
 
-## Specification status — read this before depending on it
+## Specification status
 
 - **A.8 is under review.** The specification says of itself that it "remains under
   review and may be subject to change based on implementation feedback and
   interoperability testing". That sentence was *added* on 2026-04-01 (commit
-  `666bdf8f`) and is the only change to A.8 across all eleven published 2.4 builds.
+  `666bdf8f`) and is the only change to A.8 across the published 2.4 builds.
 - **2.4 has no release tag.** The last tag is 2.3, where the clause is numbered A.7.
   The 2.4 PDF and HTML are published. That is why our claim cites a build hash.
-- **No certification exists to obtain.** All 152 conformance-listed products are
-  certified against specification 2.2, and none declares a valid text media type
-  (one declares a bare non-IANA `txt` token).
+- **No certification exists to obtain.** Every conformance-listed product is certified
+  against specification 2.2, and none declares a valid text media type (one declares a
+  bare non-IANA `txt` token). 156 products at `7d19b332`.
 - **The text conformance rubric is v0.1.0** — six manifest-level checks, no wire
   vectors. We pass all six.
 
-What ships in this release, and what deliberately does not:
-**[release scope](https://github.com/dualeai/c2patxt/blob/main/docs/release-scope.md)** · **[releases](https://github.com/dualeai/c2patxt/releases)**
-
-Four defects that cause silent divergence between conforming implementations are
-drafted for filing upstream: **[upstream filing](https://github.com/dualeai/c2patxt/blob/main/docs/upstream-filing.md)**.
-
-Detail: **[compatibility](https://github.com/dualeai/c2patxt/blob/main/docs/c2pa-compatibility.md)** ·
-**[deviations](https://github.com/dualeai/c2patxt/blob/main/docs/deviations.md)** ·
-**[known divergences](https://github.com/dualeai/c2patxt/blob/main/docs/known-divergences.md)** ·
-**[open questions](https://github.com/dualeai/c2patxt/blob/main/docs/open-questions.md)** ·
-**[robustness](https://github.com/dualeai/c2patxt/blob/main/docs/robustness.md)** ·
-**[mutation audit](https://github.com/dualeai/c2patxt/blob/main/docs/mutation-audit.md)** ·
-**[benchmarks](https://github.com/dualeai/c2patxt/blob/main/docs/benchmarks.md)**
-
 We publish a wire-format conformance vector file
-(`tests/vectors/A8ConformanceTest-1.2.0.txt`) because the rubric has none.
-Interoperability with the two other public A.8 implementations is tested in
-`tests/test_third_party_interop.py`; where we deliberately disagree with them, and
-why, is in [known divergences](https://github.com/dualeai/c2patxt/blob/main/docs/known-divergences.md).
+(`tests/vectors/A8ConformanceTest-1.2.1.txt`) because the rubric has none.
+`tests/test_third_party_interop.py` tests interoperability with the two other public
+A.8 implementations.
+
+### The rest of the documentation
+
+| Document | Answers |
+| --- | --- |
+| [compatibility](https://github.com/dualeai/c2patxt/blob/main/docs/c2pa-compatibility.md) | Which clauses we implement, and what the claim excludes |
+| [deviations](https://github.com/dualeai/c2patxt/blob/main/docs/deviations.md) | How we read the specification where it was unclear |
+| [known divergences](https://github.com/dualeai/c2patxt/blob/main/docs/known-divergences.md) | Where we deliberately disagree with another implementation |
+| [open questions](https://github.com/dualeai/c2patxt/blob/main/docs/open-questions.md) | What we could not settle |
+| [upstream filing](https://github.com/dualeai/c2patxt/blob/main/docs/upstream-filing.md) | Four defects causing silent divergence, written up for the C2PA |
+| [robustness](https://github.com/dualeai/c2patxt/blob/main/docs/robustness.md) | What a marked document survives, measured |
+| [release scope](https://github.com/dualeai/c2patxt/blob/main/docs/release-scope.md) | What ships, and what deliberately does not |
+| [mutation audit](https://github.com/dualeai/c2patxt/blob/main/docs/mutation-audit.md) · [benchmarks](https://github.com/dualeai/c2patxt/blob/main/docs/benchmarks.md) | Whether the tests bite, and what CodSpeed holds |
+| [releasing](https://github.com/dualeai/c2patxt/blob/main/docs/releasing.md) | How a release is cut (maintainers) |
 
 ---
 

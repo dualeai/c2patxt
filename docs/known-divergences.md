@@ -4,12 +4,6 @@ Where we deliberately **disagree** with another implementation, and why. Each ca
 a test in `tests/test_divergences.py` carrying the same reasoning, so the test cannot
 be weakened without someone reading what it protects.
 
-This exists because the failure mode is specific and quiet: a future contributor
-compares us against a reference implementation, reads a difference as our bug, "fixes"
-it, and silently breaks conformance. A test that asserts only "toggles=0x02 parses" is
-one somebody deletes. A test that says "c2pa-rs fails on this legal box, and here are
-five implementations that do not" is one they read first.
-
 Agreement is checked separately, in `tests/test_third_party_interop.py`.
 
 ---
@@ -21,19 +15,25 @@ gates the label on bit `0x02` alone; `0x01` is *Requestable*, an unrelated prope
 **c2pa-rs therefore fails on a legal box with `toggles=0x02`.**
 
 Five independent implementations test `0x02` on its own — MIPAMS, ExifTool, thorfdbg,
-iLEAPP, exifmodern — and a real file bears it out: a byte-level parse of
-`image_5jumbf.jpg` APP11 #1 shows a `toggles=0x02` box labelled `faiz mp3 data`.
+iLEAPP, exifmodern — each locatable by name and checkable against their source. That
+survey is the evidence for this item.
+
+A byte-level parse of a real asset, `image_5jumbf.jpg` APP11 #1, also showed a
+`toggles=0x02` box labelled `faiz mp3 data`. **That observation is not reproducible
+here**: the file is not vendored, we can no longer establish which corpus it came from,
+and nothing in the suite touches it. Recorded as an observation rather than as evidence,
+because the divergence stands on the five implementations without it.
 
 SVTA made the same mistake independently. Two implementations converging on a wrong
-reading is how a wrong reading becomes the de facto standard, which is why this is a
-test and not a comment.
+reading is how a wrong reading becomes the standard. Hence a test, not a comment.
 
 **We read the label on `0x02` alone.**
 
 ## 2. faceless2/c2pa uses a 2-byte box ID
 
 It reads and writes the `jumd` ID as **2 bytes** and clamps anything above 65535.
-Every other implementation uses 4 bytes big-endian, and MIPAMS states it outright as
+Every other implementation surveyed uses 4 bytes big-endian, and MIPAMS states it
+outright as
 `INT_BYTE_SIZE = 4`.
 
 **We use 4 bytes.** The discriminating test value is one above the 16-bit ceiling: a
@@ -62,10 +62,19 @@ is a box with `0x04` **alone**: it carries an ID and no label. Under the wrong
 assignment it reads as a label, and the four ID bytes get consumed as NUL-terminated
 text.
 
-**We use the ISO assignment**: `0x01` Requestable, `0x02` Label, `0x04` ID, `0x08`
-Signature, `0x10` Private.
+**We use the assignment `0x01` Requestable, `0x02` Label, `0x04` ID, `0x08` Signature,
+`0x10` Private**, sourced in two halves. Bits 0-3 are JPEG WG1's JLINK WD 3.0, Table
+A.2, which reserves everything above bit 3. Bit 4 is C2PA 11.1.4.1.2, which writes the
+toggles as masks and gives Private as `xxx1xxxx` — the same notation it uses for Label
+(`xxxxxx1x`) and Requestable (`xxxxxx11`). That clause is the only primary source we
+can reach for bit 4; ISO/IEC 19566-5:2023's Foreword independently records a "new
+Private entry in the JUMBF Description Box", but its Annex A.3 is paywalled.
 
-## 5. encypherai/c2pa-conformance-suite gets three things wrong at once
+Note what 11.1.4.1.2 does **not** give: ID and Signature. Those two rest on JLINK and
+on the four implementations surveyed in `_jumbf.py`, which is why this document records
+where three repositories got them wrong.
+
+## 5. encypherai/c2pa-conformance-suite: three divergences
 
 - It hashes the raw bytes minus the exclusion with **no NFC normalization**, which
   A.8.6.1 requires. See deviation 1 in [deviations.md](deviations.md).
@@ -92,8 +101,8 @@ class as everything above, pointed at ourselves.
 ## 7. Where we are STRICTER than everyone
 
 C2PA 11.1.4.1.1 forbids these characters in a label: U+0000–001F, U+007F–009F,
-`/ ; ? #`, plus U+FEFF, U+FFFF and the surrogate range. **No implementation anywhere
-enforces this.** We do.
+`/ ; ? #`, plus U+FEFF, U+FFFF and the surrogate range. **Of the implementations
+surveyed in this document, none enforces it.** We do.
 
 Labels become JUMBF URI path components, so an unescaped `/` or `#` in a label is a
 URI-injection primitive against any consumer that resolves `self#jumbf=` references by
@@ -106,11 +115,36 @@ text we have found. But C2PA's own manifest labels are `urn:c2pa:…` (8.1), so 
 would leave the specification unable to express its own required labels. C2PA
 11.1.4.1.1 governs.
 
+## 8. Padding for the two-pass search goes in three different places
+
+A.8 defines no padding mechanism at all: the wrapper structure has no pad field, and
+nothing says how a producer that must hit an exact length reserves space. Each
+implementation answered differently, and only one of the three answers puts the slack
+inside the signature.
+
+- **encypherai/c2pa-text pads the selector run.** `encode_wrapper_padded` appends extra
+  VS-encoded bytes after the JUMBF container and relies on `manifestLength` to tell a
+  decoder where the manifest ends. Its own changelog calls this "deterministic padding"
+  and pairs it with `worst_case_wrapper_byte_length()`, `3 + (13 + M) * 4 + 6`.
+- **writerslogic/c2pa-text-binding does not pad.** `soft_binding.rs` declares
+  `pub pad: Vec<u8>` and leaves it empty — "kept empty. Present to match the reference
+  writer."
+- **We put the padding in `pad`**, the field 18.5.2 makes mandatory and 10.4 designates
+  for slack bytes, which puts it inside the signed claim.
+
+Nothing here breaks interoperability on read: `manifestLength` bounds the manifest, and
+validators are told to ignore `pad`. It is recorded because padding outside the
+signature is attacker-malleable space in a provenance format, and because the reasoning
+for our choice is not recoverable from the code. See deviation 8 in
+[deviations.md](deviations.md) for the clause argument.
+
 ---
 
 ## Filing these
 
-Items 1, 2, 3, 4 and 5 are implementation bugs, not specification defects, and belong
+Items 1 to 5 are implementation bugs, not specification defects, and belong
 upstream with their maintainers rather than with the C2PA. Item 6 is drift worth
-raising with c2pa-rs. Item 7 is a gap in every implementation including the reference
-one, and is worth raising as a conformance-suite item.
+raising with c2pa-rs. Item 7 is a gap in every implementation surveyed here, and is
+worth raising as a conformance-suite item. Item 8 is a gap in the specification rather
+than in anyone's implementation, and belongs with the C2PA — it is deviation 8 in
+[deviations.md](deviations.md).

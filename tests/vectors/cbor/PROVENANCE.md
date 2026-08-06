@@ -31,7 +31,7 @@ the cautionary precedent this directory exists to avoid.
 These cover CBOR generally. They do **not** cover RFC 8949 §4.2.1 *deterministic*
 encoding, which is what C2PA §10.1 and §18.1 mandate and what our decoder enforces on
 read — except that `streaming` supplies the indefinite-length half of it. Vectors for
-bytewise map ordering and shortest-form lengths are ours to author — a genuine gap in the ecosystem and
-a cheap contribution back.
+bytewise map ordering and shortest-form lengths are ours to author: upstream publishes
+only `rfc8949-appendixA`, `rfc8949` and `spike`, none of which carries them.
 
 Refresh with `make download-vectors`.

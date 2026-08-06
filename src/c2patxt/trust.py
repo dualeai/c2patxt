@@ -155,6 +155,11 @@ def _der_contents(encoded: bytes, offset: int) -> tuple[int, int]:
     if first == _DER_LONG_FORM:
         msg = "indefinite length is not valid DER"
         raise ValueError(msg)
+    # `<` versus `<=` on the next line is PROVABLY EQUIVALENT, and a mutation audit
+    # filed it as a survivor. The check above means control reaches here only when
+    # first != 0x80, so both comparisons agree for all 256 byte values. This helper has
+    # exactly two callers, both downstream of that guard. No test can distinguish them;
+    # do not write one, and do not "tighten" the comparison expecting a behaviour change.
     if first < _DER_LONG_FORM:
         length = first
     else:

@@ -16,7 +16,8 @@ algorithm C2PA 2.4 §13.2.1 permits ("Ed25519 instance only. No other EdDSA inst
 are allowed"). `eddsa-sig-02` is **Ed448**, and is here precisely because 13.2.1
 forbids it — see `tests/test_external_vectors.py`.
 
-`sign1-*` add three passing and six **failing** cases, all **ES256 over P-256**. That
+`sign-pass-*` and `sign-fail-*` — upstream's `sign1-tests/`, flattened here — add three
+passing and six **failing** cases, all **ES256 over P-256**. That
 algorithm is outside our narrowing, so they are useless as signature oracles and
 valuable as `Sig_structure` oracles, which is algorithm-independent. `sign-fail-05`
 does not exist upstream; the gap is theirs, not a vendoring error.

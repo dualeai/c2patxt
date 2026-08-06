@@ -6,6 +6,7 @@ the consumer agree, and it is the one a wrong constant fails first.
 
 from __future__ import annotations
 
+import concurrent.futures
 import datetime
 import unicodedata
 import uuid
@@ -330,7 +331,7 @@ def test_a_naive_signing_time_is_refused(signer: Signer) -> None:
 
 
 def test_the_manifest_carries_no_operator_identity(signer: Signer) -> None:
-    """RFC-136 5: no tenant, agent, account, end-user, author, prompt or
+    """Our marking policy: no tenant, agent, account, end-user, author, prompt or
     conversation content, ever.
 
     Asserted against the emitted BYTES rather than against the builder's inputs,
@@ -382,18 +383,77 @@ def test_the_published_size_figures_are_still_true(signer: Signer) -> None:
     assert len(store.raw) == 1_797, f"self-signed store is {len(store.raw)} B; the documents publish 1,797"
     assert 3.89 <= inflation <= 3.91, f"inflation {inflation:.3f}; README publishes 3.90"
     assert 6_900 <= wrapper_bytes <= 7_100, (
-        f"{wrapper_bytes} B per mark under the pinned context; platform-handoff.md publishes 7,001"
+        f"{wrapper_bytes} B per mark under the pinned context; the documents publish 7,001"
     )
 
     # A.8.2.2: 13-byte header plus the marker, so the CHARACTER count is exact.
     assert len(wrapper) == len(store.raw) + 14
 
 
+def test_the_default_context_size_is_still_what_this_fixture_produces(signer: Signer) -> None:
+    """The default-context size, pinned to the fixture that produces it.
+
+    ``embed`` with no ``EmbedContext`` mints a fresh ``xmp:iid:<uuid>`` and a timestamp
+    carrying microseconds, so it cannot be pinned to a single byte the way the fully
+    pinned row is. This holds the band it does produce, UNDER THIS CERTIFICATE:
+    ``conftest.build_certificate``, a self-signed Ed25519 leaf with a pinned seven-byte
+    serial. Measured here, 7,145-7,171 across 200 marks on one signer and 60 on fresh
+    keys; the bound below is that widened to the nearest ten.
+
+    THE BAND IS A PROPERTY OF THE FIXTURE, NOT OF "A REAL CALLER", and three attempts at
+    this test got that wrong in three different ways. Worth recording, because each
+    looked like a correction of the one before:
+
+    1. README published 7,153-7,161 -- one run's min and max presented as a bound, the
+       mistake ``docs/benchmarks.md`` warns against.
+    2. Republished as 7,145-7,164 "over 60 fresh certificates", with the spread
+       attributed to "the DER length of a random serial number". That sample varied the
+       KEY and never the serial, which ``build_certificate`` pins.
+    3. A derivation was then written from a random 20-byte serial, and figures quoted
+       for populations this fixture does not produce. A review could not reproduce any
+       of them; only the fully pinned 7,001 B reproduced to the byte.
+
+    So the published figure is the RATIO -- 3.90 UTF-8 bytes per manifest byte -- plus
+    the one fully pinned total. Byte totals for any other certificate are the caller's
+    to measure, and the README says so rather than guessing on their behalf.
+    """
+    sizes = {
+        len(marked[marked.index(MARKER) :].encode("utf-8"))
+        for marked in (embed("Hello world.", signer, DISCLOSURE) for _ in range(8))
+    }
+
+    assert min(sizes) >= 7_140, f"smallest default-context mark is {min(sizes)} B under this fixture"
+    assert max(sizes) <= 7_180, f"largest default-context mark is {max(sizes)} B under this fixture"
+
+
+def test_one_signer_marks_correctly_from_many_threads(signer: Signer) -> None:
+    """README publishes "Safe to share", and nothing held it.
+
+    The claim is specific: every public type is a frozen dataclass, the digest cache is
+    per-call, there is no module-level mutable state, and ``Ed25519PrivateKey.sign`` is
+    safe to call concurrently. Each of those is a reason to believe the conclusion; none
+    of them IS the conclusion. This shares one ``Signer`` across threads, marks distinct
+    documents, and verifies each result -- so torn state shows up as a bad verdict or a
+    raised exception rather than as a passing test about immutability.
+    """
+    texts = [f"Document number {n}." for n in range(32)]
+
+    def mark(text: str) -> str:
+        return embed(text, signer, DISCLOSURE, context=PINNED)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        marked = list(pool.map(mark, texts))
+        verdicts = list(pool.map(verify, marked))
+
+    assert [strip(m) for m in marked] == texts
+    assert all(v.state is Provenance.VALID for v in verdicts), [v.state for v in verdicts]
+
+
 def test_the_published_leaf_and_ca_size_is_still_true(signing_key: Ed25519PrivateKey) -> None:
     """The second row of the same size table, which nothing held.
 
-    ``constants.py`` published 2,102 B and ``docs/platform-handoff.md`` published
-    2,090 B, re-measured a day apart, and both cannot be right. Neither reproduced: the
+    ``constants.py`` published 2,102 B and a second document published 2,090 B,
+    re-measured a day apart, and both cannot be right. Neither reproduced: the
     chain CONSTRUCTION was pinned nowhere, so the number depended on how whoever took it
     happened to build the CA that day, and no assertion covered the row at all.
 
@@ -413,7 +473,7 @@ def test_the_published_leaf_and_ca_size_is_still_true(signing_key: Ed25519Privat
     wrapper_bytes = len(marked[marked.index(MARKER) :].encode("utf-8"))
 
     assert len(store.raw) == 2_120, f"leaf+CA store is {len(store.raw)} B; the documents publish 2,120"
-    assert wrapper_bytes == 8_218, f"leaf+CA mark is {wrapper_bytes} B; the documents publish 8,218"
+    assert wrapper_bytes == 8_218, f"leaf+CA mark is {wrapper_bytes} B for this pinned chain"
 
 
 @pytest.mark.parametrize(

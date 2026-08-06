@@ -375,7 +375,7 @@ def test_editing_one_character_is_a_hash_mismatch(signer: Signer) -> None:
 
 
 def test_appending_after_the_wrapper_cannot_extend_the_exclusion(signer: Signer) -> None:
-    """ATTACK: exclusion-range extension (RFC-136 9).
+    """ATTACK: exclusion-range extension.
 
     Appending after the mark and hoping the excluded range grows to cover it. It
     cannot: the range lives inside the SIGNED claim, so extending it requires a

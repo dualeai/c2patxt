@@ -32,7 +32,7 @@ Source: <https://github.com/writerslogic/c2pa-text-binding> —
 
 **Licence: Apache-2.0.** Attribution and notice required.
 
-Upstream `main` at `2466dbae6f6044f10c953544608807123ac84b7b`, latest release `v0.3.0`
+Upstream `main` at `2466dbae4f6044f10c953544608807123ac84b7b`, latest release `v0.3.0`
 (2026-08-03). The file last changed in `ac48522b6a23` (2026-07-14).
 
 Six top-level keys. `byteToVariationSelector` and `wrapperVector` are asserted;

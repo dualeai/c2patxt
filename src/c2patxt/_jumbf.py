@@ -18,6 +18,9 @@ bytes for a hash its own writer emits as 32.
 
 Clause 4.3 of the standard (LBox/XLBox/TBox semantics) is quoted verbatim in the free
 iTeh/SIST sample, so that part is normatively sourced.
+
+Every integer here is big-endian -- ``struct.pack(">I")`` and ``(">Q")`` throughout --
+which is C2PA 18.6, the clause A.8.2.2 omits for the wrapper's own header.
 """
 
 from __future__ import annotations
@@ -63,8 +66,8 @@ _LBOX_XLBOX_FOLLOWS = 1
 _LBOX_TO_END = 0
 _LBOX_RESERVED_MAX = 7
 
-# Characters forbidden in a label by C2PA 11.1.4.1.1. No implementation anywhere
-# enforces these; we do.
+# Characters forbidden in a label by C2PA 11.1.4.1.1. Of the implementations surveyed
+# in docs/known-divergences.md, none enforces these; we do.
 _FORBIDDEN_LABEL_CHARS = frozenset("/;?#\ufeff\uffff")
 
 # C0 controls, DEL and the C1 range, plus the surrogate range. Named because the
@@ -187,7 +190,7 @@ class DescriptionBox:
 
 
 def _validate_label(label: str) -> None:
-    """C2PA 11.1.4.1.1 label rules. Enforced here because nobody else enforces them."""
+    """C2PA 11.1.4.1.1 label rules, which no surveyed implementation enforces."""
     if "\x00" in label:
         msg = "a label is NUL-terminated and cannot contain NUL"
         raise JumbfError(msg, 0)
@@ -332,9 +335,11 @@ def _parse_description(payload: bytes, base: int) -> DescriptionBox:
         pos += _HASH_SIZE
 
     # The private field is one or more complete boxes and is kept OPAQUE. Real Adobe
-    # assets carry toggles=0x13 with a 24-byte 'c2sh' salt box here, so a parser that
-    # stops after the signature mis-reads genuine output. Modelled generically, as
-    # WG1 RI-1, dbench, jumbf-rs and MediaInfo do, rather than hard-coding 'c2sh'.
+    # assets carry toggles=0x13 with a 24-byte 'c2sh' assertion salt box here (C2PA
+    # 6.6), so a parser that stops after the signature mis-reads genuine output. This
+    # is the READ half of 6.6; _embed.py holds the other half, which is that we never
+    # emit one. Modelled generically, as WG1 RI-1, dbench, jumbf-rs and MediaInfo do,
+    # rather than hard-coding 'c2sh'.
     private = payload[pos:] if toggles & Toggle.PRIVATE else None
     if private is None and pos != len(payload):
         msg = f"{len(payload) - pos} unexpected trailing byte(s) in description box"
