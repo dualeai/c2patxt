@@ -287,40 +287,6 @@ def test_the_last_manifest_in_the_store_is_the_active_one() -> None:
     assert parse_manifest_store(raw).manifest_label != "urn:c2pa:" + "0" * 36
 
 
-def test_the_documented_code_taxonomy_lists_every_code_the_parser_raises() -> None:
-    """``MarkCorruptError``'s docstring enumerates the codes ``.code`` can carry, and
-    NOTHING COMPARED IT TO THE SOURCE.
-
-    A caller switching on ``.code`` over the documented set is the reason the
-    enumeration exists, so a code missing from it is a caller's unhandled branch. Two
-    have gone missing already -- ``manifest.text.multipleWrappers``, which
-    ``extract``'s own docstring advertised, and ``assertion.missing`` -- and both were
-    found by an auditor reading, not by a test.
-
-    A SET DIFFERENCE, not a list of examples. Adding a raise site with a new code now
-    fails here until the docstring is updated, which is the direction that matters: the
-    prose cannot silently fall behind the code.
-    """
-    import pathlib
-    import re
-
-    from c2patxt import _extract
-
-    source = pathlib.Path(_extract.__file__).read_text("utf-8")
-    raised = {
-        StatusCode[name]
-        for block in re.findall(r"MarkCorruptError\((?:[^()]|\([^()]*\))*\)", source, re.S)
-        for name in re.findall(r"StatusCode\.([A-Z_]+)", block)
-    }
-    documented = {code for code in StatusCode if code.value in (MarkCorruptError.__doc__ or "")}
-
-    assert raised, "the scrape found no raise sites; the pattern has drifted from the source"
-    assert raised <= documented, (
-        f"raised but undocumented: {sorted(c.value for c in raised - documented)}; "
-        "add them to MarkCorruptError's docstring or a caller switching on .code misses them"
-    )
-
-
 @pytest.mark.parametrize(
     ("damage", "expected"),
     [
@@ -705,43 +671,6 @@ def test_extract_refuses_multi_wrapper_text_as_verify_does(signer: Signer) -> No
         extract(first + second)
 
     assert caught.value.code is StatusCode.TEXT_MULTIPLE_WRAPPERS
-
-
-def test_the_carrier_code_is_used_at_exactly_the_two_sites_with_no_clause() -> None:
-    """``MarkCorruptError``'s docstring says a C2PA fault inside an INTACT wrapper
-    carries the code its clause names, and lists two exceptions by message.
-
-    That is a taxonomy claim about the whole module, so it is checked against the
-    module. Four sites once defaulted to ``manifest.text.corruptedWrapper`` for faults
-    that were not in the carrier; two now carry ``claimSignature.missing`` and
-    ``claim.malformed``, and the two that remain are the ones for which NO CLAUSE NAMES
-    A CODE -- every code below that level presupposes a store that parsed, and there
-    the store did not. docs/open-questions.md records that as unresolved.
-
-    A NEW DEFAULTING RAISE FAILS THIS TEST, which is the point: the next person to add
-    one has to decide whether a clause names a code, rather than inheriting the
-    carrier's by not thinking about it.
-    """
-    import inspect
-    import re
-
-    from c2patxt import _extract
-    from c2patxt.exceptions import MarkCorruptError
-
-    source = inspect.getsource(_extract)
-    defaulting = [
-        call.strip() for call in re.findall(r"raise MarkCorruptError\(([^\n]*)\)", source) if "StatusCode" not in call
-    ]
-    assert len(defaulting) == 2, f"expected exactly two carrier-default raises, found {len(defaulting)}: {defaulting}"
-
-    # Whitespace-normalized: the docstring wraps these phrases across lines, and a
-    # substring test against the raw text would fail on the line break rather than on
-    # the claim.
-    documented = " ".join((MarkCorruptError.__doc__ or "").split())
-    assert documented
-    for phrase in ("manifest store contains no manifest", "malformed manifest store"):
-        assert phrase in source, f"{phrase!r} is named in the docstring but no longer raised"
-        assert phrase in documented, f"{phrase!r} defaults to the carrier code but the docstring does not say so"
 
 
 def test_a_metadata_assertion_carrying_both_box_types_reads_the_json_one() -> None:

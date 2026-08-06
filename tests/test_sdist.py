@@ -10,6 +10,15 @@ every test needing a fixture or a vector corpus died on import.
 Shipping a suite that cannot run is worse than shipping none: it invites the one
 check we most want an auditor to perform and then fails in a way that looks like our
 code is broken.
+
+WHAT IS CHECKED HERE IS THE CONTENTS, NOT A RUN. A test that unpacked the sdist and
+executed the whole suite inside it used to live here. It cost 15.3 s of a 22 s suite to
+run all 1 242 tests a second time, and it made OTHER tests lie: under ``-x`` it was
+reported as the failure instead of the test that named the rule; under ``--deselect``
+its subprocess did not inherit the flag, so a selective probe reported kills it had not
+earned; and on a cold ``uv`` cache it resolved the package to the archive cache rather
+than ``src/``, turning the default target red. The files it proved were present are
+asserted directly below, in under a second.
 """
 
 from __future__ import annotations
@@ -79,75 +88,3 @@ def test_the_sdist_carries_no_compiled_artefacts(sdist: pathlib.Path) -> None:
     disagrees with its .py is actively misleading to someone diffing against a tag."""
     assert list(sdist.rglob("*.pyc")) == []
     assert list(sdist.rglob("__pycache__")) == []
-
-
-@pytest.mark.timeout(600)
-def test_the_suite_in_the_sdist_actually_passes(sdist: pathlib.Path) -> None:
-    """THE TEST THAT MATTERS. Everything above checks for files; this runs them.
-
-    Coverage and xdist are disabled: the auditor's environment is not ours, and a
-    coverage threshold failing in their checkout would tell them nothing about the
-    source they are auditing.
-
-    test_sdist.py and test_leaf_rule.py are DESELECTED from the inner run, and the
-    reason is not tidiness -- both shell out to ``uv build``, so an inner run that
-    included this very test would build an sdist, unpack it, and run the suite again,
-    forever. The first version of this test did exactly that and hit the 600s timeout
-    rather than failing on anything about the sdist. What is under test here is the
-    packaged SOURCE, and packaging tests are about the repository.
-    """
-    # "uv" is resolved from PATH deliberately: this test asks whether an AUDITOR's
-    # environment can run the shipped suite, and an auditor has uv on their path, not
-    # at ours.
-    command = [
-        "uv",
-        "run",
-        "--no-project",
-        # "." installs the unpacked sdist itself, which also proves it BUILDS.
-        "--with",
-        ".",
-        # pytest-timeout is required, not optional: pyproject registers
-        # @pytest.mark.timeout, and without the plugin the inner run warns on an
-        # unknown mark and every per-test timeout silently does not apply.
-        "--with",
-        "pytest",
-        "--with",
-        "pytest-socket",
-        "--with",
-        "pytest-timeout",
-        "--with",
-        "hypothesis",
-        "--with",
-        "cbor2",
-        "python",
-        "-m",
-        "pytest",
-        "-p",
-        "no:cacheprovider",
-        "-q",
-        "-p",
-        "no:cov",
-        "-o",
-        "addopts=",
-        "--disable-socket",
-        # Deselected because both shell out to `uv build`. Including this very test
-        # would build an sdist, unpack it, and run the suite again, forever -- the
-        # first version did exactly that and hit the 600s timeout rather than failing
-        # on anything about the sdist.
-        "--ignore=tests/test_sdist.py",
-        "--ignore=tests/test_leaf_rule.py",
-        # Benchmarks import pytest-codspeed, which an auditor has no reason to install
-        # and which this command deliberately does not provide. Without this the inner
-        # run dies at COLLECTION -- one ModuleNotFoundError aborts the whole suite, so
-        # the sdist would look broken over a benchmarking plugin.
-        #
-        # It passed without this line for a while, and the reason is worth knowing: the
-        # subprocess inherits VIRTUAL_ENV from the developer's shell, so `uv run` layered
-        # on top of an environment that already had the plugin. Run from a clean shell --
-        # an auditor's situation, which is the whole point of this test -- it failed.
-        "--ignore=tests/benchmarks",
-        "tests",
-    ]
-    result = subprocess.run(command, cwd=sdist, capture_output=True, text=True, check=False)  # noqa: S603
-
-    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-2000:]

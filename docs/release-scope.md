@@ -16,7 +16,7 @@ someone actually ran the column — not to the document.
 | Three-way agreement with the encypher and writerslogic vectors | ✅ | `tests/test_third_party_interop.py` |
 | Coverage ≥ 90, and the gate is real rather than tautological | ✅ | 99.83%; mutation-verified — see below |
 | Exactly one runtime dependency | ✅ | `tests/test_package.py`, `tests/test_leaf_rule.py` |
-| README states its six load-bearing claims without hedging | ✅ | `tests/test_docs.py::test_the_readme_is_not_a_stub` |
+| README states its six load-bearing claims without hedging | ✅ | Review. A test asserting six substrings were present was removed on 2026-08-06 as documentation grading; nothing checks the wording now |
 | Every unresolved item described as unverified, or removed | ✅ | [open-questions.md](open-questions.md) |
 
 The evidence is in [mutation-audit.md](mutation-audit.md).

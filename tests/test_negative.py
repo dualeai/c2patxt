@@ -904,62 +904,27 @@ _EMPTY = "http://c2pa.org/digitalsourcetype/empty"
     ],
 )
 def test_exactly_one_inception_action_is_required(payload: CborValue, ok: bool) -> None:
-    """C2PA 15.10.1.2: "Validate that either a c2pa.created or c2pa.opened action is
-    contained in exactly one actions assertion."
-    18.15.2: "There shall be at least one actions assertion present in the
-    created_assertions array of the Claim of a standard C2PA Manifest."
+    """C2PA 15.10.1.2 and 15.10.3.2.3: exactly one inception action, and it must be
+    first.
 
-    THIS MATTERS BEYOND CONFORMANCE. The c2pa.created action is where
-    ``digitalSourceType = trainedAlgorithmicMedia`` lives -- the field that actually
-    says a model generated this. A manifest with no created action, or with the action
-    rewritten to c2pa.edited, verified VALID while asserting nothing about machine
-    origin.
-
-    THE CODE IS THE SPECIFICATION'S, AND SO IS THE STRICTNESS. 15.10.1.2 names no code
-    itself, and an earlier version of this docstring concluded we had adopted one from
-    a neighbouring clause by our own judgement. That was wrong. 15.10.3.2.3 states the
-    rule and the code outright:
-
-    > "For each action in the actions list: If the action field is either
-    > `c2pa.created` or `c2pa.opened`, then the claim shall be rejected with a failure
-    > code of `assertion.action.malformed` unless all of the following are true: the
-    > assertion is the first actions assertion in the created_assertions or
-    > gathered_assertions array (of a v2 claim), or the first actions assertion in the
-    > assertions array of a v1 claim, and **the action is the first element in the
-    > actions array in this assertion**."
-
-    So "both created and opened" and "two created" are rejections because the second
-    inception action cannot be first -- not because we decided an asset has one
-    history. And ``inception-not-first`` is the case that reading exposed: an actions
-    array beginning ``c2pa.edited`` and only then ``c2pa.created`` used to pass, and the
-    clause rejects it. An asset cannot be edited before it exists.
-
-    The per-assertion half of the rule lives here; the "first actions assertion" half
-    needs the claim's link order and is tested in
+    15.10.3.2.3 states both the rule and the code: an action that is `c2pa.created` or
+    `c2pa.opened` is `assertion.action.malformed` unless the assertion is the first
+    actions assertion AND the action is the first element of its actions array. So
+    "both created and opened" and "two created" are rejected because the second cannot
+    be first, and `inception-not-first` -- an array beginning `c2pa.edited` -- is
+    rejected because an asset cannot be edited before it exists. The "first actions
+    ASSERTION" half needs the claim's link order and lives in
     ``test_only_the_first_actions_assertion_may_carry_the_inception``.
 
-    THE SOURCE TYPE IS PART OF THE SAME RULE, from 18.15: "For all assets, a
-    corresponding `digitalSourceType` field, with an appropriate value, **shall** be
-    recorded with the `c2pa.created` action, to indicate the nature of the asset at its
-    inception." Without it the mark says a machine made this in its LABEL and says
-    nothing in its CONTENT -- and ``manifest.py`` calls that field "the single fact the
-    mark exists to carry" while nothing read it.
+    WHY IT MATTERS BEYOND CONFORMANCE: `c2pa.created` is where
+    ``digitalSourceType = trainedAlgorithmicMedia`` lives -- the field that says a model
+    made this. Without it the mark asserts machine origin in its LABEL and nothing in
+    its CONTENT. 18.15 requires the field on `c2pa.created` and exempts `c2pa.opened`
+    in terms; that exemption is a row here, as the control against reading it too widely.
 
-    ``c2pa.opened`` is exempt, and the exemption is the clause's own: "No
-    `digitalSourceType` field is required in conjunction with a `c2pa.opened` action."
-    That row is the control against reading the rule too widely.
-
-    THE VALUE IS NOT CONSTRAINED, only its presence and type. 18.15 says "with an
-    appropriate value" and names only the empty-content case explicitly; the vocabulary
-    is IPTC's plus c2pa.org's, and requiring membership of a list we vendor would reject
-    a conforming producer using a term we have not heard of. ``created-from-nothing``
-    pins that: the empty-content value is one we never emit and must accept.
-
-    THE LAST TWO ROWS ARE THE OPENING NARROWING, added after coverage showed that line
-    was never executed. Everything here is attacker-controlled CBOR and the function
-    begins by refusing anything that is not a map -- and ``None`` is what the caller
-    actually passes when the assertion decoded to nothing at all, which since the
-    embedded-data change is a state a real store can be in.
+    The VALUE is unconstrained -- 18.15 says "an appropriate value", and requiring
+    membership of a vendored list would reject a conforming producer using a term we
+    have not heard of. `created-from-nothing` pins that.
     """
     from c2patxt._verify import _has_single_inception_action
 

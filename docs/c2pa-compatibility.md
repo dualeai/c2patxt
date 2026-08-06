@@ -9,6 +9,12 @@ listed below is one you can open in the spec and compare against the code. If yo
 find a clause listed here that we do not actually implement, that is a bug in this
 file and we want the report.
 
+**Nothing automated checks it.** Tests that harvested clause citations out of the
+source and matched them against the tables below, in both directions, were removed on
+2026-08-06: grading prose is not the test suite's job. They had found five rows listed
+as implemented and cited at no implementing site. Read the tables as a claim maintained
+by hand.
+
 For the places where the specification is ambiguous or self-contradictory and we had
 to choose, see [deviations.md](deviations.md). This file says *what* we implement;
 that one says *how we read it where it was unclear*.

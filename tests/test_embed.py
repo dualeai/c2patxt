@@ -455,37 +455,17 @@ def test_embed_refuses_to_sign_with_a_credential_outside_its_validity(
     """A mark signed with an expired credential is BORN INVALID, and signed bytes cannot
     be recalled.
 
-    ``Signer``'s docstring promises "Everything below is checked at construction rather
-    than at signing time, so a misconfigured deployment fails at startup instead of on a
-    request." Expiry is the ONE property that changes with time, and it was checked at
-    neither construction nor signing: ``Signer(expired_leaf)`` constructed, ``embed()``
-    succeeded, and the freshly made mark verified INVALID with
-    ``claimSignature.outsideValidity``. A long-running service holding a ``Signer`` built
-    at startup kept emitting those silently the moment its leaf lapsed.
+    Expiry is the one property of a credential that changes with time, so it is checked
+    at SIGN TIME against ``EmbedContext.when`` rather than at ``Signer`` construction:
+    nothing reconstructs a Signer, and a service holding one across its leaf's expiry
+    emitted invalid marks silently. Judging against ``when`` also keeps ``embed`` a pure
+    function of its arguments.
 
-    CHECKED AT SIGN TIME AGAINST ``EmbedContext.when``, not at construction against the
-    wall clock, and the choice matters twice over. Construction alone would miss the case
-    that actually happens — a ``Signer`` held across an expiry boundary — because nothing
-    reconstructs it. And judging against ``when`` keeps ``embed`` a pure function of its
-    arguments, which is a property this package states and tests; reading the clock here
-    would quietly remove it.
-
-    The producer still cannot guarantee the mark will be valid when READ — verification
-    judges against ITS own clock (15.8), which is why ``VerifyContext.now`` exists. What
-    this catches is the credential that is already outside its window at the moment of
-    signing, which is the failure a deployment can actually prevent.
-
-    THE ENDPOINTS ARE INCLUSIVE, and the two ``on-`` cases are what holds that. This
-    test ran with 2025 and 2047 against a 2026-2046 leaf -- months clear of either edge
-    -- so ``<=`` could become ``<`` on the producer side and nothing failed. RFC 5280
-    4.1.2.5 defines the period as the closed interval, and the verifier side of the same
-    comparison is already pinned by ``test_the_validity_window_includes_its_own_endpoints``;
-    producer and verifier disagreeing about one instant would refuse to issue a mark that
-    would have verified.
-
-    ``before-notBefore`` is not decoration: a freshly issued credential put into service
-    early fails the same comparison, and it is the case an operator hits during a
-    rotation rather than at the end of one.
+    THE ENDPOINTS ARE INCLUSIVE (RFC 5280 4.1.2.5), and the two ``on-`` rows hold that.
+    This ran with 2025 and 2047 against a 2026-2046 leaf -- months clear of either edge
+    -- so ``<=`` could become ``<`` and nothing failed. The verifier side is pinned by
+    ``test_the_validity_window_includes_its_own_endpoints``; the two disagreeing about
+    one instant would refuse to issue a mark that would have verified.
     """
     when = moment(signer.certificates[0])
     context = EmbedContext(manifest_uuid=uuid.UUID(int=7), instance_id="xmp:iid:pinned", when=when)

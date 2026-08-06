@@ -184,16 +184,15 @@ Recorded so nobody "fixes" them later:
 
 ### Method note
 
-**Before you run a single mutation**, three things, each of which turns a broken probe
+**Before you run a single mutation**, two things, each of which turns a broken probe
 into a green one if you skip it:
 
 ```bash
-uv run pytest <target> --ignore=tests/test_sdist.py   # alongside any --deselect
 find src -name __pycache__ -type d -exec rm -rf {} +  # after any same-length revert
 ```
 
 zsh does not word-split unquoted `$VAR`; use `${=VAR}`. Read every result as the literal
-words `1 failed`. The reasoning behind all three is below.
+words `1 failed`. The reasoning is below.
 
 
 Every survivor needs a **distinguishing probe** — a test that passes on pristine code
@@ -201,25 +200,10 @@ and fails under the mutant — before it is filed as untested rather than equiva
 2 filed a survivor as equivalent without one and was wrong; a critic disproved it in
 three lines. The probe is the cheap part and it is what makes the distinction honest.
 
-One practical wrinkle: `tests/test_sdist.py` rebuilds an sdist and reruns the whole
-suite inside it, so under `-x` it can be reported as the failure instead of the test that
-actually names the rule. Read past it to the first non-sdist failure.
-
-**The same file breaks `--deselect` runs, and that one produces false KILLs rather than
-a confusing failure.** `--deselect tests/test_x.py` leaves `test_sdist.py` selected, and
-its rerun happens in a subprocess that does not inherit the flag — so under a mutant it
-runs the WHOLE suite, including what was deselected, and fails for whatever the mutant
-broke anywhere. The probe then reports a kill it did not earn and the survivor stays
-hidden. Pass `--ignore=tests/test_sdist.py` alongside any `--deselect`.
-
-`-k` does not have this problem: the expression deselects `test_sdist.py` itself, so the
-subprocess never starts. Measured — `pytest tests --collect-only` selects it, `pytest
-tests -k <name>` selects none of it, `pytest tests --deselect <other>` still selects it.
-Passing `--ignore` on every narrow run costs nothing and needs no case analysis.
-
-Two more traps, both of which produce a green result from a broken probe. (A third,
-about reading a local CodSpeed table, lived here and is in
-[benchmarks.md](benchmarks.md) — it misleads a reader but does not make a probe pass.)
+Two traps, both of which produce a green result from a broken probe. (A third, about
+reading a local CodSpeed table, is in [benchmarks.md](benchmarks.md) — it misleads a
+reader but does not make a probe pass. A fourth, three paragraphs about
+`tests/test_sdist.py` rerunning the whole suite, is gone with the test that caused it.)
 
 - **Stale bytecode after a same-length revert.** Python invalidates a `.pyc` on source
   size and mtime, and `0xFFFE` → `0xFFFF` changes neither at second granularity. The

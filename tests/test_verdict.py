@@ -186,19 +186,6 @@ def test_the_invalid_prose_names_the_two_article_50_2_causes() -> None:
         assert code.name in implementation, f"{code.name} is named in the prose but no longer reachable"
 
 
-def test_the_invalid_prose_does_not_blame_the_profile_for_our_own_narrowing() -> None:
-    """Ed25519-only is OUR restriction; 13.2.1's list is wider.
-
-    The only account of ``signingCredential.invalid`` was "fails the 14.5.1.1 profile",
-    which attributed our narrowing to the clause -- the exact overclaim shape corrected
-    elsewhere in this package, committed inside a correction. A conforming ES256 mark is
-    refused here, and the prose must say that choice is ours and where it is recorded.
-    """
-    prose = _invalid_prose()
-    assert "Ed25519" in prose, "the prose must name the algorithm restriction it applies"
-    assert "deviations.md" in prose, "and must point at where that choice is recorded"
-
-
 def test_the_informational_bucket_is_empty_until_a_code_lands_in_it() -> None:
     """``Verdict.informational`` is public and presented as a peer of success and
     failure, and nothing has ever gone into it: ``_KIND`` maps all 31 codes to SUCCESS

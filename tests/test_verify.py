@@ -668,41 +668,12 @@ def test_a_malformed_anchor_bundle_fails_the_same_way_for_every_verdict(marked: 
 def test_an_unlinked_assertion_is_rejected_whatever_its_content_type(
     signer: Signer, content_type: bytes, declared: bool
 ) -> None:
-    """ATTACK: smuggle an assertion the claim does not commit to, past the guard.
+    """C2PA 15.10.3.1: an assertion in the store the claim never linked is
+    `assertion.undeclared`, whatever it contains.
 
-    _check_assertions rejects any assertion in the store that the claim does not link.
-    The enforcement compared `set(manifest.assertion_bytes) - seen`, and
-    assertion_bytes was populated ONLY for boxes whose content box 4CC was `cbor` --
-    so a box carrying `json`, `xml `, `uuid` or any other four-character code was
-    silently dropped from the set being compared and the guard never saw it. THE
-    ATTACKER CHOOSES THE 4CC.
-
-    Confirmed before the fix: injecting a requestable box labelled "evil" with a
-    `json` content box, byte-length-neutral so the hard binding still matched,
-    produced a VALID verdict on text carrying attacker-authored content. A consumer
-    enumerating the assertion store of that credential attributes the injected content
-    to the signer -- and to a TRUSTED signer wherever anchors are configured.
-
-    Parametrized over the content types precisely because the defect was that one of
-    them behaved differently from the rest.
-
-    ``declared`` IS THE CONTROL, and without it this test could not fail in both
-    directions: every row expected rejection, so replacing ``_check_assertions`` with
-    ``return verdict, False`` passed all five. CONTRIBUTING.md warns about exactly this
-    shape and records the precedent -- a CBOR corpus test here once passed with the
-    decoder replaced by an unconditional ``raise``. The linked rows put the same box in
-    the same store and add one hashed-uri link, so what separates accept from reject is
-    the claim's commitment and nothing else.
-
-    THE CODE IS ASSERTED TOO. Rejection alone would accept ``assertion.missing``, which
-    names the opposite condition and is the regression a separate test was written to
-    prevent.
-
-    An earlier version wrapped the parse in ``try/except MarkCorruptError: return``,
-    because non-``cbor`` assertions used to be refused there. They are not any more --
-    every assertion keeps its raw bytes whatever it carries -- so that escape had become
-    a silent alternative pass: an unrelated parse regression would have sent four of five
-    rows through it, green.
+    The claim commits to assertions by hashed URI, so a box it never named is
+    unauthenticated and its content is irrelevant. Accepting one would let anyone append
+    assertions to a signed manifest and have them read.
     """
     from c2patxt import _jumbf
     from c2patxt._extract import _reparse, parse_manifest_store
@@ -1260,72 +1231,24 @@ def _icon(
 def test_a_hashed_uri_reference_follows_the_15_10_3_3_procedure(
     store: ManifestStore, drop: tuple[str, ...], overrides: dict[str, _cbor.CborValue], expected: StatusCode | None
 ) -> None:
-    """C2PA 15.10.3.3, "Validation of References", verbatim:
+    """C2PA 15.10.3.3, "Validation of References".
 
-    > "The destination of a `hashed_uri` is found in its `url` field. If the field is
-    > not present or the destination cannot be located (i.e., that data isn't present
-    > where it is supposed to be) then it shall be treated as a validation failure with
-    > code `hashedURI.missing`. If the destination can be located, then proceed as
-    > follows: Follow the procedure in Section 15.4 to determine the hash algorithm...
-    > Ensure that the `hash` field is present in the `hashed_uri` structure. If it is
-    > not, the claim shall be rejected with a failure code of `hashedURI.mismatch`.
-    > Compute the hash of the assertion... If they do not match, the claim shall be
-    > rejected with a failure code of `hashedURI.mismatch`."
+    A missing or unlocatable destination is ``hashedURI.missing``; a missing or
+    mismatching ``hash`` is ``hashedURI.mismatch``. Those codes are deliberately NOT
+    ``assertion.missing``/``assertion.hashedURI.mismatch`` -- a reference is a field
+    inside a structure pointing elsewhere, so naming the assertion misnames the object.
 
-    We validated no references at all. 15.6.2 obliges it for the claim generator's
-    icon -- "If there is an `icon` field in the generator-info-map referenced by the
-    `claim_generator_info` field... then its value shall be validated as described in
-    Section 15.10.3.3" -- and we read `claim_generator_info` only for its `name`.
+    External references are passed over rather than failed: the clause scopes external
+    validation to a resource "the validator chooses to retrieve", and this package
+    retrieves none. An external reference is recognised by having a URI SCHEME, matched
+    against RFC 3986's production -- three mutations of which survived the whole suite:
+    ``.match`` to ``.search``, ``[A-Za-z]`` to ``[A-Za-z0-9]``, and dropping ``+.-``
+    from the trailing class. The rows pin the production, not the four strings the
+    branch was originally written for.
 
-    THE CODES ARE DELIBERATELY NOT THE ASSERTION ONES. ``hashedURI.missing`` and
-    ``hashedURI.mismatch`` are distinct entries in the status table from
-    ``assertion.missing`` and ``assertion.hashedURI.mismatch``, and the clause names
-    the unprefixed pair here. A reference is not an assertion link: it is a field
-    INSIDE a structure pointing at something else, so telling an operator "an assertion
-    is missing" when a generator icon failed to resolve names the wrong object.
-
-    ``external-not-retrieved`` records a CHOICE, not an oversight. The clause scopes
-    external validation to "a `hashed_ext_uri` whose resource the validator chooses to
-    retrieve", and this package never touches the network -- a verifier whose answer
-    depends on network conditions is not the offline verifier it claims to be. So an
-    external reference is passed over rather than failed.
-
-    THAT ESCAPE WAS FAR WIDER THAN ITS JUSTIFICATION, which is what the four rows after
-    it exist to pin. The check was ``if not url.startswith("self#jumbf="): return None``,
-    so an EMPTY string, a relative path with the prefix missing, a truncated prefix and a
-    miscased one were all treated as "an external resource we chose not to retrieve".
-    None of them is one. 15.10.3.3 is explicit: "If the field is not present **or the
-    destination cannot be located** (i.e., that data isn't present where it is supposed
-    to be) then it shall be treated as a validation failure with code
-    `hashedURI.missing`."
-
-    The divergence was inside our own file: ``_link_status``, implementing 15.10.3.1 on
-    the same input, returns ``assertion.outsideManifest`` for the empty string and for
-    the prefix-less relative form. Two clauses, two answers, identical bytes -- and a
-    third-party validator following either one rejects what we accepted.
-
-    An external reference is now recognised by having a URI SCHEME, which is what makes
-    it fetchable at all. ``external-non-http-scheme`` is there so the test does not
-    quietly become "https is special": the clause says nothing about which schemes a
-    validator may decline to retrieve, and we decline all of them.
-
-    THE SCHEME PRODUCTION IS RFC 3986's, AND IS NOW PINNED AS SUCH. Three mutations of it
-    survived the whole suite -- ``.match`` to ``.search`` (so a colon anywhere made a
-    relative path "external"), ``[A-Za-z]`` to ``[A-Za-z0-9]`` (so ``0x:`` became a
-    scheme), and dropping ``+.-`` from the trailing class (so ``view-source:``,
-    ``z39.50r:`` and ``x-my+scheme:`` stopped being schemes and were failed as missing).
-    The rows pinned the four negative strings the branch was written for and never the
-    production itself, which is the difference between testing a bug fix and testing a
-    rule.
-
-    ``store-relative-resolves`` is the positive form of 8.4.2.1's second URI shape -- the
-    specification's own Example 1 -- and it was missing too: with only the negative
-    ``another-manifest`` row, sending every store-relative URL down the external branch
-    survived. Its mismatching sibling is there so the row proves resolution rather than
-    merely proving the branch was entered.
-
-    ``alg-inherited-from-the-claim`` is the control for 15.4.2: a reference with no
-    ``alg`` must resolve through the claim rather than be treated as unusable.
+    ``store-relative-resolves`` is 8.4.2.1's second URI shape, the specification's own
+    Example 1; with only the negative row, sending every store-relative URL down the
+    external branch survived. ``alg-inherited-from-the-claim`` is the 15.4.2 control.
     """
     reference = _icon(store, drop=drop, **overrides)
 
@@ -1439,44 +1362,14 @@ def test_only_the_first_actions_assertion_may_carry_the_inception(
     accepted_when: set[bool],
     reversed_order: bool,
 ) -> None:
-    """C2PA 15.10.3.2.3 requires the inception action's assertion to be "the first
-    actions assertion in the created_assertions OR GATHERED_ASSERTIONS array", and
-    15.10.1.2 requires it to
-    be "contained in exactly one actions assertion".
+    """C2PA 15.10.3.2.3 and 15.10.1.2: the inception action belongs to the FIRST actions
+    assertion, and to exactly one.
 
-    WE INSPECTED ONE LABEL. ``_store_shape_status`` read
-    ``manifest.assertions.get("c2pa.actions.v2")`` exactly, so a store carrying
-    ``c2pa.actions.v2`` AND ``c2pa.actions.v2__1`` -- both declared, both hash-matched,
-    each with its own inception action -- was accepted. Reproduced before the fix.
-
-    6.4 IS THE CONVENTION THAT MAKES THE SECOND LABEL LEGAL: "Multiple assertions of
-    the same type can occur in the same manifest... by adding a double-underscore and a
-    monotonically increasing index to the label." ``_count_hard_bindings`` in the same
-    module already honoured it for the hard-binding count, so the machinery existed and
-    simply was not applied here -- which is why this is an inconsistency inside one
-    file rather than a missing feature.
-
-    ORDER COMES FROM THE CLAIM, NOT FROM THE STORE. "First" is defined against
-    ``created_assertions``, so the check walks the claim's link order; a store that
-    happens to serialize ``__1`` before the base label cannot change which assertion is
-    first, and neither can a JUMBF reader that iterates differently from ours.
-
-    ``inception-in-the-second`` is the case a naive "some actions assertion has an
-    inception" check would wave through, and ``no-inception`` is the control that keeps
-    18.15.2's requirement in force.
-
-    ``reversed_order`` IS WHAT MAKES THE ORDER CLAIM CHECKABLE. The store's dict keeps
-    the base label at position 0 whichever way the claim links them, so with only the
-    forward rows a version of ``_actions_labels`` walking ``manifest.assertions.keys()``
-    passes everything -- and the docstring's central assertion would be untested. The
-    two expectations differ for exactly the two rows where one assertion carries the
-    inception and the other does not, which is the signature of a rule that follows the
-    claim rather than the store.
-
-    ``accepted_when`` holds the orderings under which the manifest is valid: ``{False}``
-    for forward only, ``{True}`` for reversed only, empty for neither. Written as a set
-    rather than two booleans because "valid under exactly one ordering" is the fact each
-    row is really stating.
+    WE INSPECTED ONE LABEL. `_store_shape_status` read `assertions.get("c2pa.actions.v2")`
+    exactly, so a store carrying both `c2pa.actions.v2` and `c2pa.actions.v2__1` -- each
+    declared, hash-matched, each with its own inception action -- was accepted. 6.4's
+    `__N` convention is what makes the second label legal, which is why reading one label
+    is not enough.
     """
     label, other = ASSERTION_ACTIONS, f"{ASSERTION_ACTIONS}__1"
 
@@ -1804,45 +1697,16 @@ def test_an_icon_in_a_second_actions_assertion_is_checked_too(store: ManifestSto
     ],
 )
 def test_the_disclosure_must_actually_disclose(store: ManifestStore, payload: _cbor.CborValue, ok: bool) -> None:
-    """C2PA 18.28.2: "The value of the `modelType` field is an enumeration of AI model
-    types defined in Table 12, 'Model type values' and **it shall be present** in the
-    ai-model-disclosure-map object."
+    """C2PA 18.28.2: `modelType` "shall be present" in the ai-model-disclosure-map.
 
-    WE CHECKED THE LABEL AND NEVER READ THE PAYLOAD. ``_store_shape_status`` required
-    ``c2pa.ai-disclosure`` to appear in the claim's links and stopped there, so a
-    disclosure of ``{}`` -- or of ``{"junk": 1}``, or a CBOR array -- was linked,
-    hash-matched and reported VALID. This artefact exists under EU AI Act Article 50(2)
-    to carry one fact, and a mark that carries none of it was indistinguishable from a
-    mark that carries it.
+    WE CHECKED THE LABEL AND NEVER READ THE PAYLOAD. `_store_shape_status` required
+    `c2pa.ai-disclosure` to appear in the claim's links and stopped, so a disclosure of
+    `{}` -- or `{"junk": 1}`, or a CBOR array -- was linked, hash-matched and VALID.
+    This artefact exists under EU AI Act Article 50(2) to carry one fact, and a mark
+    carrying none of it was indistinguishable from one that did.
 
-    THIS IS THE THIRD TIME THIS SHAPE HAS APPEARED HERE. #71 required the disclosure
-    assertion; #79 required an inception action; both were satisfied by PRESENCE, and
-    neither wrote the assertion that holds the claim the presence stands for. The
-    pattern is worth naming because it is not a coding error -- each step was correct
-    and each stopped one level short of the fact it was about.
-
-    TABLE 12 IS NOT A CLOSED ENUMERATION, and an earlier version of this test asserted
-    that it was. 18.28.4's CDDL extends the socket -- ``$model-type-choice /= tstr`` --
-    so the twenty-four literals are a union with any text string, exactly as its sibling
-    ``$asset-type-choice`` is. The four accepting rows after ``a-real-framework`` are
-    what that costs: a framework Table 12 predates, the string earlier releases of this
-    package wrote, a 6.2.2 entity-namespaced value, and a plain vendor value must all
-    verify. Refusing them would be the over-strictness docs/known-divergences.md
-    catalogues in five other implementations, pointed at ourselves.
-
-    ``signing.MODEL_TYPES`` keeps the twenty-four as the PRODUCER's vocabulary. The
-    asymmetry is deliberate and is the whole shape of the rule: we write from a list, we
-    read anything.
-
-    ``scientificDomain`` is NOT checked, though 18.28.2 constrains it too: conformance
-    to the arXiv taxonomy would need a vendored copy of that taxonomy, and this package
-    resolves nothing over the network.
-
-    THE LAST THREE ROWS ARE THE NARROWING, and they were missing until coverage pointed
-    at the line. Everything read here is attacker-controlled CBOR, so the function opens
-    by refusing anything that is not a map -- and that opening branch was the one line of
-    it no test executed. A decoder can hand us an array, a text string or nothing at all
-    as readily as a map.
+    Third occurrence of this shape: a required assertion whose PRESENCE was checked and
+    whose CONTENT was not.
     """
     tampered = dataclasses.replace(store, assertions={**store.assertions, ASSERTION_AI_DISCLOSURE: payload})
     verdict, accepted = _verify._check_assertions(tampered, Verdict(state=Provenance.INVALID))

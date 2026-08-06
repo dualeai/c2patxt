@@ -10,8 +10,7 @@
 graft tests
 graft docs
 # The workflows and issue templates travel too: an auditor diffing shipped source
-# against the git tag wants the CI definitions, and tests/test_docs.py asserts the
-# governance files are present wherever the suite runs.
+# against the git tag wants the CI definitions.
 graft .github
 graft tools
 include LICENSE
