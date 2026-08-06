@@ -44,7 +44,7 @@ classifiers = [
 # RFC 8949 4.2.1 bytewise map ordering while cbor2's canonical=True implements
 # 4.2.3 length-first ordering, and because a decoder that REJECTS non-deterministic
 # input is a security property a general-purpose library cannot provide.
-dependencies = ["cryptography~=48.0"]
+dependencies = ["cryptography~=49.0"]
 
 [project.optional-dependencies]
 # RFC 5280 6 certificate path validation. Kept optional because pyca/cryptography's
