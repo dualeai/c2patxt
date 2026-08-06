@@ -63,13 +63,29 @@ def test_every_relative_link_resolves(document: pathlib.Path) -> None:
 #: hrefs -- readme_renderer has no base-URL logic (pypa/readme_renderer#71, closed
 #: 2026-03-29), so a relative link in it resolved against pypi.org and 404'd.
 #:
-#: A PATTERN, not a fixed prefix, and that is the whole point. This matched only
-#: `blob/main/` when it was written, so a link to `.../tree/main/DOES-NOT-EXIST.md` --
-#: into our own repository, at a file that does not exist -- passed BOTH link tests:
-#: the relative one skips anything starting with https, and this one skipped anything
-#: not starting with `blob/main/`. Same shape as the defect it was written to close,
-#: one prefix over.
-_REPO_LINK = re.compile(r"https://github\.com/dualeai/c2pa-text/(?:blob|tree|raw)/[^/]+/(?P<path>[^)#]+)")
+def _repository_url() -> str:
+    """Our repository, read from ``pyproject.toml`` rather than written down here.
+
+    THE LITERAL KEPT GOING STALE, three times in one day, and each time it narrowed a
+    guarantee without failing anything. It matched only `blob/main/`, so a `tree/main/`
+    link to a missing file passed both link tests; and a repository RENAME would have
+    silenced it again, because a pattern that matches nothing reports nothing broken.
+
+    `pyproject.toml`'s `Repository` URL is the right source: it has to be correct
+    anyway -- it is what PyPI shows in the sidebar -- and reading it means the pattern
+    and the links cannot disagree without something failing.
+
+    Read with a regex rather than ``tomllib``, which is 3.11+ and this package supports
+    3.10 -- and a TOML parser as a test dependency is a lot of machinery for one line.
+    """
+    text = (ROOT / "pyproject.toml").read_text("utf-8")
+    match = re.search(r'^Repository = "([^"]+)"', text, re.M)
+    assert match, "pyproject.toml has no [project.urls] Repository entry"
+    return match.group(1).removesuffix(".git")
+
+
+#: A PATTERN over that URL, covering every form GitHub serves a file under.
+_REPO_LINK = re.compile(re.escape(_repository_url()) + r"/(?:blob|tree|raw)/[^/]+/(?P<path>[^)#]+)")
 
 
 @pytest.mark.parametrize("document", MARKDOWN, ids=lambda p: p.name)
@@ -84,8 +100,18 @@ def test_every_link_into_our_own_repository_resolves(document: pathlib.Path) -> 
 
     The URL is still not FETCHED -- that would put the network in the suite. What is
     checked is that the path after the blob prefix names a file we actually ship.
+
+    README.md IS REQUIRED TO CARRY SOME. Without that, every way this test has been
+    weakened -- an absolute prefix it did not match, a rename it did not follow -- reads
+    as "nothing broken" instead of "nothing checked". A vacuous pass is the failure mode
+    of this test specifically, so it is the one thing asserted unconditionally.
     """
     targets = re.findall(r"\]\(([^)]+)\)", document.read_text("utf-8"))
+    if document.name == "README.md":
+        assert any(_REPO_LINK.fullmatch(target) for target in targets), (
+            f"no links into {_repository_url()} found in README.md; the pattern and the "
+            "links have drifted apart, and this test is checking nothing"
+        )
     broken = sorted(
         target
         for target in targets

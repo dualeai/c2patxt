@@ -75,10 +75,10 @@ dev = [
 
 [project.urls]
 Homepage = "https://duale.ai"
-Documentation = "https://github.com/dualeai/c2pa-text#readme"
-Repository = "https://github.com/dualeai/c2pa-text.git"
-Changelog = "https://github.com/dualeai/c2pa-text/releases"
-Issues = "https://github.com/dualeai/c2pa-text/issues"
+Documentation = "https://github.com/dualeai/c2patxt#readme"
+Repository = "https://github.com/dualeai/c2patxt.git"
+Changelog = "https://github.com/dualeai/c2patxt/releases"
+Issues = "https://github.com/dualeai/c2patxt/issues"
 
 [build-system]
 requires = ["setuptools>=78.1.1"] # Pinned for CVE-2025-47273

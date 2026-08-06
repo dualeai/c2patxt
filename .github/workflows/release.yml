@@ -248,12 +248,17 @@ jobs:
             echo "- [TestPyPI](https://test.pypi.org/p/c2patxt)"
             echo "- [PyPI](https://pypi.org/p/c2patxt)"
             echo ""
+            # THE REPOSITORY NAME HERE MUST BE EXACT. `gh attestation verify -R` matches
+            # against the repository named in the signed provenance, so a stale value
+            # fails verification even when the artifact is genuine -- and these lines
+            # are printed for whoever cuts the release to copy. Renamed from
+            # dualeai/c2pa-text on 2026-08-06; nothing published predates that.
             echo "### Verify this release yourself"
             echo '```bash'
             echo "# artifact -> commit (SLSA provenance)"
-            echo "gh attestation verify ./c2patxt-*.whl -R dualeai/c2pa-text"
+            echo "gh attestation verify ./c2patxt-*.whl -R dualeai/c2patxt"
             echo "# artifact -> publisher (PEP 740, no GitHub account needed)"
-            echo "pypi-attestations verify pypi --repository https://github.com/dualeai/c2pa-text <url>"
+            echo "pypi-attestations verify pypi --repository https://github.com/dualeai/c2patxt <url>"
             echo '```'
             echo ""
             echo "An attestation tells you WHERE a package came from, not WHETHER to trust it."

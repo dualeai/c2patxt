@@ -134,9 +134,21 @@ publishing.
 
 **Before the first release**, both the `testpypi` and `pypi` environments need a
 trusted publisher configured on the respective index. Three fields have to match
-exactly, and a mismatch in any of them is the standard first-release failure: the
-owner/repository, the workflow filename `release.yml`, and the environment name
+exactly, and a mismatch in any of them is the standard first-release failure:
+`dualeai/c2patxt`, the workflow filename `release.yml`, and the environment name
 (`testpypi` or `pypi`). No API token exists or should; see [SECURITY.md](SECURITY.md).
+
+> **The repository was renamed** from `dualeai/c2pa-text` to `dualeai/c2patxt`. If a
+> trusted publisher was configured under the old name it must be updated on **both**
+> indexes. GitHub's rename redirect does not help: the OIDC token the workflow mints
+> carries the *current* repository, and the index compares that claim against what it
+> has stored. A stale entry fails the upload at `publish-testpypi` — after `build` has
+> already run and attested — and because TestPyPI gates PyPI, someone fixing only the
+> one they hit will meet the other on the next attempt.
+
+Nothing published predates the rename, so no released artifact carries provenance
+naming the old repository and there is no historical mismatch for an auditor to
+reconcile. That is only true until the first release.
 
 **The version comes from the tag**, via `cicd/version.sh`, which falls back to `0.1.0`
 when `git describe` finds nothing. `fetch-depth: 0` in the workflow is what makes tags

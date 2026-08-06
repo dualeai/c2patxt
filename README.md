@@ -53,7 +53,7 @@ Python 3.10+. One runtime dependency: `cryptography`.
 > Until then, install from a checkout:
 >
 > ```console
-> $ git clone <this repository> && cd c2pa-text
+> $ git clone <this repository> && cd c2patxt
 > $ make install
 > ```
 >
@@ -301,7 +301,7 @@ Catch `C2paTextError`; `MarkCorruptError`, `AlreadyMarkedError`,
 most integrators meet first — it is what `Signer(...)` raises for a non-conformant
 certificate, and it was left off this list once already, which is why the base class
 exists. The reason this matters on a verification endpoint is in
-[SECURITY.md](https://github.com/dualeai/c2pa-text/blob/main/SECURITY.md). The same
+[SECURITY.md](https://github.com/dualeai/c2patxt/blob/main/SECURITY.md). The same
 split applies when a limit trips — `verify` returns `INVALID`, the other three raise.
 
 ## Limits
@@ -309,7 +309,7 @@ split applies when a limit trips — `verify` returns `INVALID`, the other three
 | Property | Answer |
 | --- | --- |
 | Survives copy-paste of the full text | Yes, where the application preserves variation selectors |
-| Survives any edit to the visible text | **No.** By design — see [robustness](https://github.com/dualeai/c2pa-text/blob/main/docs/robustness.md) |
+| Survives any edit to the visible text | **No.** By design — see [robustness](https://github.com/dualeai/c2patxt/blob/main/docs/robustness.md) |
 | Survives NFC/NFD/NFKC/NFKD | The **mark** does; the binding does not. Decomposing is enough — see below |
 | Detects tampering | Yes; that is the mechanism |
 | Identifies the signer | Only against anchors you supply |
@@ -374,7 +374,7 @@ this library cannot know what your endpoint considers a reasonable request. Budg
 roughly 0.1 ms of CPU per MB of unmarked text and about 4x the document size in peak
 memory for a marked one, and cap the body size at your edge.
 
-Per-attack survival rates are in **[docs/robustness.md](https://github.com/dualeai/c2pa-text/blob/main/docs/robustness.md)** (PAN'26
+Per-attack survival rates are in **[docs/robustness.md](https://github.com/dualeai/c2patxt/blob/main/docs/robustness.md)** (PAN'26
 corpus, 300 documents, CC-BY-4.0, DOI 10.5281/zenodo.18620130). Read both columns:
 **carrier survival is not provenance survival.** A transform can leave every selector
 intact, so the mark is still found, while the covered bytes changed and the binding
@@ -390,7 +390,7 @@ do not repeat vendor claims about it.
 
 Everything an AppSec questionnaire asks, without contacting us.
 
-- **Licence.** Apache-2.0, including its express patent grant. See [LICENSE](https://github.com/dualeai/c2pa-text/blob/main/LICENSE).
+- **Licence.** Apache-2.0, including its express patent grant. See [LICENSE](https://github.com/dualeai/c2patxt/blob/main/LICENSE).
 - **Dependencies.** Exactly one at runtime:
   ```console
   $ python -c "from importlib.metadata import requires; \
@@ -403,7 +403,7 @@ Everything an AppSec questionnaire asks, without contacting us.
   discovery, no log records. The suite runs with `--disable-socket`, so egress fails
   the build.
 - **Supported Python.** 3.10 – 3.14, CPython.
-- **Vulnerability reporting.** [SECURITY.md](https://github.com/dualeai/c2pa-text/blob/main/SECURITY.md) — a CRA Article 24(1)
+- **Vulnerability reporting.** [SECURITY.md](https://github.com/dualeai/c2patxt/blob/main/SECURITY.md) — a CRA Article 24(1)
   steward policy: 48h acknowledgement, 90-day coordinated disclosure.
 - **SBOM and provenance.** The release pipeline produces CycloneDX **and** SPDX SBOMs
   and attests both, plus build provenance. PLANNED, like the install: no release exists
@@ -412,8 +412,8 @@ Everything an AppSec questionnaire asks, without contacting us.
 Verify a release yourself:
 
 ```console
-$ gh attestation verify ./c2patxt-X.Y.Z-py3-none-any.whl -R dualeai/c2pa-text
-$ pypi-attestations verify pypi --repository https://github.com/dualeai/c2pa-text <url>
+$ gh attestation verify ./c2patxt-X.Y.Z-py3-none-any.whl -R dualeai/c2patxt
+$ pypi-attestations verify pypi --repository https://github.com/dualeai/c2patxt <url>
 $ uv export --frozen --no-emit-project -o requirements.txt
 $ pip install --require-hashes -r requirements.txt
 ```
@@ -442,18 +442,18 @@ attestations. Verification is a step you run, not an assumption you inherit.
   vectors. We pass all six.
 
 What ships in this release, and what deliberately does not:
-**[release scope](https://github.com/dualeai/c2pa-text/blob/main/docs/release-scope.md)** · **[changelog](https://github.com/dualeai/c2pa-text/blob/main/CHANGELOG.md)**
+**[release scope](https://github.com/dualeai/c2patxt/blob/main/docs/release-scope.md)** · **[changelog](https://github.com/dualeai/c2patxt/blob/main/CHANGELOG.md)**
 
 Four defects that cause silent divergence between conforming implementations are
-drafted for filing upstream: **[upstream filing](https://github.com/dualeai/c2pa-text/blob/main/docs/upstream-filing.md)**.
+drafted for filing upstream: **[upstream filing](https://github.com/dualeai/c2patxt/blob/main/docs/upstream-filing.md)**.
 
-Detail: **[compatibility](https://github.com/dualeai/c2pa-text/blob/main/docs/c2pa-compatibility.md)** ·
-**[deviations](https://github.com/dualeai/c2pa-text/blob/main/docs/deviations.md)** ·
-**[known divergences](https://github.com/dualeai/c2pa-text/blob/main/docs/known-divergences.md)** ·
-**[open questions](https://github.com/dualeai/c2pa-text/blob/main/docs/open-questions.md)** ·
-**[robustness](https://github.com/dualeai/c2pa-text/blob/main/docs/robustness.md)** ·
-**[mutation audit](https://github.com/dualeai/c2pa-text/blob/main/docs/mutation-audit.md)** ·
-**[benchmarks](https://github.com/dualeai/c2pa-text/blob/main/docs/benchmarks.md)**
+Detail: **[compatibility](https://github.com/dualeai/c2patxt/blob/main/docs/c2pa-compatibility.md)** ·
+**[deviations](https://github.com/dualeai/c2patxt/blob/main/docs/deviations.md)** ·
+**[known divergences](https://github.com/dualeai/c2patxt/blob/main/docs/known-divergences.md)** ·
+**[open questions](https://github.com/dualeai/c2patxt/blob/main/docs/open-questions.md)** ·
+**[robustness](https://github.com/dualeai/c2patxt/blob/main/docs/robustness.md)** ·
+**[mutation audit](https://github.com/dualeai/c2patxt/blob/main/docs/mutation-audit.md)** ·
+**[benchmarks](https://github.com/dualeai/c2patxt/blob/main/docs/benchmarks.md)**
 
 `docs/platform-handoff.md` is also in the tree. It corrects an internal document that
 is not, so it reads as correspondence rather than reference — kept for the findings,
@@ -463,7 +463,7 @@ We publish a wire-format conformance vector file
 (`tests/vectors/A8ConformanceTest-1.1.0.txt`) because the rubric has none.
 Interoperability with the two other public A.8 implementations is tested in
 `tests/test_third_party_interop.py`; where we deliberately disagree with them, and
-why, is in [known divergences](https://github.com/dualeai/c2pa-text/blob/main/docs/known-divergences.md).
+why, is in [known divergences](https://github.com/dualeai/c2patxt/blob/main/docs/known-divergences.md).
 
 ---
 
@@ -479,4 +479,4 @@ $ uv run python -m tools.robustness train.jsonl   # the robustness numbers
 
 ## Licence
 
-Apache-2.0. See [LICENSE](https://github.com/dualeai/c2pa-text/blob/main/LICENSE).
+Apache-2.0. See [LICENSE](https://github.com/dualeai/c2patxt/blob/main/LICENSE).

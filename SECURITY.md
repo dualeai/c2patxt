@@ -16,7 +16,7 @@ is measured against.
 
 GitHub Security Advisories are the preferred route once this repository is public —
 private vulnerability reporting is enabled, and
-`https://github.com/dualeai/c2pa-text/security/advisories/new` will accept reports at
+`https://github.com/dualeai/c2patxt/security/advisories/new` will accept reports at
 that point. It does not resolve while the repository is internal, which is why email
 comes first here rather than second.
 
@@ -124,11 +124,11 @@ attached to the GitHub release. Verify a release yourself:
 
 ```bash
 # artifact -> commit (SLSA provenance)
-gh attestation verify ./c2patxt-<version>-py3-none-any.whl -R dualeai/c2pa-text
+gh attestation verify ./c2patxt-<version>-py3-none-any.whl -R dualeai/c2patxt
 
 # artifact -> publisher (PEP 740; no GitHub account required)
 pypi-attestations verify pypi \
-  --repository https://github.com/dualeai/c2pa-text \
+  --repository https://github.com/dualeai/c2patxt \
   https://files.pythonhosted.org/packages/.../c2patxt-<version>-py3-none-any.whl
 ```
 
