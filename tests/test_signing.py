@@ -185,8 +185,7 @@ def test_the_escape_hatch_exists_only_to_build_verifier_tests() -> None:
 def test_the_claim_signing_eku_is_reachable_from_the_package() -> None:
     """Reachable from the package, because a caller has to name it to build a leaf.
 
-    NOT required by the profile, and an earlier version of this line called it "the one
-    constant nobody can build a working certificate without". 14.5.1.1 names no EKU OID;
+    NOT required by the profile. 14.5.1.1 names no EKU OID;
     a leaf carrying only id-kp-emailProtection verifies as VALID. It is exported because
     14.5.1.2 lets a validator accept only credentials bearing an EKU it holds anchors
     for, so this is the OID a C2PA-aware trust store looks for.

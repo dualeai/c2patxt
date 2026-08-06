@@ -72,7 +72,7 @@ def test_the_search_settles_in_a_modest_number_of_builds(signer: Signer) -> None
     THE BOUND IS THE ALGORITHM'S OWN CEILING, deliberately, not a measurement.
     solve() tries at most _MAX_TARGETS targets of (1 probe + _WINDOW * 3 pads), so
     801 builds is the most it can ever do; anything at or below that is the search
-    working as designed. An earlier version pinned 400, taken from a measurement on
+    working as designed. A bound of 400, taken from a measurement on
     one machine, and a run on a different interpreter hit 553 -- a green test failing
     for a reason that had nothing to do with a regression.
 

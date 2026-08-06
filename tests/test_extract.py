@@ -637,7 +637,7 @@ def test_json_decoding_is_scoped_to_metadata_labels(
 
 
 def test_extract_refuses_multi_wrapper_text_as_verify_does(signer: Signer) -> None:
-    """``extract`` used to return the FIRST wrapper's manifest on multi-wrapper text,
+    """``extract`` REFUSES multi-wrapper text rather than returning the first wrapper's manifest,
     with no error and no signal. It now refuses, and the reversal is deliberate.
 
     THE DEVIATION ENTRY ARGUES AGAINST THE OLD BEHAVIOUR IN ITS OWN WORDS. Recording why
@@ -649,13 +649,8 @@ def test_extract_refuses_multi_wrapper_text_as_verify_does(signer: Signer) -> No
     prepend -- and an integrator calling ``extract`` to render "who signed this" got
     their manifest.
 
-    I ARGUED THE OTHER WAY EARLIER TODAY: that ``extract`` performs no validation, that
-    multiple wrappers is a validation verdict rather than a parse failure, and that a
-    caller inspecting a suspicious document should be able to see what is in it. The
-    last point stands and is served by ``locate``, which returns a SPAN rather than a
-    manifest and documents its first-wrapper choice. The rest does not survive the
-    deviation's own reasoning: handing back attacker-chosen provenance silently is not a
-    lesser evil than refusing.
+    A caller inspecting a suspicious document is served by ``locate``, which returns a
+    SPAN rather than a manifest and documents its first-wrapper choice.
 
     ``manifest.text.multipleWrappers`` rather than the carrier's corruption code: the
     wrapper decoded perfectly and there are simply two of them, which is what that code

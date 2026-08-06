@@ -1,14 +1,12 @@
 """The code in README.md, executed.
 
 This tests CODE that happens to live in a markdown file. It does not test prose: no
-link resolution, no banned words, no required substrings. Those checks lived here until
-2026-08-06 and were removed as documentation grading rather than testing.
+link resolution, no banned words, no required substrings.
 
-What survives is the reason the file still exists. `pyproject.toml` sets
-`readme = "README.md"`, so this file is the entire PyPI long description and its
-quickstart is the first code most readers run. On the day it was first executed it did
-not work: it called a function defined fifty lines below it, and a worked example
-quoted two dates that were already in the past.
+`pyproject.toml` sets `readme = "README.md"`, so that file is the entire PyPI long
+description and its quickstart is the first code most readers run. The two failures
+this catches are a quickstart that calls a function defined fifty lines below it, and a
+worked example quoting dates already in the past.
 """
 
 from __future__ import annotations
@@ -66,10 +64,9 @@ def test_the_readme_quickstart_runs_as_written() -> None:
     shelf_life = next(block for block in blocks if "not_valid_after_utc" in block)
     exec(compile(shelf_life, "README.md[shelf life]", "exec"), namespace)  # noqa: S102 -- as above
 
-    # THE BLOCK'S OWN `inside` AND `after`, not values recomputed here. A first version
-    # derived both from `leaf.not_valid_after_utc`, so breaking the block's arithmetic
-    # left it green: an assertion whose operands both come from the test cannot fail on
-    # a change to the document.
+    # THE BLOCK'S OWN `inside` AND `after`, not values recomputed here. Deriving both
+    # from `leaf.not_valid_after_utc` makes the assertion's operands come from the test,
+    # so it cannot fail on a change to the block's arithmetic.
     leaf, marked = namespace["leaf"], namespace["marked"]
     inside, after = namespace["inside"], namespace["after"]
     assert isinstance(leaf, x509.Certificate)

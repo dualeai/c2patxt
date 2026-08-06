@@ -55,9 +55,8 @@ def build_certificate(
     With ``conformant=True`` it satisfies the C2PA 14.5.1.1 rules the validator enforces:
     ``cA`` NOT asserted, ``keyCertSign`` NOT asserted, ``digitalSignature`` ASSERTED, and
     a present, non-empty EKU. It also carries ``c2pa-kp-claimSigning`` -- which the
-    profile does NOT require, and which an earlier version of this paragraph listed while
-    omitting ``digitalSignature``, sending a reader debugging a rejected certificate to
-    the one property that does not matter and away from one that does.
+    profile does NOT require -- a reader debugging a rejected certificate should
+    look at ``digitalSignature``, not at this.
 
     With ``conformant=False`` it is what ``openssl req -x509`` produces by default --
     ``cA`` asserted and no EKU at all. That combination yields

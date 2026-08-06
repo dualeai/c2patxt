@@ -82,7 +82,6 @@ ASSERTION_HASH_DATA = "c2pa.hash.data"
 #: (with label c2pa.actions) and the new v2 (which shall have a label of
 #: c2pa.actions.v2)." 5.1 makes "deprecated" mean a claim generator SHALL NOT write
 #: it, and Appendix C.1 lists c2pa.actions as deprecated in both 2.3 and 2.4. We
-#: emitted the v1 label until 2026-08-05.
 ASSERTION_ACTIONS = "c2pa.actions.v2"
 
 ASSERTION_ACTIONS_V1 = "c2pa.actions"
@@ -129,7 +128,7 @@ class Assertion:
     and thumbnails, none of which we produce. 18.17.2 is explicit: "Each metadata
     assertion shall contain a single JSON content type box containing the JSON-LD
     serialization of one or more metadata values. The @context property within the
-    JSON-LD object shall be included". We emitted it as CBOR until 2026-08-05.
+    JSON-LD object shall be included".
     """
 
     def to_box(self) -> JumbfBox:
@@ -280,9 +279,6 @@ def _actions_assertion(when: datetime.datetime) -> Assertion:
                     # TAG 0, not a bare string. 18.15.12's CDDL types this `tdate`,
                     # 6.9 defines that as "serialized in CBOR as tag number 0", and
                     # the spec's own example writes 0("2023-02-11T09:00:00Z"). We
-                    # emitted an untagged text string until 2026-08-05; _cbor has
-                    # always supported tags, so it was an oversight rather than a
-                    # codec limitation.
                     "when": _cbor.Tagged(0, when.isoformat().replace("+00:00", "Z")),
                 }
             ]
@@ -447,8 +443,7 @@ def build_manifest_store(
 
     # C2PA 11.1.4.2: "shall be labelled with a urn:c2pa value". 8.1's ABNF is
     #   c2pa_urn = "urn:c2pa:" UUID [claim-generator [version-reason]]
-    # NOT urn:uuid:, which is RFC 9562's namespace and what we emitted until
-    # 2026-08-05. The label lives inside the SIGNED claim and inside every
+    # NOT urn:uuid:, which is RFC 9562's namespace. The label lives inside the SIGNED claim and inside every
     # self#jumbf= resolution path, so it is a wire defect rather than a cosmetic one.
     # The two optional suffixes are omitted: version-reason applies only to manifests
     # versioned due to a conflict, which we never produce.

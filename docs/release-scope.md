@@ -6,9 +6,7 @@ task silently becomes a blocker.
 
 ## Definition of done
 
-Every row was re-verified on 2026-08-06 and every one held. A dated blanket assurance
-nobody re-runs is worth less than no assurance, so the date belongs to the last time
-someone actually ran the column — not to the document.
+Every row was re-verified on 2026-08-06 and every one held.
 
 | Requirement | Status | Evidence |
 | --- | --- | --- |
@@ -16,7 +14,7 @@ someone actually ran the column — not to the document.
 | Three-way agreement with the encypher and writerslogic vectors | ✅ | `tests/test_third_party_interop.py` |
 | Coverage ≥ 90, and the gate is real rather than tautological | ✅ | 99.83%; mutation-verified — see below |
 | Exactly one runtime dependency | ✅ | `tests/test_package.py`, `tests/test_leaf_rule.py` |
-| README states its six load-bearing claims without hedging | ✅ | Review. A test asserting six substrings were present was removed on 2026-08-06 as documentation grading; nothing checks the wording now |
+| README states its six load-bearing claims without hedging | ✅ | Review only. Nothing automated checks the wording |
 | Every unresolved item described as unverified, or removed | ✅ | [open-questions.md](open-questions.md) |
 
 The evidence is in [mutation-audit.md](mutation-audit.md).
@@ -32,8 +30,7 @@ statement.
 
 **"The gate is real" is a claim we can support, not an aspiration.** Several tests
 were verified by deliberately breaking the code and confirming they fail: the CBOR
-corpus test (which previously passed with the decoder replaced by an unconditional
-raise), the assertion-authentication check, the duplicate-label rejection, the
+corpus test, the assertion-authentication check, the duplicate-label rejection, the
 non-`cbor` assertion rejection, and the quadratic-scan guard. Where a test did *not*
 bite, it was rewritten rather than kept.
 
@@ -50,8 +47,7 @@ statement, the text conformance rubric).
 **Delivered ahead of its planned scope:** the adversarial robustness numbers were
 explicitly *not* required for 0.1.0, on the grounds that they are a measurement rather
 than a correctness gate. They were measured anyway and are published in
-[robustness.md](robustness.md), so the README states real numbers instead of saying
-they are not yet available.
+[robustness.md](robustness.md).
 
 ## Deliberately not in 0.1.0
 
@@ -132,7 +128,6 @@ The **build** job — `uv build`, `twine check`, SBOM, attestation — runs on e
 to `main`. The **publish** jobs are gated on the `release` event. That leaves the OIDC
 handshake as the single untested step at release time, rather than the whole chain.
 
-**Not on a tag.** This said "gated behind a tag", which would send a maintainer to
-`git push --tags` and produce nothing at all: the `push` trigger filters on
-`branches: [main]`, and a branch filter excludes tag pushes. Publishing means creating
+**Not on a tag.** `git push --tags` produces nothing at all: the `push` trigger filters
+on `branches: [main]`, and a branch filter excludes tag pushes. Publishing means creating
 a GitHub **Release**. The runbook is in [CONTRIBUTING.md](../CONTRIBUTING.md#cutting-a-release).

@@ -146,7 +146,7 @@ def test_duplicate_map_keys_are_rejected() -> None:
 
 
 def test_unknown_tags_are_refused_by_the_writer_and_carried_by_the_reader() -> None:
-    """The asymmetry is the design, and this test used to assert its opposite.
+    """The asymmetry is the design.
 
     It required ``loads`` to REJECT tag 1, which made a conforming third-party manifest
     unreadable: ``_parse_assertions`` turns a CborDecodeError into

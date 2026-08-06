@@ -27,11 +27,6 @@ VALIDATION ORDER, AND WHAT IT COSTS
 15.1.2 says the phases are "listed in no particular order", and we run them assertions,
 then binding, then signature -- see ``verify`` at the foot of this module.
 
-AN EARLIER VERSION OF THIS PARAGRAPH CLAIMED THE OPPOSITE, describing a
-signature-before-hash order as a deliberate mitigation. The code has never done that,
-so the paragraph asserted a security property the package did not have -- and a reviewer
-who read it would stop looking, which is the worst thing a docstring can do.
-
 The order is not free, and the consequence is real rather than theoretical: everything
 before the signature check runs on the word of an attacker holding no credential. That
 is what made pre-authentication hash amplification possible -- one manifest naming a
@@ -42,7 +37,7 @@ equal a located wrapper span before any hash is computed, so an attacker cannot 
 which bytes the binding covers.
 
 Reordering to signature-first would remove that class of exposure at the root, and the
-argument once given here against it was wrong: ``verify`` runs all three phases
+``verify`` runs all three phases
 UNCONDITIONALLY and accumulates every code, so reordering changes the ORDER of entries
 in ``Verdict.failure`` and not the set reported. What it would change is how much work
 runs before authentication. Recorded in docs/open-questions.md.
@@ -103,9 +98,9 @@ class VerifyContext:
     default -- this is the ONLY channel, with no environment variable behind it.
 
     PARSED EAGERLY, at construction. A malformed bundle is a CALLER error, and
-    resolving it lazily inside :func:`verify` put the failure on the signature-valid
-    path ONLY: unmarked and invalid text sailed through while the first genuinely
-    good document raised. That asymmetry survives every staging test built on
+    resolving it lazily inside :func:`verify` puts the failure on the signature-valid
+    path ONLY -- unmarked and invalid text sails through while the first genuinely
+    good document raises, an asymmetry that survives every staging test built on
     unmarked input. Parsing here also stops the bundle being re-parsed on every
     single call."""
 
@@ -131,10 +126,10 @@ class VerifyContext:
     """The parsed anchors, derived from ``anchors_pem``.
 
     ``init=False`` because ``__post_init__`` overwrites this unconditionally. Without
-    it, ``VerifyContext(anchors=(cert,))`` CONSTRUCTED, discarded the argument, and
-    reported ``signingCredential.untrusted`` on every mark forever -- silent, and
-    indistinguishable from having supplied nothing. The docstring said "do not set it
-    directly", which is not a mechanism. Now it is a ``TypeError`` naming the keyword.
+    it, ``VerifyContext(anchors=(cert,))`` constructs, discards the argument, and
+    reports ``signingCredential.untrusted`` on every mark forever -- silent, and
+    indistinguishable from having supplied nothing. With it, that call is a
+    ``TypeError`` naming the keyword; "do not set it directly" is not a mechanism.
     """
 
     def __post_init__(self) -> None:
@@ -170,10 +165,10 @@ def _hash_binding_bytes(encoded: bytes, start: int, length: int) -> bytes:
     ("Normalization") in practice: the hash covers the NFC form of the visible text
     with the wrapper's byte range removed, and nothing else.
 
-    Takes the document ALREADY ENCODED. It used to take the ``str`` and encode it
-    here, which meant ``_binding_status`` -- which needs the encoded length two lines
-    earlier for the suffix rule -- encoded the same document a second time and threw
-    the result away. That was 10-12% of a whole verify. The offsets this function
+    Takes the document ALREADY ENCODED. Taking the ``str`` and encoding it here makes
+    ``_binding_status`` -- which needs the encoded length two lines earlier for the
+    suffix rule -- encode the same document twice and throw one result away, 10-12% of
+    a whole verify. The offsets this function
     indexes with are UTF-8 byte offsets, so bytes are the honest argument type anyway.
     """
     remaining = encoded[:start] + encoded[start + length :]
@@ -278,18 +273,11 @@ def _binding_status(text: str, manifest: ManifestStore, matches: Sequence[Wrappe
     """Decide the single status the hard binding earns (15.12.1.3.1).
 
     ``matches`` is the located wrappers, PASSED IN rather than found here. This
-    function used to call ``find_wrappers(text)`` on text the caller had already
-    scanned, keeping only the spans -- a second full walk of the document, and of the
-    selector run inside it. Re-measured 2026-08-06 against SHIPPED code, 9 repetitions:
+    Calling ``find_wrappers(text)`` here instead re-walks a document the caller has
+    already scanned, and the selector run inside it. Measured 2026-08-06 against
+    shipped code, 9 repetitions:
     the second scan is 11.1% of a double-scanning verify on a 12 B document and 21.9%
     on a 1 MB one.
-
-    THE SHORT-DOCUMENT FIGURE READ 59% AND THE PREMISE UNDER IT WAS STALE. It said
-    ``_decode_run`` "traverses one code point at a time in Python", which stopped being
-    true when the run was moved to a regex plus ``str.translate`` -- ``_locate`` says so
-    in the same words, one file away. Under that older implementation the share was
-    28.8%, still not 59%. The 1 MB figure was taken against current code and reproduces
-    to a tenth of a point, which is what shows the pair was measured in two worlds.
 
     Required rather than defaulted to ``None``-means-rescan: a default would let a
     caller reintroduce the second walk by forgetting an argument, and there is
@@ -333,9 +321,8 @@ def _binding_status(text: str, manifest: ManifestStore, matches: Sequence[Wrappe
     # it, so an attacker could mint text we call VALID and a peer implementation calls
     # INVALID, at will. Requiring a suffix costs nothing: we only ever produce suffixes,
     # and it is what makes the two readings agree by construction.
-    # BOTH CONDITIONS ARE INDEPENDENTLY LOAD-BEARING. An earlier comment here claimed
-    # the suffix rule subsumed the membership test, on the strength of a mutation that
-    # survived the suite. It does not: slide the wrapper one WHOLE CODE POINT earlier
+    # BOTH CONDITIONS ARE INDEPENDENTLY LOAD-BEARING, and the suffix rule does NOT
+    # subsume the membership test. Slide the wrapper one WHOLE CODE POINT earlier
     # and pad the tail to match, and `start + length == encoded_length` still holds
     # while the range names no located wrapper. With the membership test that is
     # dataHash.malformed; without it the input reaches the hash and reports
@@ -349,8 +336,7 @@ def _binding_status(text: str, manifest: ManifestStore, matches: Sequence[Wrappe
     # ONE encode, used for both the suffix rule and the hash. Taking the length from
     # a throwaway encode here and letting _hash_binding_bytes encode again below cost
     # 14.0% of a whole verify at 1 MB and 0.4% at 12 B -- a 35x spread, because the
-    # duplicated work is proportional to the document and nothing else is. This read
-    # "10-12% ... on a document of ANY SIZE", and the size-invariance was the false part.
+    # duplicated work is proportional to the document and nothing else is.
     encoded = text.encode("utf-8")
     spans = {(match.span.utf8_start, len(match.span)) for match in matches}
     if (start, length) not in spans or start + length != len(encoded):
@@ -363,12 +349,10 @@ def _binding_status(text: str, manifest: ManifestStore, matches: Sequence[Wrappe
 #: that is easy to miss: it is NOT a ValueError, so an x5chain leaf whose
 #: SubjectPublicKeyInfo names an OID `cryptography` does not implement escaped a
 #: plain `except ValueError` and propagated out of verify(). A truncated DER, by
-#: contrast, raises ValueError and was always caught -- which is exactly why the gap
-#: was narrow enough to survive.
+#: contrast, raises ValueError, which is why this gap is narrow enough to look closed.
 #:
-#: THIS TUPLE IS NOT THE WHOLE SET AND CANNOT BE. Enumerating it has now failed three
-#: times: a one-byte edit to a valid mark produced `InvalidVersion`, `KeyError` and
-#: `DuplicateExtension`, none of them a ValueError and two of them descending straight
+#: THIS TUPLE IS NOT THE WHOLE SET AND CANNOT BE. A one-byte edit to a valid mark produces
+#: `InvalidVersion`, `KeyError` and `DuplicateExtension`, none of them a ValueError and two of them descending straight
 #: from Exception. Use it where the operation is a single narrow call; use
 #: :func:`_load_chain` where attacker DER is parsed.
 CERTIFICATE_ERRORS = (ValueError, UnsupportedAlgorithm)
@@ -555,11 +539,6 @@ _REQUIRED_CLAIM_FIELDS = ("instanceID", "signature", "created_assertions", "clai
 
 def _claim_malformed(claim: dict[str, CborValue]) -> bool:
     """Apply 15.6.2's required-field check.
-
-    manifest.py's Claim docstring has always SAID these are "enforced on read by
-    15.6.2", and nothing enforced them: a claim with no instanceID verified happily.
-    A docstring describing behaviour the module does not have is worse than silence,
-    because a reviewer reads it and stops looking.
 
     15.6.2 also requires claim_generator_info to contain a ``name``, and the field to
     be a MAP -- claim-map-v2 declares ``$generator-info-map``, singular, where v1
@@ -1029,10 +1008,7 @@ def _has_single_inception_action(payload: CborValue) -> bool:
 
     So "both created and opened" and "two created" fail because the SECOND inception
     action cannot be first, and an actions array beginning c2pa.edited fails for the
-    same reason -- an asset cannot be edited before it exists. An earlier version of
-    this docstring justified the strictness as our own reading of "exactly one"; the
-    specification states it outright, and presenting a spec rule as our judgement is
-    the overclaim this repository exists to avoid.
+    same reason -- an asset cannot be edited before it exists.
 
     The "first actions ASSERTION" half of the clause needs the claim's link order and
     lives in ``_actions_status``.
@@ -1234,8 +1210,8 @@ def _disclosure_status(payload: CborValue) -> StatusCode | None:
 
     so the twenty-four literals are a union with any ``tstr``, exactly as its sibling
     ``$asset-type-choice`` is, under a rule the specification itself comments as "one of
-    the listed choices OR A CUSTOM VALUE". An earlier version of this function checked
-    membership of the twenty-four and refused ``ai.duale.types.model.generative`` -- 6.2.2
+    the listed choices OR A CUSTOM VALUE". Checking membership of the twenty-four refuses
+    ``ai.duale.types.model.generative`` -- 6.2.2
     entity-specific namespacing, which ``signing.py``'s own comment acknowledges the
     specification permits -- along with any framework Table 12 predates.
 
@@ -1541,11 +1517,11 @@ def verify(text: str, *, context: VerifyContext | None = None) -> Verdict:
     surrogate is not a text asset this specification can describe, so there is no
     verdict to give and :class:`UnencodableTextError` is raised instead.
 
-    THAT PROMISE WAS FALSE UNTIL 2026-08-06, and the shape of the failure is worth
+    THE PROMISE IS NARROW AND EASY TO BREAK, and the shape of the failure is worth
     knowing before changing anything below. A single byte changed in a valid mark's
-    certificate produced ``InvalidVersion``, ``KeyError`` or ``DuplicateExtension`` out
-    of this function -- none of them a ``C2paTextError``, which is what the
-    documentation tells integrators to catch. ``cryptography`` parses lazily, so a
+    certificate can produce ``InvalidVersion``, ``KeyError`` or ``DuplicateExtension``
+    -- none of them a ``C2paTextError``, which is what the documentation tells
+    integrators to catch. ``cryptography`` parses lazily, so a
     malformed field raises at an ATTRIBUTE ACCESS two modules away from the load, past
     every ``try`` watching it. :func:`_load_chain` is the boundary that closed it, and
     the promise now rests on its probe list covering every certificate field this

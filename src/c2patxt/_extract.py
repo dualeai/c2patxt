@@ -72,8 +72,8 @@ def _children_with_bytes(box: JumbfBox, what: str) -> dict[str, tuple[JumbfBox, 
     attacker who can make those two differ can substitute an assertion at will.
 
     A DUPLICATE LABEL IS REJECTED, NOT OVERWRITTEN. This returns a label-keyed map,
-    and an earlier version simply assigned into it -- last write wins -- which
-    silently discarded a box and defeated three separate checks built on top:
+    and plainly assigning into it -- last write wins -- silently discards a box and
+    defeats three separate checks built on top:
 
       * the "more than one manifest" count, since two manifests sharing a label
         collapsed to one and never tripped it;
@@ -222,8 +222,8 @@ def _content(box: JumbfBox, tbox: bytes) -> bytes | None:
     take the FIRST box where we took the last, so two conforming implementations would
     authenticate different content from identical bytes." That argument applies
     unchanged one level down -- two cbor boxes in one assertion is the same ambiguity
-    at a smaller scale, and the bytes hash identically either way -- and this function
-    resolved it silently until 2026-08-06.
+    at a smaller scale, and the bytes hash identically either way -- so resolving it silently is not an option here
+    either.
 
     Raises:
         MarkCorruptError: the box carries more than one content box of that type,
@@ -338,18 +338,17 @@ def parse_manifest_store(raw: bytes) -> ManifestStore:
         # 15.5.1: "The last C2PA Manifest superbox in the C2PA Manifest Store
         # superbox shall be considered the active manifest." We follow it rather than
         # rejecting plural manifests, and the reasoning changed once the duplicate-
-        # label collapse below was fixed:
+        # Rejecting len(manifests) > 1 looks safer -- picking one silently seems to
+        # let an attacker append a manifest and have different consumers read
+        # different claims -- but the rule is DETERMINISTIC, so every conforming
+        # consumer picks the same one, and the divergence would come from our own
+        # departure rather than from the rule. Appending anything also grows the
+        # wrapper, which breaks the exclusion range, so the hard binding rejects it
+        # regardless.
         #
-        # An earlier version rejected len(manifests) > 1, arguing that picking one
-        # silently lets an attacker append a manifest and have different consumers
-        # read different claims. But the rule is DETERMINISTIC, so every conforming
-        # consumer picks the same one -- the divergence risk came from our own
-        # departure, not from the rule. And appending anything grows the wrapper,
-        # which breaks the exclusion range, so the hard binding rejects it regardless.
-        #
-        # What genuinely was exploitable is duplicate LABELS, which used to collapse
-        # silently and is now refused outright. That is the check doing the security
-        # work here; this line is spec conformance.
+        # Duplicate LABELS are the exploitable case, and _children_with_bytes refuses
+        # them outright. That is the check doing the security work here; this line is
+        # spec conformance.
         label = list(manifests)[-1]
         manifest = manifests[label]
         parts = _children(manifest, f"manifest {label}")

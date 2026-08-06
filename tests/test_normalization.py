@@ -146,7 +146,7 @@ _DIVERGENCE_CASES: list[tuple[str, str, str, str]] = [
 def test_every_divergence_case_actually_diverges() -> None:
     """A check on the TABLE, not on the package.
 
-    This assertion used to sit inside the test below, where it compared two literals
+    Inside the test below this compares two literals
     that the parametrize decorator had just handed it: no change to ``src/`` could
     make it fail. It is still worth making -- a row whose two orderings agree is a
     witness to nothing, and would sit in the table looking like coverage -- so it runs

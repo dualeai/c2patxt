@@ -2,23 +2,23 @@
 
 release.yml sells the sdist as the artefact that "lets an auditor diff shipped source
 against the git tag with no rebuild". The obvious next thing an auditor does is run
-the tests. Before 2026-08-05 that produced a wall of collection errors: setuptools'
-default sdist picked up ``tests/test_*.py`` but dropped ``tests/conftest.py``,
-``tests/__init__.py``, ``tests/_json.py`` and the entire ``tests/vectors/`` tree, so
-every test needing a fixture or a vector corpus died on import.
+the tests. setuptools' default sdist picks up ``tests/test_*.py`` and drops
+``tests/conftest.py``, ``tests/__init__.py``, ``tests/_json.py`` and the entire
+``tests/vectors/`` tree, so every test needing a fixture or a vector corpus dies on
+import.
 
 Shipping a suite that cannot run is worse than shipping none: it invites the one
 check we most want an auditor to perform and then fails in a way that looks like our
 code is broken.
 
-WHAT IS CHECKED HERE IS THE CONTENTS, NOT A RUN. A test that unpacked the sdist and
-executed the whole suite inside it used to live here. It cost 15.3 s of a 22 s suite to
-run all 1 242 tests a second time, and it made OTHER tests lie: under ``-x`` it was
-reported as the failure instead of the test that named the rule; under ``--deselect``
-its subprocess did not inherit the flag, so a selective probe reported kills it had not
-earned; and on a cold ``uv`` cache it resolved the package to the archive cache rather
-than ``src/``, turning the default target red. The files it proved were present are
-asserted directly below, in under a second.
+WHAT IS CHECKED HERE IS THE CONTENTS, NOT A RUN. Unpacking the sdist and executing the
+whole suite inside it costs 15.3 s of a 22 s run -- every test a second time -- and
+makes OTHER tests lie: under ``-x`` the subprocess is reported as the failure instead
+of the test that names the rule; under ``--deselect`` it does not inherit the flag, so
+a selective probe reports kills it has not earned; and on a cold ``uv`` cache it
+resolves the package to the archive cache rather than ``src/``, turning the default
+target red. The files it would prove present are asserted directly below, in under a
+second.
 """
 
 from __future__ import annotations

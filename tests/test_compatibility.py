@@ -88,8 +88,7 @@ _DOTTED = re.compile(r"\bA?\.?[0-9]{1,2}(?:\.[0-9]+)+\b(?!\s*(?:s\b|ms\b|[KMG]i?
 #: before harvesting rather than causing the line to be skipped, because a single
 #: sentence often cites both -- "C2PA 13.2.1 permits Ed25519; RFC 8032 5.1.6 derives the
 #: nonce deterministically" -- and dropping the whole line would lose the C2PA half.
-#: Reading RFC sections as C2PA clauses is how the first version of this guard came to
-#: be checking "4.1.2.8" against a C2PA inventory.
+#: Reading RFC sections as C2PA clauses ends up checking "4.1.2.8" against a C2PA inventory.
 _ANOTHER_STANDARD = re.compile(r"RFC\s+[0-9]+,?\s+(?:section|appendix|clause)?\s*[0-9A-Z](?:\.[0-9]+)*", re.IGNORECASE)
 
 #: OID arcs. ``2.5`` is the ITU-T/ISO joint arc and ``1.3`` the ISO identified-organization

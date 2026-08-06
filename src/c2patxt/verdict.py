@@ -90,14 +90,13 @@ class Provenance(str, enum.Enum):
         clause's: this package accepts Ed25519 alone, where 13.2.1's list is wider. A
         conforming ES256 mark is refused here and reported under the same code. That is
         deliberate and it is a deviation -- see docs/deviations.md -- but it is not
-        14.5.1.1 speaking, and an earlier version of this docstring attributed it to the
-        clause by naming the profile as the only cause.
+        14.5.1.1 speaking, so do not describe the profile as the only cause.
 
-    SO INVALID DOES NOT MEAN "TAMPERED". An earlier version ended "the text may have
-    been altered after signing", which is true of the binding case and false of an
-    expired certificate, where nothing was altered and the mark is simply no longer
-    acceptable. It is equally false of a disclosure that names no model, where the text
-    is exactly what was signed and the claim is the thing that is inadequate.
+    SO INVALID DOES NOT MEAN "TAMPERED". "The text may have been altered after signing"
+    is true of the binding case and false of an expired certificate, where nothing was
+    altered and the mark is simply no longer acceptable. It is equally false of a
+    disclosure that names no model, where the text is exactly what was signed and the
+    claim is the thing that is inadequate.
     """
 
     VALID = "valid"
@@ -186,16 +185,14 @@ class Verdict:
     more than one wrapper, and every structural failure inside the manifest. The
     carrier-level codes are exactly the ones that report those cases.
 
-    This said "present even when validation FAILED" without the qualification, and
-    ``verdict.manifest.assertions`` then raises ``AttributeError`` on precisely the
-    hostile inputs where a caller most needs their code not to crash."""
+    ``verdict.manifest.assertions`` raises ``AttributeError`` on precisely the hostile
+    inputs where a caller most needs their code not to crash, so check for ``None``."""
 
     span: Span | None = None
     """Byte range of the wrapper in the text as stored.
 
     ``None`` when unmarked, AND on the corrupt-wrapper path -- a wrapper whose magic
-    matched but whose structure is malformed has no span to report, so "None when
-    unmarked" was an incomplete rule that reads as a complete one.
+    matched but whose structure is malformed has no span to report.
 
     Typed concretely rather than as ``object`` so removing the mark -- the single most
     common thing to do with it -- needs no cast."""

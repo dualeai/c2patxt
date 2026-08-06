@@ -102,15 +102,6 @@ class MarkCorruptError(C2paTextError, ValueError):
             a character index into it. ``_extract`` passes an empty ``doc`` and ``0``: a
             manifest that is structurally intact and wrong at the C2PA layer has no
             meaningful position, and ``__str__`` appends no location at all then.
-
-            THIS FIELD HAS BEEN DESCRIBED WRONGLY THREE TIMES, which is why the cases are
-            enumerated. It was "a byte offset into the NFC-normalized encoding" (true of
-            no site -- ``_locate`` indexes the as-stored form). Then "a byte offset into
-            the decoded body" (also wrong -- the offset indexes the text). Then, briefly,
-            the offsets themselves were wrong: ``parse_wrapper_body`` added a DECODED
-            index to a DOCUMENT offset, and ``MAGIC`` is 8 decoded bytes against 31
-            encoded ones, so a bad-version report landed inside the magic number. Fixed
-            in ``_document_offset``; a test pins each field's true offset.
         code: The C2PA status code this corresponds to, so a caught exception maps
             onto the same vocabulary as ``Verdict.failure``.
     """

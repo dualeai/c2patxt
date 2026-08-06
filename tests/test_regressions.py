@@ -77,8 +77,8 @@ def _encoded_bytes(operation: Callable[[str], object], text: str) -> int:
     """Total bytes ``operation`` encodes out of ``text``, transitively through slices.
 
     The unit these tests assert in. A byte count is an integer that is identical on
-    every machine, so unlike the CPU-time ratios these tests used to carry, it needs no
-    headroom constant and cannot fail under load.
+    every machine, so it needs no headroom constant and cannot fail under load -- unlike
+    a CPU-time ratio.
     """
     counting = _CountingStr(text)
     _CountingStr.encoded_bytes = 0
@@ -105,12 +105,11 @@ def test_xlbox_of_zero_does_not_hang() -> None:
     data = _box(TBOX_SUPERBOX, _description() + child)
 
     # THE REAL GUARD HERE IS THE TIMEOUT, NOT THIS ASSERTION. It comes from
-    # pyproject.toml's global "--timeout=30" rather than a marker on this test; an
-    # earlier version of this comment named @pytest.mark.timeout, which is not here. If the XLBox
+    # pyproject.toml's global "--timeout=30" rather than a marker on this test. If the XLBox
     # check is removed, parse_superbox never returns and the line below never runs --
     # pytest-timeout is what fails the test. The assertion catches a slow-but-
     # terminating regression; the timeout catches the hang. Do not delete the timeout
-    # timeout believing this assert covers it.
+    # believing this assert covers it.
     started = time.process_time()
     with pytest.raises(JumbfError, match="XLBox 0 is shorter"):
         parse_superbox(data)
@@ -176,11 +175,10 @@ def test_scanning_is_linear_not_quadratic() -> None:
     allocation -- allocation was bounded, CPU was not. Doubling the input must
     roughly double the time, not quadruple it.
 
-    COUNTED, NOT TIMED -- and this test used to be timed. It asserted that 4x the input
-    cost less than 10x the CPU, measured with ``process_time`` rather than wall clock
-    because the wall-clock version failed 5 runs out of 6 under load and 0 out of 3
-    unloaded, on a PRISTINE tree, since the suite runs under ``-n auto`` and inflicts
-    that contention on itself.
+    COUNTED, NOT TIMED. A timed form -- 4x the input under 10x the CPU, measured with
+    ``process_time`` rather than wall clock -- is flaky: it fails 5 runs out of 6 under
+    load and 0 out of 3 unloaded, on a PRISTINE tree, since the suite runs under
+    ``-n auto`` and inflicts that contention on itself.
 
     Counting the encodes is strictly stronger. The defect WAS one whole-document encode
     per match, so the encode count is not a proxy for the regression -- it is the
@@ -203,12 +201,10 @@ def test_scanning_is_linear_not_quadratic() -> None:
 
     for count in (4_000, 16_000):
         encoded, size = scan(count)
-        # THREE passes, and the bound is 4 so that a FOURTH fails. An earlier version
-        # of this comment named two -- require_encodable and the incremental prefix
-        # walk -- and set the bound at 3, which left a margin of FIFTY BYTES at both
-        # sizes: 2.999745 and 2.999936 passes. A constant 50 bytes is not headroom, it
-        # is the measured value rounded up, and it would have failed on an unrelated
-        # change to the wrapper length.
+        # THREE passes, and the bound is 4 so that a FOURTH fails. A bound of 3 leaves
+        # a margin of FIFTY BYTES at both sizes -- 2.999745 and 2.999936 passes --
+        # which is the measured value rounded up rather than headroom, and would fail
+        # on an unrelated change to the wrapper length.
         #
         # The third pass is `wrapper_text.encode("utf-8")`; the prefix walk is the
         # second and re-encodes each wrapper, because `consumed_index` is set to

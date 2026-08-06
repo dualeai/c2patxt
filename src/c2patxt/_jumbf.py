@@ -79,8 +79,7 @@ _SURROGATE_MAX = 0xDFFF
 class Toggle:
     """jumd toggle bits, and the field each one gates.
 
-    Bits 0x04 and 0x08 were the weakest-evidenced part of the format -- previously
-    inferred only from c2pa-rs test comments. They are now confirmed 4374/4374
+    Bits 0x04 and 0x08 are the weakest-evidenced part of the format: they rest on 4374/4374
     against the WG1 conformance dataset's per-file ground truth, and independently
     in both WG1 reference implementations.
 

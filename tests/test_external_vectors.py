@@ -110,7 +110,7 @@ def test_the_corpus_contains_an_algorithm_c2pa_forbids() -> None:
 def test_cbor_appendix_a_corpus_covers_major_types_zero_to_six() -> None:
     """RFC 8949 Appendix A, grouped by major type.
 
-    NAMED FOR WHAT IT ACTUALLY CHECKS. It used to say "every major type" and assert
+    NAMED FOR WHAT IT ACTUALLY CHECKS: mt0 to mt6, not "every major type". Asserting
     `len >= 7` against exactly seven files -- a bound that reads as a floor and is
     really an equality, over a set that stops at mt6.
 

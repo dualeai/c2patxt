@@ -222,7 +222,7 @@ def test_a_colon_is_allowed_because_c2pa_labels_require_it() -> None:
     forbidding ``:`` would make the specification unable to express its own required
     labels. C2PA 11.1.4.1.1 governs here.
 
-    THE LABEL USED HERE IS THE ONE WE ACTUALLY EMIT. An earlier version wrote
+    THE LABEL USED HERE IS THE ONE WE ACTUALLY EMIT. Writing
     ``urn:uuid:``, which is RFC 9562's namespace rather than C2PA's, and is a defect this
     package fixed in signed bytes -- so the file whose job is to stop a contributor
     "reading a difference as our bug" was itself carrying the bug as its example.

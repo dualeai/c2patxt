@@ -22,8 +22,7 @@ Checked against the Creator Assertions Working Group's own specification index a
 | User Experience Guidance | current 1.0 |
 
 None is text-specific, and the index mentions neither `text/plain` nor "unstructured"
-anywhere. This was previously recorded as *absence of evidence*; it is now absence
-confirmed against the authoritative list rather than against a search that came back
+anywhere. This is absence confirmed against the authoritative list, not a search that came back
 empty. We are not designing around a specification that does not exist.
 
 ## HypoFuzz licensing — UNRESOLVED, and a legal question rather than a technical one
@@ -78,9 +77,8 @@ class remains, and the next expensive check added before the signature would reo
 
 Signature-first would remove it at the root. Two things argue against doing it casually:
 
-- **It changes the ORDER of reported codes, not the set.** An earlier version of this
-  entry claimed the set would change; `verify` runs all three phases unconditionally and
-  accumulates every code, so a manifest broken in several ways already reports all of
+- **It changes the ORDER of reported codes, not the set.** `verify` runs all three
+  phases unconditionally and accumulates every code, so a manifest broken in several ways already reports all of
   them. Nothing pins the top-level phase order — the three ordering tests pin
   `_assertion_failure`'s INTERNAL order, which is a different rule.
 - **It changes what a caller learns.** Reporting `claimSignature.mismatch` for a manifest
@@ -91,7 +89,7 @@ The honest position is that the current order is a choice with a known cost, def
 one specific mitigation, and that anything added to the pre-signature path needs its work
 bounded the way `_assertion_digest` bounds hashing.
 
-## Closed since this file's predecessor
+## Closed
 
 - **JUMBF constants, `jumd` layout, toggle bits, content-type UUIDs, LBox/XLBox
   semantics, the Padding Box.** Resolved by four independent sources plus verbatim
@@ -100,7 +98,5 @@ bounded the way `_assertion_digest` bounds hashing.
   the 2.0 PDF and have been re-verified byte for byte against the 2.4 build. See
   [c2pa-compatibility.md](c2pa-compatibility.md).
 - **pytest-codspeed simulation mode** was adopted on 2026-08-05, in `tests/benchmarks/`
-  and `.github/workflows/codspeed.yml`. This entry recorded the opposite -- that it
-  "no longer matters" because benchmarks had moved to optional post-v1 -- until a
-  requirement arrived. What is held by a benchmark and what is held by an assertion is
+  and `.github/workflows/codspeed.yml`. What is held by a benchmark and what is held by an assertion is
   set out in [benchmarks.md](benchmarks.md).

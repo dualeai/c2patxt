@@ -299,8 +299,7 @@ locate   -> raises MarkCorruptError
 Catch `C2paTextError`; `MarkCorruptError`, `AlreadyMarkedError`,
 `UnencodableTextError` and `ProfileError` all derive from it. `ProfileError` is the one
 most integrators meet first — it is what `Signer(...)` raises for a non-conformant
-certificate, and it was left off this list once already, which is why the base class
-exists. The reason this matters on a verification endpoint is in
+certificate. Catch the base class rather than the four subclasses; the list can grow. The reason this matters on a verification endpoint is in
 [SECURITY.md](https://github.com/dualeai/c2patxt/blob/main/SECURITY.md). The same
 split applies when a limit trips — `verify` returns `INVALID`, the other three raise.
 
@@ -349,10 +348,6 @@ verify(marked, context=VerifyContext(now=after)).state  # Provenance.INVALID
 
 The second carries `claimSignature.outsideValidity`. Nothing was tampered with; the
 credential simply expired between the two calls.
-
-**Written against the leaf's own window, not against dates.** An earlier version of
-this block quoted two fixed timestamps, which stopped being true the day after they
-were measured — the same defect as publishing a sample maximum as a bound.
 
 Pass `VerifyContext(now=...)` to fix the instant and make `verify` a pure function of
 its arguments — which is what makes a stored verdict reproducible. Without it, do not
@@ -454,10 +449,6 @@ Detail: **[compatibility](https://github.com/dualeai/c2patxt/blob/main/docs/c2pa
 **[robustness](https://github.com/dualeai/c2patxt/blob/main/docs/robustness.md)** ·
 **[mutation audit](https://github.com/dualeai/c2patxt/blob/main/docs/mutation-audit.md)** ·
 **[benchmarks](https://github.com/dualeai/c2patxt/blob/main/docs/benchmarks.md)**
-
-`docs/platform-handoff.md` is also in the tree. It corrects an internal document that
-is not, so it reads as correspondence rather than reference — kept for the findings,
-not linked here as documentation of this package.
 
 We publish a wire-format conformance vector file
 (`tests/vectors/A8ConformanceTest-1.1.0.txt`) because the rubric has none.

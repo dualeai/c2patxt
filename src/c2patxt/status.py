@@ -117,9 +117,6 @@ class StatusKind(str, enum.Enum):
     __format__ = str.__format__
 
 
-#: Which bucket each code belongs to. A code absent here is a programming error,
-#: not an input error, so lookup raises rather than guessing.
-
 #: What each code MEANS, keyed by member. Assigned to ``__doc__`` below rather than
 #: written as a literal under each member, because an enum discards those: the string
 #: after ``NAME = "value"`` never reaches ``StatusCode.NAME.__doc__``, which returns the
@@ -237,11 +234,9 @@ _EXPLANATIONS: dict[StatusCode, str] = {
     SUCCESS. Every certificate in the chain is inside its validity window AT VALIDATION.
 
     15.8: "the C2PA Manifest is valid if the current time at validation is within the
-    validity period of the signer's certificate". NOT the signing time -- these two
-    sentences said "when signed" and "at the signing time", which is the reading
-    ``_verify`` argues against at length and which two deleted tests once encoded. A
-    reader who believed it would expect marks to survive their credential's expiry.
-    They do not: a certificate live when it signed and expired now lands on
+    validity period of the signer's certificate". NOT the signing time. A reader
+    who believes otherwise expects marks to survive their credential's expiry. They do
+    not: a certificate live when it signed and expired now lands on
     ``outsideValidity``.
 
     Checked across the WHOLE chain, not just the leaf: an intermediate that has
@@ -326,6 +321,8 @@ for _code, _text in _EXPLANATIONS.items():
     # the opening quotes to stay inside the line limit, and that must not show.
     _code.__doc__ = inspect.cleandoc(_text)
 
+#: Which bucket each code belongs to. A code absent here is a programming error, not an
+#: input error, so lookup raises rather than guessing.
 _KIND: dict[StatusCode, StatusKind] = {
     StatusCode.DATA_HASH_MATCH: StatusKind.SUCCESS,
     StatusCode.ASSERTION_HASHED_URI_MATCH: StatusKind.SUCCESS,

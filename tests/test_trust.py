@@ -150,7 +150,7 @@ def test_the_environment_cannot_supply_anchors(
 def test_a_hostile_anchors_variable_cannot_break_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The exact bomb that used to fire on the happy path only.
+    """The exact bomb that fires on the happy path only.
 
     Both of these raised -- FileNotFoundError and a PEM MalformedFraming ValueError --
     from inside verify(), and ONLY for text that was otherwise valid.

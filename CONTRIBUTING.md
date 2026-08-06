@@ -24,9 +24,10 @@ that instead.
 
 **A test must fail if you break the code it covers.** Before adding one, delete the
 function body in your head: if the test still passes, the assertion is too weak. This
-is not theoretical here. A CBOR corpus test in this repository once passed with the
-decoder replaced by an unconditional `raise`, and a manifest-label test asserted the
-wrong value while citing the clause that contradicted it — so it *defended* the defect.
+is not theoretical. Two shapes recur: a corpus test that catches every exception the
+decoder can raise, so an unconditional `raise` satisfies it; and an assertion pinning
+the wrong value while citing the clause that contradicts it, so the test *defends* the
+defect.
 
 **Write the failing test first.** Reproduce the bug, watch the test fail, then fix it.
 Prefer parametrized cases: a defect where one input behaves differently from its
@@ -62,8 +63,9 @@ conformance vector file. Text marked by an older version must keep verifying, or
 compliance artefact was worthless.
 
 `tests/test_vector_file.py::test_the_signed_manifest_bytes_are_exactly_what_they_were`
-is what holds this — a SHA-256 over one fully pinned `embed()`. Until it existed, a
-four-byte change to the COSE `x5chain` encoding passed the whole suite. Adding vector records is MINOR; changing what a
+is what holds this — a SHA-256 over one fully pinned `embed()`. Nothing else in the
+suite covers the emitted bytes, down to a four-byte change in the COSE `x5chain`
+encoding. Adding vector records is MINOR; changing what a
 record means is MAJOR.
 
 ## Changing anything under `tests/vectors/`

@@ -9,11 +9,9 @@ listed below is one you can open in the spec and compare against the code. If yo
 find a clause listed here that we do not actually implement, that is a bug in this
 file and we want the report.
 
-**Nothing automated checks it.** Tests that harvested clause citations out of the
-source and matched them against the tables below, in both directions, were removed on
-2026-08-06: grading prose is not the test suite's job. They had found five rows listed
-as implemented and cited at no implementing site. Read the tables as a claim maintained
-by hand.
+**Nothing automated checks it.** Grading prose is not the test suite's job, so the
+tables below are a claim maintained by hand. Read them as one — and report a row you
+cannot find in the code.
 
 For the places where the specification is ambiguous or self-contradictory and we had
 to choose, see [deviations.md](deviations.md). This file says *what* we implement;
@@ -153,8 +151,7 @@ key we verify a claim with to Ed25519, so a certificate reaching either rule was
 already rejected. The Subject Key Identifier requirement is a `should` for end-entity
 certificates, and a `should` is not a rejection condition.
 
-**Two more are genuinely not implemented, and were previously covered by a claim that
-this clause was checked "in full".** They are recorded here rather than quietly:
+**Two more are genuinely not implemented:**
 
 - **RSASSA-PSS parameters.** When `signatureAlgorithm` is `id-RSASSA-PSS` the clause
   requires `hashAlgorithm` to be present and to be one of `id-sha256` / `id-sha384` /
@@ -173,7 +170,7 @@ directly — `cryptography` exposes no accessor for either — and the walk stay
 top level of the `TBSCertificate` SEQUENCE so a `0x81` length byte inside a nested
 structure can never be mistaken for a field.
 
-**We do NOT require `c2pa-kp-claimSigning`,** and we did until 2026-08-05. 14.5.1.1
+**We do NOT require `c2pa-kp-claimSigning`.** 14.5.1.1
 names no required EKU OID; 14.4.1, which we cited for it, is addressed to validators
 about their own trust-anchor configuration and explicitly anticipates
 `id-kp-emailProtection` and `id-kp-documentSigning` instead — the pair previous versions

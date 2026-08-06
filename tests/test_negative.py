@@ -1072,13 +1072,12 @@ def test_an_exclusion_that_splits_a_code_point_is_malformed_not_a_crash(signer: 
     fragment that is not valid UTF-8. That must be a status, not a ``UnicodeDecodeError``
     escaping ``verify`` -- which promises never to raise.
 
-    DRIVEN AT ``_compare_digest``, WHICH IS THE UNIT THAT OWNS THE BEHAVIOUR, and the
-    first version of this test did not. It called ``_binding_status`` with a splitting
-    range, asserted ``assertion.dataHash.malformed``, and PASSED -- from a different
-    branch. The exclusion must equal a located wrapper span before the hash is ever
-    computed, so the span check answered first and returned the same code. Same
-    assertion, same result, wrong reason: precisely the defect this suite has been
-    hunting all day, committed while hunting it.
+    DRIVEN AT ``_compare_digest``, WHICH IS THE UNIT THAT OWNS THE BEHAVIOUR. Driving
+    ``_binding_status`` with a splitting range also asserts
+    ``assertion.dataHash.malformed`` and also passes -- from a different branch: the
+    exclusion must equal a located wrapper span before the hash is ever computed, so
+    the span check answers first and returns the same code. Same assertion, same
+    result, wrong reason.
 
     THE BRANCH IS UNREACHABLE THROUGH ``_binding_status`` TODAY, and is kept anyway.
     Located spans are code-point aligned by construction -- a wrapper begins at U+FEFF
@@ -1120,7 +1119,6 @@ def test_reference_collection_narrows_every_level(claim_generator_info: CborValu
     test hands them well-formed maps and lists. A ``TypeError`` escaping here would reach
     ``verify``, which promises never to raise, from input an attacker fully controls.
 
-    THAT SENTENCE WAS RETRACTED ONCE, AS UNSUPPORTED, AND IT SHOULD NOT HAVE BEEN.
     Three of the four rows below are reachable through the PUBLIC ``verify()`` -- an
     actions assertion carrying ``softwareAgent = {"icon": "not a map"}``, or
     ``softwareAgents = 42``, or a non-list ``templates`` -- and narrowing either guard

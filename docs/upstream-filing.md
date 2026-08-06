@@ -60,8 +60,7 @@ three be satisfied (25); a reference into a data box, which 10.2.3.2 makes a SHO
 decline (26); and no status code for a manifest store that fails to parse at all,
 recorded in [open-questions.md](open-questions.md).
 
-**U+FEFF is not on this list**, because it is Issue 3 above. It was on both, which made
-the count wrong twice over — filed and explicitly not filed in the same document.
+**U+FEFF is not on this list**, because it is Issue 3 above.
 
 ---
 

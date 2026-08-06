@@ -282,9 +282,8 @@ def check_claim_signing_profile(certificate: Certificate) -> None:
     time-stamping or OCSP-signing certificates -- time-stamping needs network access
     and is out of scope, and OCSP arrives stapled in the ``rVals`` unprotected header,
     which we do not parse -- but the clause's mutual-exclusivity rule constrains the
-    CLAIM-SIGNING certificate, so it is checked here. This docstring previously said
-    those rules "govern certificate roles we never validate" and skipped them; that
-    reading was backwards, and a credential able both to sign claims and to mint the
+    CLAIM-SIGNING certificate, so it is checked here. The rules look like they govern certificate roles we never
+    validate. They do not: a credential able both to sign claims and to mint the
     time-stamps attesting to when they were signed is the separation-of-duties failure
     the clause exists to prevent.
 
@@ -311,7 +310,7 @@ def check_claim_signing_profile(certificate: Certificate) -> None:
     # so without this the exception escapes _accept_credential and escapes verify(),
     # which is documented never to raise for absent, corrupt or invalid marks.
     #
-    # BOTH halves are inside the try, and an earlier version guarded only the second.
+    # BOTH halves are inside the try.
     # _check_x509_structure reads AuthorityKeyIdentifier for any certificate whose issuer
     # differs from its subject -- catching ExtensionNotFound alone -- so a wire
     # certificate that was not self-issued still escaped.
@@ -358,7 +357,7 @@ def _check_extensions(certificate: Certificate) -> None:
         raise ProfileError(msg)
 
     # "the Key Usage extension shall be present and should be marked as critical."
-    # PRESENCE IS REQUIRED IN ITS OWN RIGHT. We previously tolerated an absent
+    # PRESENCE IS REQUIRED IN ITS OWN RIGHT. Tolerating an absent
     # extension -- correctly reasoning that a certificate with no KeyUsage cannot
     # assert keyCertSign, and wrongly concluding there was nothing to check.
     try:
@@ -401,8 +400,8 @@ def _check_extensions(certificate: Certificate) -> None:
             )
             raise ProfileError(msg)
 
-    # NO REQUIRED OID. We used to demand c2pa-kp-claimSigning here and cite 14.4.1 for
-    # it, which was wrong twice over.
+    # NO REQUIRED OID, and demanding c2pa-kp-claimSigning here on 14.4.1's authority is
+    # wrong twice over.
     #
     # 14.5.1.1's EKU rules are exhaustively: present and non-empty on a non-CA
     # certificate, no anyExtendedKeyUsage, the timeStamping/OCSPSigning exclusivity
@@ -441,7 +440,7 @@ def load_anchors(pem: bytes | None = None) -> list[Certificate]:
     ``SECURITY.md`` all promise no ambient configuration -- and an environment
     variable would falsify all three.
 
-    A ``C2PATXT_TRUST_ANCHORS`` fallback used to exist here, modelled on
+    There is deliberately no ``C2PATXT_TRUST_ANCHORS`` fallback, though there is one in
     ``c2patool``. It was removed on 2026-08-05 for three reasons found by testing it:
     a missing path raised ``FileNotFoundError`` and a malformed one raised
     ``ValueError`` straight out of ``verify()``, which promises never to raise; the

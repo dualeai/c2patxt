@@ -531,16 +531,6 @@ def test_a_wrapper_that_is_not_a_suffix_is_rejected(signer: Signer) -> None:
     assert StatusCode.DATA_HASH_MALFORMED in verdict.codes()
 
 
-# NOTE: test_a_credential_expired_before_signing_is_not_valid and
-# test_a_credential_live_at_signing_stays_valid_after_it_expires lived here. Both
-# encoded the reading C2PA 15.8 contradicts -- that validity is judged against the
-# time the CLAIM asserts it was signed -- and the second one asserted, as intended
-# behaviour, that an expired credential still produces VALID. They are superseded by
-# test_validity_is_judged_at_validation_time above. Recorded rather than silently
-# deleted, because a test removed during a semantics change is exactly the thing a
-# later reader will want to find.
-
-
 def test_a_hostile_trust_anchors_variable_does_not_affect_verify(marked: str, monkeypatch: pytest.MonkeyPatch) -> None:
     """verify() consults NO ambient configuration, asserted end to end.
 
@@ -611,7 +601,7 @@ def test_validity_is_judged_at_validation_time(
 def test_an_expired_credential_cannot_hide_by_omitting_the_actions_assertion(
     signing_key: Ed25519PrivateKey,
 ) -> None:
-    """ATTACK: the validity check used to read its reference time out of the manifest.
+    """ATTACK: make the validity check read its reference time out of the manifest.
 
     c2pa.actions is attacker-supplied, and when it (or its `when`) was absent the
     check was SKIPPED -- while still filing claimSignature.insideValidity as a
@@ -1375,7 +1365,7 @@ def test_only_the_first_actions_assertion_may_carry_the_inception(
 
     # BOTH assertions are real boxes under their OWN labels, built through the helper so
     # each one's bytes decode to its own payload. Mapping two labels to byte-identical
-    # payloads -- the shortcut this test used to take -- is a state the parser refuses:
+    # payloads is a state the parser refuses:
     # both would decode to the same label and _children_with_bytes rejects duplicates.
     tampered = _with_assertion(_with_assertion(store, label, first), other, second)
 
@@ -1509,11 +1499,9 @@ def test_a_generator_icon_can_now_actually_resolve(store: ManifestStore) -> None
     input at all -- a check that only ever fails is not a check.
 
     THE FIXTURE IS A GENUINE `bfdb`/`bidb` SUPERBOX, serialized the way the assertion
-    store carries one. An earlier version used a loose byte string, which meant the test
-    stayed green when the pre-#89 rejection of non-`cbor` assertions was restored -- it
-    was asserting the match path over an input the parse could never deliver, and the
-    claim it makes about embedded data was held entirely by a different test in a
-    different file.
+    store carries one. A loose byte string leaves this green under a parse that rejects
+    non-`cbor` assertions -- it would assert the match path over an input the parse can
+    never deliver.
 
     Both directions are asserted from the same fixture: the right digest resolves, the
     wrong one is a mismatch. That is what makes this a test of the match path rather
@@ -1921,7 +1909,7 @@ def test_an_expired_intermediate_invalidates_the_mark(
     within the validity period of the signer's certificate **and all CA certificates up
     to the trust anchor**."
 
-    THE FIX FOR THIS LANDED EARLIER TODAY AND NOTHING PROVED IT WAS WIRED. Changing
+    NOTHING PROVES THE CHAIN CHECK IS WIRED THROUGH TO A VERDICT. Changing
     ``_chain_inside_validity(chain, ...)`` to ``(chain[:1], ...)`` -- undoing the whole
     change -- left the suite green, because the only test hand-built a two-certificate
     list and asserted a BOOL from the helper. It never touched ``Verdict.state`` and
@@ -2254,9 +2242,7 @@ def _with_assertion(store: ManifestStore, label: str, payload: _cbor.CborValue) 
     would leave them. The link is added or replaced by label, so the caller does not have
     to know whether the assertion already existed.
 
-    ``raw`` AND ``claim_bytes`` ARE LEFT STALE, and an earlier version of this docstring
-    claimed otherwise -- that "the only thing that differs from a real mark is the payload
-    under test". It is not: ``raw`` still holds the untampered store and ``claim_bytes``
+    ``raw`` AND ``claim_bytes`` ARE LEFT STALE: ``raw`` still holds the untampered store and ``claim_bytes``
     still decodes to the ORIGINAL claim.
 
     That is safe for ``_check_assertions``, which reads ``claim``, ``assertions``,

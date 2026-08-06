@@ -16,8 +16,8 @@ decision with its own review, not a keyword argument.
 
 WHY A DATACLASS AND NOT A CALLABLE PROTOCOL
 -------------------------------------------
-An earlier design took a bytes-in/signature-out callable so the private key could
-live in an HSM or KMS. No such deployment exists: RFC-136 has the router signing
+A bytes-in/signature-out callable, letting the private key live in an HSM or KMS, is
+the obvious alternative. No such deployment exists: RFC-136 has the router signing
 locally from a Kubernetes secret, and 'Credential custody' is explicit that the
 private key reaches exactly one service so marking adds no network call. A Protocol
 needs either multiple concrete production implementations or a dependency that
@@ -151,9 +151,7 @@ class Disclosure:
 
     Attributes:
         media_type: the media type of the text being marked. Validated as ``text/*``,
-            and WRITTEN INTO THE MANIFEST as ``dc:format``; see the note below. This
-            line said it was "NOT recorded in the manifest", nine lines above the note
-            saying it is -- which matters for privacy review, since a caller told the
+            and WRITTEN INTO THE MANIFEST as ``dc:format``; see the note below. A caller who believes this
             field is not recorded may put something in it they would not ship in
             signed bytes.
         model_type: ``c2pa.ai-disclosure`` ``modelType``, the assertion's only
@@ -331,9 +329,7 @@ def has_claim_signing_eku(certificate: Certificate) -> bool:
     14.5.1.1 profile at construction -- "THE PRODUCER MUST APPLY THE SAME PROFILE THE
     VERIFIER DOES", as it says -- so this predicate exists for a caller who wants to ASK
     rather than be refused. Holding a non-conformant development certificate needs
-    ``allow_nonconformant=True``; an earlier version of this paragraph said the profile
-    check "belongs to the verification path", which stopped being true when the
-    producer-side check landed. Note that a default ``openssl req -x509`` certificate
+    ``allow_nonconformant=True``. Note that a default ``openssl req -x509`` certificate
     asserts ``cA`` and carries no EKU at all, which yields
     ``signingCredential.invalid`` -- a hard reject -- rather than the expected
     ``signingCredential.untrusted``.

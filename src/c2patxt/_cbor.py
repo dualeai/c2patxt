@@ -47,8 +47,8 @@ together is the overclaim shape this package corrects elsewhere:
   security property no general-purpose decoder offers.
 - Tags 25/256 (string references) are refused BY US on the write side only, as a
   consequence of the two-tag allowlist in ``dumps``. That is our scope decision, not the
-  specification's; an earlier version of this paragraph called both cases "forbidden by
-  deterministic encoding", which credited 4.2.1 with a restriction it does not impose.
+  specification's -- calling it "forbidden by deterministic encoding" would credit
+  4.2.1 with a restriction it does not impose.
 """
 
 from __future__ import annotations
@@ -385,7 +385,7 @@ class _Decoder:
         This module's whole argument is that a decoder rejecting non-deterministic
         input is a security property no general-purpose library offers, and floats
         arrived without it: ``fb3ff0000000000000`` decoded to 1.0 where 4.2.1 requires
-        ``f93c00``, sitting alongside ``_argument``, which has always refused a
+        ``f93c00``, sitting alongside ``_argument``, which refuses a
         non-shortest INTEGER. Widening the reader is not licence to stop checking.
 
         4.2.1: "the shortest form that preserves the value". So the test is a round

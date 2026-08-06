@@ -2,18 +2,16 @@
 
 Run with: make test-bench
 
-ELEVEN BENCHMARKS, DOWN FROM 23, AND THEY CATCH MORE. The previous set was measured
-against the four performance defects this package has actually had, by reintroducing
-each one and comparing every benchmark: it caught ONE. Three moved no benchmark above
-its own run-to-run noise, because every input was benign and the defects amplify
-structures benign input does not contain -- one reference per assertion, zero decoy
-markers, one actions link. The amplification factor was exactly 1.
+EACH BENCHMARK DISCRIMINATES A DEFECT CLASS THIS PACKAGE HAS HAD. A benign-only set
+catches one of the four: three move no benchmark above its own run-to-run noise,
+because the defects amplify structures benign input does not contain -- one reference
+per assertion, zero decoy markers, one actions link -- so the amplification factor is
+exactly 1. That is why three of these inputs are hostile, and why ``strip``, which is
+public API, has one of its own.
 
-So the set changed shape rather than merely size. Twelve benchmarks that discriminated
-nothing were removed, and four added: three hostile inputs reproducing the defect
-classes, and ``strip``, which is public API and had no coverage. Re-measured 2026-08-06
-by restoring each defect: decoys 105.7x, hash amplification 8.4x, duplicate actions
-11.7x on the dedupe alone and 12.1x with both halves of its fix removed.
+Measured 2026-08-06 by restoring each defect: decoys 105.7x, hash amplification 8.4x,
+duplicate actions 11.7x on the dedupe alone and 12.1x with both halves of its fix
+removed.
 
 TWO RULES THIS FILE FOLLOWS, both learned by getting them wrong:
 
@@ -31,11 +29,10 @@ TWO RULES THIS FILE FOLLOWS, both learned by getting them wrong:
    benchmark's cost 95% and report as an improvement.
 
    A BENCHMARK ID IS ITS HISTORY. CodSpeed tracks each id separately, so renaming one
-   resets it to zero and deleting one discards it. That has already happened here
-   unnoticed: renaming ``decode_selector_run[typical]`` to ``[typical-1792B]`` reset
+   resets it to zero and deleting one discards it. Renaming
+   ``decode_selector_run[typical]`` to ``[typical-1792B]`` reset
    two histories, visible in the local ``.codspeed/results_*.json`` files either side
-   of 2026-08-05. Today's twelve removals are deliberate and their histories are gone
-   with them. Rename an id only when the old name was WRONG, never for tidiness.
+   of 2026-08-05. Rename an id only when the old name was WRONG, never for tidiness.
 
    ONE MEASURED CALL IS NOT ONE CALL. On an interpreter built with
    ``PY_HAVE_PERF_TRAMPOLINE`` -- which the CI interpreter is, verified against the
@@ -349,27 +346,26 @@ def test_bench_verify_hostile_duplicate_actions(benchmark: BenchmarkFixture) -> 
     The two counts are independent and both attacker-chosen, so the cost was their
     PRODUCT before the reference walk was deduped and made lazy.
 
-    ``instance=True`` IS LOAD-BEARING, and this benchmark ran without it while claiming
-    to cover the walk. Repeating the BASE actions label is rejected by ``_actions_status``
-    as ``assertion.action.malformed`` before the walk is drawn -- measured on the old
-    payload: ``_action_references`` called 0 times, ``_reference_status`` 0 times. It was
-    timing the rejection, at CBOR-decode and selector-decode cost already covered by
-    ``extract`` and ``decode_selector_run``. The reachable form links the base label once
-    and a 6.4 ``__1`` instance N times, which passes every shape rule: 2 walks and 800
-    reference checks.
+    ``instance=True`` IS LOAD-BEARING. Repeating the BASE actions label is rejected by
+    ``_actions_status`` as ``assertion.action.malformed`` before the walk is drawn --
+    ``_action_references`` called 0 times, ``_reference_status`` 0 times -- so that
+    payload times the rejection, at CBOR-decode and selector-decode cost already covered
+    by ``extract`` and ``decode_selector_run``. The reachable form links the base label
+    once and a 6.4 ``__1`` instance N times, which passes every shape rule: 2 walks and
+    800 reference checks.
 
     That is the difference between catching one defect and catching two. Measured here,
     min of 5, restoring each half of the fix separately:
 
     ====================  ===============  ==================
-    tree                  old payload      this payload
+    tree                  base-label only  ``__1`` instance
     ====================  ===============  ==================
     pristine               9.14 ms          15.21 ms
     dedupe removed         9.22 ms (1.0x)  177.82 ms (11.7x)
     both removed          76.19 ms (8.3x)  184.31 ms (12.1x)
     ====================  ===============  ==================
 
-    The old payload could not see the dedupe at all. The LAZINESS moves neither payload
+    The base-label payload cannot see the dedupe at all. The LAZINESS moves neither payload
     on its own (15.29 ms here) and is held where it belongs, by an assertion:
     ``test_a_repeated_actions_link_does_not_multiply_the_reference_walk`` pins the walk
     count at zero for a store the shape check rejects.

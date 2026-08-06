@@ -8,11 +8,8 @@ noticed if the line were wrong. The gate is `--cov-fail-under=90`; the figure th
 reports today is in [release-scope.md](release-scope.md), stated once so two documents
 cannot drift apart on it.
 
-Where a pass states a suite size, that is the size it ran against, and the numbers
-differ because the suite grew between passes. Pass 1 gives per-mutation test counts
-rather than a suite total, and there is no Pass 2 heading — two lines below refer to a
-second pass whose results were folded into the table instead of given their own
-section.
+Where a pass states a suite size, that is the size it ran against; the suite grew
+between passes.
 
 The first pass applied 24 mutations across `_verify`, `_extract`, `_selectors`,
 `_jumbf`, `_cbor` and `manifest`; 16 died immediately and 8 survived. **All eight are
@@ -54,7 +51,7 @@ re-applied to confirm it now dies.
 | `_verify` → drop the `bool`-before-`int` guard | **survived → fixed** |
 | `_verify` → drop the `HASH_ALGORITHMS` membership test | **survived → fixed** |
 | `_extract` → `manifests[-1]` → `manifests[0]` | **survived → fixed** |
-| `_verify` → drop the exact-span membership test | **survived → fixed** (misfiled as equivalent first — see below) |
+| `_verify` → drop the exact-span membership test | **survived → fixed** (see below) |
 
 ## What this audit actually found
 
@@ -89,7 +86,7 @@ None was visible in a coverage report.
 | `bool`-before-`int` | `{"start": True}` describing a real attacker-chosen range |
 | `HASH_ALGORITHMS` membership | `algorithm.unsupported`, never once produced by a test |
 | `manifests[-1]` | C2PA 15.5.1's active-manifest rule, justified by a 16-line comment |
-| exact-span membership | 15.12.1.3.1 step 3 — **and I misfiled it as equivalent** |
+| exact-span membership | 15.12.1.3.1 step 3 — looks equivalent until you build the input |
 
 Three patterns, all worth recognising elsewhere:
 
@@ -103,12 +100,10 @@ Three patterns, all worth recognising elsewhere:
   *test-local* functions differ — a fact about Unicode, not about our code — and never
   drove the shipped one.
 
-### The "equivalent mutant" was not equivalent — I was wrong
+### The exact-span membership mutant is not equivalent
 
-This document previously recorded the exact-span membership test as an equivalent
-mutant: *"the suffix rule already forces the span. Writing a test for it would mean
-writing a test that cannot fail."* **That was false**, and a follow-up audit disproved
-it in three lines.
+The tempting reading is that the suffix rule already forces the span, so a test for
+membership would be a test that cannot fail. It is false, and three lines disprove it.
 
 Slide the wrapper one **whole code point** (3 bytes) earlier and pad the tail by 3.
 The signed `start + length == len(encoded)` still holds, so the suffix rule passes,
@@ -149,7 +144,7 @@ the suite) rather than counted as a pass.
 `SPEC_VERSION = "2.4.0"` → `"2.4"`, dropping the `specVersion` emission, moving it to the
 deprecated claim-level position, and repointing `CLAIM_SIGNATURE_URI` at the claim box.
 
-**Eleven survivors, all now closed** — see the tasks that landed the same day. The four
+**Eleven survivors, all now closed.** The four
 worth remembering as a class:
 
 - The **wiring** survivors. `_count_hard_bindings`, `_chain_inside_validity`,
@@ -196,14 +191,12 @@ words `1 failed`. The reasoning is below.
 
 
 Every survivor needs a **distinguishing probe** — a test that passes on pristine code
-and fails under the mutant — before it is filed as untested rather than equivalent. Pass
-2 filed a survivor as equivalent without one and was wrong; a critic disproved it in
-three lines. The probe is the cheap part and it is what makes the distinction honest.
+and fails under the mutant — before it is filed as untested rather than equivalent. The
+probe is the cheap part and it is what makes the distinction honest.
 
 Two traps, both of which produce a green result from a broken probe. (A third, about
 reading a local CodSpeed table, is in [benchmarks.md](benchmarks.md) — it misleads a
-reader but does not make a probe pass. A fourth, three paragraphs about
-`tests/test_sdist.py` rerunning the whole suite, is gone with the test that caused it.)
+reader but does not make a probe pass.)
 
 - **Stale bytecode after a same-length revert.** Python invalidates a `.pyc` on source
   size and mtime, and `0xFFFE` → `0xFFFF` changes neither at second granularity. The
@@ -233,5 +226,5 @@ afternoon costs.
 
 ## Benchmarks
 
-Moved to [benchmarks.md](benchmarks.md) — what CodSpeed holds, what assertions hold,
-and the harness traps. This document is about mutation testing.
+Covered in [benchmarks.md](benchmarks.md) — what CodSpeed holds, what assertions hold,
+and the harness traps.

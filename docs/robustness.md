@@ -62,12 +62,6 @@ documents that fail are exactly the 150 containing a non-breaking space. **The r
 measures NBSP folding**, and its label is wrong for this corpus. A transform that
 genuinely rewrapped lines would change nothing here and the row would read 1.000.
 
-Three earlier explanations of this number were wrong, the last of them saying the
-fraction "is not something this repository can check" — which the reproduce block at the
-top of this file refutes. The corpus is one `curl` away and the measurement took a
-minute. **Not run in CI is not the same as not checkable**, and treating it as such is
-how an unverified claim gets written down twice.
-
 ## Why almost every row is 0.000, and why that is not a defect
 
 **A hard binding is not a watermark.** It is a cryptographic hash over the exact

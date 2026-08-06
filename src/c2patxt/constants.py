@@ -92,8 +92,7 @@ Measured on real manifests it lands at 3.88-3.91, because length prefixes, zero
 padding and hash high-nibbles put more bytes in the cheap 3-byte band. The asymmetry
 is a property of the specification and is not optimisable.
 
-(An earlier 3.79-3.85 here was taken before the manifest gained a ``c2pa.metadata``
-assertion. Re-measure after any change to what is emitted; see
+(Re-measure after any change to what is emitted; see
 ``tests/test_embed.py::test_the_published_size_figures_are_still_true``.)
 """
 

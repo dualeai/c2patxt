@@ -67,11 +67,9 @@ samples above bracket 456 from either side, which settles what the maximum is: a
 property of the corpus, not of this code. **The only bound is 801, and it is analytic:
 1 + _MAX_TARGETS * (1 + _WINDOW * 3).** It is what ``tests/test_fixpoint.py`` asserts.
 
-THE SAMPLE SIZE IS PART OF THE FIGURE. An earlier version published "median 28 builds
-(14 ms), best 5 (2.5 ms), worst 203 (101 ms)" from NINE inputs, and the worst case was
-low by more than a factor of two -- a distribution's tail is exactly what nine samples
-do not show. The milliseconds also halved when the selector encoder became a table
-lookup, so the old figures were stale in both directions at once.
+THE SAMPLE SIZE IS PART OF THE FIGURE, and so is the code it was taken against: these
+numbers move when the selector encoder or the manifest contents change. Quote both or
+quote neither.
 
 That variance is inherent to the approach and is acceptable here -- embed runs once per document, not per token -- but
 it is the number to look at first if embed ever needs to be fast.
@@ -128,10 +126,9 @@ _WINDOW = 8
 class FixpointError(C2paTextError, RuntimeError):
     """The padding search could not reach the declared target length.
 
-    Catchable as ``C2paTextError`` and as ``RuntimeError``. It derived from
-    ``RuntimeError`` alone until 2026-08-05, which meant a caller following
-    ``exceptions.py``'s instruction to catch ``C2paTextError`` did not catch it -- and it
-    is reachable from ``embed()``.
+    Catchable as ``C2paTextError`` and as ``RuntimeError``. Both bases are load-bearing:
+    it is reachable from ``embed()``, so a caller following ``exceptions.py``'s
+    instruction to catch ``C2paTextError`` must catch it.
 
     Never expected in practice. Raised rather than looped so that a builder which
     stops behaving monotonically fails loudly instead of hanging.

@@ -35,9 +35,9 @@ Repo-specific, and non-negotiable:
   self-describes that way. We claim interoperability, not primacy.
 - **Do not call this "the C2PA text library".** It is *our implementation of* C2PA
   text marking, and it is not a consortium release.
-- **A claim in shipped text must be true today, or marked as planned.** Five overclaims
-  have already been found and fixed here; each was a sentence asserting a property with
-  nothing checking it. If you write a claim, write the assertion that holds it.
+- **A claim in shipped text must be true today, or marked as planned.** An overclaim
+  takes one shape: a sentence asserting a property with nothing checking it. If you
+  write a claim, write the assertion that holds it.
 
 ## GitHub Actions must be SHA-pinned
 
@@ -53,8 +53,8 @@ $ gh api repos/actions/checkout/commits/v4.2.2 --jq '.sha'
 - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 ```
 
-**Use `commits/<tag>`, not `git/ref/tags/<tag>`.** This instruction said the latter
-until 2026-08-05, and it is correct only for *lightweight* tags. `actions/checkout`
+**Use `commits/<tag>`, not `git/ref/tags/<tag>`.** The latter is correct only for
+*lightweight* tags. `actions/checkout`
 uses those, which is why the worked example above is right either way. `CodSpeedHQ/action`
 uses **annotated** tags, where the ref points at a tag OBJECT and `.object.sha` returns
 that object rather than the commit:
@@ -70,10 +70,10 @@ $ gh api repos/CodSpeedHQ/action/commits/v5.0.2 --jq '.sha'
 `commits/<tag>` resolves both kinds. `git ls-remote <repo> refs/tags/<tag>^{}` also
 works.
 
-**Nothing in CI checks this.** A `zizmor` job ran `unpinned-uses` here until 2026-08-06,
-when it was removed — the action is not on the enterprise allowlist. It would not have
-caught the subtle half anyway: a SHA that is really a tag OBJECT is syntactically a
-valid pin. Both halves are now on the author, enforced by review.
+**Nothing in CI checks this.** `zizmor`'s `unpinned-uses` audit is unavailable — the
+action is not on the enterprise allowlist — and it would not catch the subtle half
+anyway: a SHA that is really a tag OBJECT is syntactically a valid pin. Both halves are
+on the author, enforced by review.
 
 A tag is mutable; a SHA is not. For a package whose whole argument is supply-chain
 verifiability, a mutable reference in the release path would undercut the claim.
@@ -91,7 +91,8 @@ carries a comment saying why the rule does not apply.
 package and the vector file, because text marked by an older version must keep
 verifying. Held by
 `tests/test_vector_file.py::test_the_signed_manifest_bytes_are_exactly_what_they_were`;
-before it, a four-byte x5chain change passed the whole suite.
+nothing else in the suite covers the emitted bytes, down to a four-byte change in the
+COSE `x5chain` encoding.
 
 **`VALID` is not a failure.** Our credential is self-signed and we ship no trust
 anchors, so a correct mark verifies as `VALID` carrying `signingCredential.untrusted`.

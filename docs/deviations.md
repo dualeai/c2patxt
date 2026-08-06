@@ -65,9 +65,7 @@ exactly the failure a provenance format cannot have.
 
 `verify()` and `extract()` both refuse; `locate()` deliberately does not, because it
 returns a *span* rather than a manifest and exists for inspecting a document rather than
-trusting it. Until 2026-08-05 `extract()` silently returned the first wrapper's
-manifest — which is this entry's own argument turned into a defect, since an attacker
-appends the second wrapper and therefore chooses what is first.
+trusting it.
 
 ## 3. Whether U+FEFF is inside the exclusion range
 
@@ -206,11 +204,8 @@ us. 18.28.2 makes it optional — "If present, the value of the `scientificDomai
 shall conform to the arXiv taxonomy" — and we hold no reliable signal for it. A
 guessed value inside a signed assertion is worse than its absence.
 
-This entry previously claimed "we emit an array and accept both", which was **false** —
-the field is neither emitted nor parsed, and `grep -rn scientificDomain src/ tests/`
-returns only docstrings saying so. Two independent audits found it. Recorded rather than
-quietly deleted, because a deviations document that describes behaviour the code does
-not have is the exact failure it exists to prevent.
+The field is neither emitted nor parsed; `grep -rn scientificDomain src/ tests/`
+returns only docstrings saying so.
 
 ## 14. `manifest.text.*` codes are absent from the normative CDDL enum
 
@@ -315,9 +310,7 @@ Pinned by `tests/test_cose.py::test_the_unprotected_bucket_is_still_refused`, as
 the exact message rather than merely a rejection, so the refusal cannot become
 incidental.
 
-## 19. WITHDRAWN — the specification does name the code, at 15.10.3.2.3
-
-**This entry was wrong and is kept as a correction rather than deleted.**
+## 19. The inception-action failure code is the specification's, not ours
 
 It said 15.10.1.2 "names no failure code" for a missing or duplicated inception action,
 and that `assertion.action.malformed` was therefore ours to adopt from a neighbouring
@@ -343,10 +336,7 @@ exists), and it must be in the **first actions assertion** the claim links, coun
 across 6.4's `__N` instances (`c2pa.actions.v2` and `c2pa.actions.v2__1` each carrying
 one inception action were accepted).
 
-The lesson is the entry itself: an overclaim here took the form of crediting ourselves
-with a decision the specification had already made, which is the same failure as
-claiming a property nothing checks. Read the neighbouring clause before recording a
-gap.
+Read the neighbouring clause before recording a gap.
 
 ## 20. We decline the v1 `c2pa.claim` label, which 10.1 says we *should* accept
 
@@ -433,9 +423,8 @@ listed anywhere. Inventing `assertion.aiDisclosure.malformed` would put a string
 verdict that no clause authorizes, and a third party reading our output would have no way
 to look it up.
 
-**We check PRESENCE, not membership — and an earlier version of this entry was wrong
-about that.** It claimed the risk was mitigated because "all twenty-four Table 12 values
-are accepted on read". Table 12 is not a closed enumeration. 18.28.4's CDDL — the schema
+**We check PRESENCE, not membership.** Table 12 is not a closed enumeration, so
+"all twenty-four values are accepted on read" is not a mitigation. 18.28.4's CDDL — the schema
 18.28.2 itself points at — extends the socket:
 
 ```
@@ -478,9 +467,7 @@ action alone rejected that example.
 `c2pa.opened` is exempt, by the clause's own next sentence: "No `digitalSourceType` field
 is required in conjunction with a `c2pa.opened` action" — which is a NOTE admonition
 rather than a numbered rule, so we are reading a non-normative note as scoping a
-`shall`. (Both the quotation above and this note are 18.15.2. An earlier version of this
-entry introduced the quotation as "18.15" and corrected the number only here, leaving a
-reader unable to tell which text the correction governed.)
+`shall`. (Both the quotation above and this note are 18.15.2.)
 
 ---
 
@@ -584,9 +571,9 @@ is what makes the two readings agree by construction.
 
 The membership test and the suffix rule are **independently load-bearing**: without
 membership an attacker chooses which bytes the hash covers; without the suffix rule the
-respelling above passes. An earlier comment claimed the suffix rule subsumed the
-membership test, on the strength of a mutation that survived — it does not, and the
-mutation was not equivalent.
+respelling above passes. Neither rule subsumes the other: dropping the membership test survives the suffix
+rule, and only `test_the_exclusion_must_name_a_located_wrapper_not_merely_be_trailing`
+kills it.
 
 ---
 
@@ -616,8 +603,6 @@ sentence rather than a section.
 A number of these are specification defects rather than choices, and are worth
 reporting to the C2PA. **[upstream-filing.md](upstream-filing.md) is the authority for
 which, and for what happens to each** — four are drafted as issues, fourteen are listed
-inside issue 1. This paragraph used to carry a second list and the two disagreed:
-deviations 3 and 4 were drafted but absent from it, while 25 and 26 sat on it and
-appeared nowhere in the filing document. They are the input to that work, along with the
+inside issue 1. They are the input to that work, along with the
 conformance vector file, which we offer as a starting point for A.8 interoperability
 testing — the very thing A.8 says it is waiting on.
