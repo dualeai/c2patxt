@@ -1,0 +1,77 @@
+name: Verification failed
+description: verify() returned a result you did not expect
+labels: ["verification"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Two answers make almost every report actionable, and almost every report
+        arrives without them: the **exact status code string**, and whether the text
+        **travelled through anything** before you verified it.
+
+        Before filing, please check these three — they account for most reports:
+
+        - `VALID` with `signingCredential.untrusted` is the **expected** outcome for a
+          self-signed credential. This package ships no trust anchors. Not a bug.
+        - `UNMARKED` means no mark was found. It is **not** a statement about the text.
+        - If the text was edited at all after marking — even whitespace, even a reflow
+          — the hard binding is **supposed** to fail. See
+          [docs/robustness.md](../../docs/robustness.md).
+
+  - type: input
+    id: codes
+    attributes:
+      label: Exact status codes
+      description: "`print(verdict.codes())` — copy the output verbatim, do not paraphrase."
+      placeholder: "(assertion.dataHash.mismatch, claimSignature.validated, ...)"
+    validations:
+      required: true
+
+  - type: input
+    id: state
+    attributes:
+      label: verdict.state
+      placeholder: "Provenance.INVALID"
+    validations:
+      required: true
+
+  - type: input
+    id: expected
+    attributes:
+      label: What you expected, and which specification clause says so
+      description: "Cite the clause if you have it — it is what makes this checkable rather than a difference of opinion."
+      placeholder: "VALID; C2PA 15.12.1.3.1 step 5 removes the wrapper before normalizing"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: transport
+    attributes:
+      label: Did the text travel through anything before you verified it?
+      description: "Copy-paste, a database, an editor, an email client, a markdown renderer — anything that could have touched the bytes."
+      options:
+        - "No — the same process that called embed() called verify()"
+        - "Copy-paste between applications"
+        - "Stored and retrieved (database, file, API)"
+        - "Through a markdown or HTML renderer"
+        - "Through email"
+        - "Other or unsure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: "Python we can run. Redact the text if it is sensitive — the byte LENGTH and whether it is pure ASCII usually matter more than the content."
+      render: python
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: c2patxt and Python versions
+      placeholder: "c2patxt 0.1.0, CPython 3.12.4, macOS"
+    validations:
+      required: true

@@ -1,0 +1,18 @@
+CC0 1.0 Universal (Public Domain Dedication)
+
+The conformance vector data in this directory -- A8ConformanceTest-*.txt and its
+SHA256SUMS -- is dedicated to the public domain under CC0 1.0.
+
+Full text: https://creativecommons.org/publicdomain/zero/1.0/legalcode
+
+WHY THIS IS SEPARATE FROM THE REPOSITORY LICENCE
+
+The surrounding package is Apache-2.0. The vectors are CC0 so that any
+implementation, in any language, under any licence, can vendor them without
+taking on an attribution obligation. A conformance corpus only does its job if
+competing implementations can copy it freely.
+
+The cautionary precedent is cbor/test-vectors: a standalone vector repository,
+unmaintained since 2019, shipping NO LICENCE FILE AT ALL, which makes it legally
+unvendorable no matter how good the data is. Licence and checksums exist here from
+the first commit for that reason.

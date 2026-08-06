@@ -1,0 +1,31 @@
+# The sdist is the artefact an auditor unpacks to diff shipped source against the git
+# tag without rebuilding, and the obvious next thing they do is run the suite. That
+# failed with collection errors: setuptools' default sdist picked up tests/test_*.py
+# but dropped tests/conftest.py, tests/__init__.py, tests/_json.py and the whole
+# tests/vectors/ tree -- so every test that needs a fixture or a vector corpus died on
+# import. Asserted by tests/test_sdist.py, which unpacks and runs it.
+#
+# The WHEEL is deliberately different and stays that way: py.typed and nothing else,
+# no vectors and no PEM. See tests/test_leaf_rule.py.
+graft tests
+graft docs
+# The workflows and issue templates travel too: an auditor diffing shipped source
+# against the git tag wants the CI definitions.
+graft .github
+graft tools
+include LICENSE
+include SECURITY.md
+include README.md
+include CHANGELOG.md
+include CONTRIBUTING.md
+include CODE_OF_CONDUCT.md
+include CLAUDE.md
+include Makefile
+include vulture_whitelist.py
+include uv.lock
+
+# Build and cache artefacts that must never travel.
+global-exclude *.py[cod]
+global-exclude .DS_Store
+prune tests/__pycache__
+prune htmlcov

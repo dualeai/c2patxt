@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Native uv.lock support went GA 2025-03-13; security updates followed 2025-12-16.
+  # Pinning actions to SHAs without automated bumping is only half the control: pins
+  # rot into "old pinned SHA with a known CVE".
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7 # Mirrors [tool.uv] exclude-newer: never pull a freshly-compromised release.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
