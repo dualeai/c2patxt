@@ -15,6 +15,46 @@ $ make lint        # ruff format, ruff check --fix, pyright strict, vulture
 Both green before anything is considered done. See [CONTRIBUTING.md](CONTRIBUTING.md)
 for the testing rules — they are not the usual ones and they are not optional.
 
+## Searching the code
+
+Use `seek`, not `grep` or `rg`. It ranks by relevance, groups by file, labels symbol
+definitions and prints three lines of context, so one call usually answers the
+question. It searches this repo by default; paths after the query narrow or widen it.
+
+```console
+$ seek [flags] '<query>' [path...]
+```
+
+Filters go inside the single-quoted query, separated by spaces (implicit AND):
+`sym:Name` for a definition, `file:x` / `-file:x` on the path, `lang:python`,
+`content:<regex>` for file contents only, `type:file` to list matching filenames,
+`case:yes`, and `or` with `()` for boolean logic.
+
+Queries worth reusing here:
+
+```console
+$ seek 'sym:verify -file:test'                       # the four public entry points
+$ seek 'sym:Verdict file:src'                        # the type, not its 30 test uses
+$ seek 'content:signingCredential\.[a-z]+ -file:test'  # every status code we emit
+$ seek 'lang:yaml uses: actions/checkout'            # audit the SHA pins
+$ seek 'x5chain' src/c2patxt/_cose.py                # one file only
+```
+
+Pitfalls: filters stay in **one** argument (`seek 'sym:Foo file:bar'`, not
+`seek sym:Foo file:bar`); flags come before the query (`seek -n 5 'Foo'`); anything
+after the query is a filesystem path, not a filter; single-quote to stop the shell
+eating `|`, `(`, `)`. A multi-word query ANDs substrings — it is not a phrase match.
+Cap large output with `-n` (files) and `-m` (matches per file). Exit codes: 0 found,
+1 nothing, 2 error.
+
+When you spawn a sub-agent it does not inherit this file, so tell it: *"Use
+`seek 'pattern' [path...]` for code search. Keep query filters in one quoted string.
+Never use grep/rg."*
+
+If `seek` is missing:
+`curl -sSfL https://raw.githubusercontent.com/dualeai/seek/main/install.sh | sh`
+(needs `universal-ctags`: `brew install universal-ctags`).
+
 ## Writing
 
 Six rules, from Orwell:
