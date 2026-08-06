@@ -244,7 +244,12 @@ _CorpusItem = tuple[str, bytes, str]
 
 #: Total items across mt0-mt6. Asserted so a corpus that silently shrinks -- a bad
 #: merge, a truncated download -- fails the build instead of quietly testing less.
-_CORPUS_ITEM_COUNT = 42
+_CORPUS_ITEM_COUNT = 70
+
+#: Items the reader refuses, all of them non-deterministic encodings RFC 8949 4.2.1
+#: and 4.2.2 forbid, plus three simple values this package does not carry. Their
+#: upstream descriptions name them: "Infinity coded as f32 instead of f16".
+_CORPUS_REFUSED_COUNT = 9
 
 
 def _corpus_items() -> list[_CorpusItem]:
@@ -369,16 +374,15 @@ def test_each_appendix_a_item_is_accepted_correctly_or_refused_with_a_reason(
 def test_the_corpus_is_neither_all_accepted_nor_all_refused() -> None:
     """The test above passes vacuously if the decoder refuses EVERYTHING.
 
-    THE SHAPE OF THIS TEST CHANGED ON 2026-08-05 and the reason is the point. It used
-    to require that some items be REFUSED -- "34 of the 42 accepted, 8 refused for
-    out-of-scope floats and tags". That was measuring the false reject: this corpus is
-    RFC 8949 Appendix A, every item of which is well-formed CBOR by Appendix C, and
-    15.10.3.1 gives us no licence to refuse well-formed CBOR. All of it now decodes.
+    BOTH ARMS ARE POPULATED, and what fills the refused arm is the point. 61 items
+    decode; 9 do not, and every one of the 9 is a form RFC 8949 forbids in deterministic
+    encoding -- six non-shortest-form floats and non-canonical NaNs whose own upstream
+    descriptions say so ("Infinity coded as f32 instead of f16"), and three simple
+    values this package does not carry.
 
-    So the vacuity guard moves to where the asymmetry actually lives. The reader must
-    accept everything well-formed; the WRITER must still refuse the values it cannot
-    round-trip deterministically. A reader that stopped decoding fails the first
-    assertion; a writer that started emitting floats or foreign tags fails the second.
+    That is 4.2.1 and 4.2.2 enforcement asserted against SOMEBODY ELSE'S published
+    bytes rather than against vectors written here. 15.10.3.1 gives no licence to refuse
+    well-formed CBOR, so the 61 are the floor; determinism is what earns the 9.
     """
 
     def decodes(payload: bytes) -> bool:
@@ -389,9 +393,10 @@ def test_the_corpus_is_neither_all_accepted_nor_all_refused() -> None:
         return True
 
     accepted = sum(decodes(encoded) for _, encoded, _ in _corpus_items())
-    assert accepted == _CORPUS_ITEM_COUNT, (
-        f"only {accepted} of {_CORPUS_ITEM_COUNT} items decoded; every Appendix A item is "
-        "well-formed CBOR, and 15.10.3.1 rejects only content that is not"
+    assert accepted == _CORPUS_ITEM_COUNT - _CORPUS_REFUSED_COUNT, (
+        f"{accepted} of {_CORPUS_ITEM_COUNT} items decoded; every Appendix A item is "
+        "well-formed CBOR, and 15.10.3.1 rejects only content that is not -- so a drop "
+        "here is a false reject, and a rise means determinism enforcement was dropped"
     )
 
     def writer_refuses(payload: bytes) -> bool:
@@ -401,26 +406,27 @@ def test_the_corpus_is_neither_all_accepted_nor_all_refused() -> None:
             return True
         return False
 
-    # COUNTED BY REASON, not in aggregate. Stated as one number, this assertion said
-    # "a writer that started emitting floats or foreign tags fails" and was carried
-    # entirely by tags: the corpus is mt0-mt6 with NO mt7, so major type 7 -- floats
-    # and simple values -- is absent, and mutating `dumps` to emit float64, a MAJOR
-    # wire change, left the guard green. Splitting the count makes each half say what
-    # it actually checks, and makes the float half's emptiness visible rather than
-    # hidden inside a total.
-    refused_for_tag = 0
+    # COUNTED BY REASON, not in aggregate. Stated as one number this was carried
+    # entirely by tags, and mutating `dumps` to emit float64 -- a MAJOR wire change --
+    # left it green. Each half now says what it checks.
+    #
+    # ONLY ITEMS THE READER ACCEPTS ARE CLASSIFIED. `writer_refuses` returns True both
+    # when `dumps` refuses a value and when `loads` never produced one, so classifying
+    # its output means decoding a second time; for the nine items the reader rejects,
+    # that raises out of the test.
+    refused_for_tag = refused_for_float = 0
     for _, encoded, _ in _corpus_items():
-        if not writer_refuses(encoded):
+        if not decodes(encoded) or not writer_refuses(encoded):
             continue
         value = loads(encoded)
-        if isinstance(value, Tagged) or (isinstance(value, list) and any(isinstance(i, Tagged) for i in value)):
+        members = value if isinstance(value, list) else [value]
+        if isinstance(value, Tagged) or any(isinstance(i, Tagged) for i in members):
             refused_for_tag += 1
+        if isinstance(value, float) or any(isinstance(i, float) for i in members):
+            refused_for_float += 1
 
     assert refused_for_tag >= 1, "the writer accepted every tagged item; it is supposed to emit only tags 0 and 18"
-    # The float half is asserted directly, because this corpus cannot carry it: mt7 is
-    # not in tests/vectors/cbor/, so a float vector has to be built here.
-    with pytest.raises(TypeError, match="float"):
-        dumps(0.5)
+    assert refused_for_float >= 1, "the writer accepted a float from the corpus; dumps emits no floats"
 
 
 def test_argument_beyond_the_64_bit_range_is_refused() -> None:

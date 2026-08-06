@@ -104,7 +104,7 @@ download-vectors-cose:
 download-vectors-cbor:
 	@echo "Downloading CBOR vectors (cbor-wg/cbor-test-vectors, BSD-2-Clause)..."
 	@mkdir -p $(vectors_dir)/cbor
-	@for m in 0 1 2 3 4 5 6; do \
+	@for m in 0 1 2 3 4 5 6 7-float 7-simple; do \
 	  curl -sSfL "https://raw.githubusercontent.com/cbor-wg/cbor-test-vectors/main/tests/rfc8949-appendixA/mt$$m.cbor" \
 	    -o "$(vectors_dir)/cbor/mt$$m.cbor"; \
 	  curl -sSfL "https://raw.githubusercontent.com/cbor-wg/cbor-test-vectors/main/tests/rfc8949-appendixA/mt$$m.edn" \

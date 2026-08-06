@@ -13,6 +13,7 @@ package, and belongs in their suites rather than ours.
 from __future__ import annotations
 
 import pathlib
+import re
 
 import pytest
 from cryptography.exceptions import InvalidSignature
@@ -23,6 +24,7 @@ from tests._json import load_object, str_field
 VECTORS = pathlib.Path(__file__).parent / "vectors"
 COSE = VECTORS / "cose"
 CBOR = VECTORS / "cbor"
+THIRD_PARTY = VECTORS / "third_party"
 
 # C2PA 13.2.1 permits EdDSA over Ed25519 only. The COSE algorithm identifier is -8,
 # from the IANA COSE Algorithms registry -- the C2PA specification never states it.
@@ -107,33 +109,46 @@ def test_the_corpus_contains_an_algorithm_c2pa_forbids() -> None:
     assert len(bytes.fromhex(str_field(doc, "input", "sign0", "key", "x_hex"))) == 57
 
 
-def test_cbor_appendix_a_corpus_covers_major_types_zero_to_six() -> None:
+def test_cbor_appendix_a_corpus_covers_every_major_type() -> None:
     """RFC 8949 Appendix A, grouped by major type.
 
-    NAMED FOR WHAT IT ACTUALLY CHECKS: mt0 to mt6, not "every major type". Asserting
-    `len >= 7` against exactly seven files -- a bound that reads as a floor and is
-    really an equality, over a set that stops at mt6.
+    MAJOR TYPE 7 IS SPLIT UPSTREAM into `mt7-float` and `mt7-simple`, so the set is
+    nine files rather than eight. That is the float and simple-value path, where the
+    bool-as-map-key defect lived, and it is the only place the corpus exercises our
+    4.2.1 shortest-form and 4.2.2 NaN rules against published bytes -- six of its
+    items are non-canonical encodings we refuse, and their own descriptions say so.
 
-    MAJOR TYPE 7 HAS NO CORPUS FILE. That is the simple-value and float path, and it
-    is where the bool-as-map-key defect lived (see tests/test_regressions.py), so the
-    gap is not academic. It is covered instead by hand-written cases in
-    tests/test_cbor.py and by the Hypothesis properties in tests/test_properties.py;
-    sourcing a published mt7 corpus is worth doing if one turns up.
+    A FIXED LIST, not a count: `len >= 7` reads as a floor and is really an equality.
     """
+    expected = [*(f"mt{n}" for n in range(7)), "mt7-float", "mt7-simple"]
     encoded = sorted(p.stem for p in CBOR.glob("mt*.cbor"))
-    assert encoded == [f"mt{n}" for n in range(7)], f"corpus changed shape: {encoded}"
+    assert encoded == expected, f"corpus changed shape: {encoded}"
     for path in CBOR.glob("mt*.cbor"):
         assert path.stat().st_size > 0, f"{path.name} is empty"
         assert path.with_suffix(".edn").exists(), f"{path.name} has no diagnostic pair"
 
 
 def test_vendored_corpora_carry_their_provenance_and_licence() -> None:
-    """An unlicensed vector corpus is legally unvendorable; say where each came from."""
-    for directory in (COSE, CBOR):
+    """An unlicensed vector corpus is legally unvendorable; say where each came from.
+
+    THIRD_PARTY IS THE ONE THAT MATTERS. `cose/` is Unlicense and `cbor/` BSD-2-Clause,
+    neither carrying an attribution obligation; the EncypherAI and writerslogic vectors
+    are MIT and Apache-2.0, which do. Checking the two permissive corpora and skipping
+    the encumbered one is the wrong half.
+    """
+    for directory in (COSE, CBOR, THIRD_PARTY):
         text = (directory / "PROVENANCE.md").read_text("utf-8")
         assert "Licence" in text or "licence" in text
         assert "https://github.com/" in text
         assert "2026-08-05" in text, "retrieval date must be recorded"
+
+    # A COMMIT, not a push date. A push to an unrelated path cannot tell a maintainer
+    # whether the vectors moved -- the same mutable-reference failure CLAUDE.md forbids
+    # for GitHub Actions.
+    third_party = (THIRD_PARTY / "PROVENANCE.md").read_text("utf-8")
+    assert re.search(r"\b[0-9a-f]{12,40}\b", third_party), "pin the upstream commit"
+    for obligation in ("MIT", "Apache-2.0"):
+        assert obligation in third_party, f"{obligation} notice must travel with the files"
 
 
 def test_the_checksum_manifest_lists_no_build_artefacts() -> None:

@@ -3,9 +3,9 @@
 Source: <https://github.com/cbor-wg/cbor-test-vectors>, `tests/rfc8949-appendixA/`
 — the CBOR working group's own corpus.
 
-**Licence: BSD-2-Clause.** Retrieved 2026-08-05; upstream last pushed 2026-02-22.
+**Licence: BSD-2-Clause.** Retrieved 2026-08-05; Upstream `tests/rfc8949-appendixA/` last changed 2026-01-22 in `001eb684`.
 
-`mt0.cbor` … `mt7.cbor` hold encoded values grouped by major type, each paired with
+`mt0.cbor` … `mt7-simple.cbor` hold encoded values grouped by major type, each paired with
 an `.edn` file giving the same values in CBOR diagnostic notation.
 
 ## Why this repository and not `cbor/test-vectors`

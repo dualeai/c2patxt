@@ -16,7 +16,6 @@ graft tools
 include LICENSE
 include SECURITY.md
 include README.md
-include CHANGELOG.md
 include CONTRIBUTING.md
 include CODE_OF_CONDUCT.md
 include CLAUDE.md

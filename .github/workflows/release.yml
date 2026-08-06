@@ -29,7 +29,7 @@ jobs:
       contents: read
       id-token: write # Sigstore signing for attestations
       attestations: write
-      artifact-metadata: write # Required by actions/attest v4
+      artifact-metadata: write # Documented by actions/attest v4, which both attest actions wrap
 
     env:
       UV_MALWARE_CHECK: "1"
@@ -137,11 +137,15 @@ jobs:
         # SLSA provenance binds artifact -> commit. PEP 740 alone only proves
         # "a Trusted Publisher uploaded this"; only this step ties the artifact to
         # the source, which is the claim that matters for a compliance artefact.
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        #
+        # NOT `actions/attest` with `predicate: "{}"`. That action takes the predicate
+        # verbatim, and an empty one is rejected by the attestations API -- "Invalid
+        # Argument - build definition is nil" -- because a SLSA v1 predicate must carry
+        # a buildDefinition. This action builds the predicate from the workflow run
+        # instead, which is the only way it can name the commit at all.
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: dist/*
-          predicate-type: https://slsa.dev/provenance/v1
-          predicate: "{}"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

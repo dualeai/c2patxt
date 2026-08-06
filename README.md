@@ -42,23 +42,17 @@ Whether your deployment satisfies the Article is a question for your counsel, no
 library.
 
 ```console
-$ pip install c2patxt          # PLANNED -- see below
+$ pip install c2patxt
 ```
 
 Python 3.10+. One runtime dependency: `cryptography`.
 
-> **Not published yet.** `c2patxt` is not on PyPI and this repository is internal, so
-> the install line above, the GitHub links in this file and the attestation commands
-> under [Security review](#security-review) all become true at the first release, not before.
-> Until then, install from a checkout:
->
-> ```console
-> $ git clone <this repository> && cd c2patxt
-> $ make install
-> ```
->
-> Everything else in this file — the API, the verdicts, the limits — is true today and
-> is exercised by the test suite on every commit.
+Or from a checkout:
+
+```console
+$ git clone https://github.com/dualeai/c2patxt && cd c2patxt
+$ make install
+```
 
 ---
 
@@ -400,9 +394,8 @@ Everything an AppSec questionnaire asks, without contacting us.
 - **Supported Python.** 3.10 – 3.14, CPython.
 - **Vulnerability reporting.** [SECURITY.md](https://github.com/dualeai/c2patxt/blob/main/SECURITY.md) — a CRA Article 24(1)
   steward policy: 48h acknowledgement, 90-day coordinated disclosure.
-- **SBOM and provenance.** The release pipeline produces CycloneDX **and** SPDX SBOMs
-  and attests both, plus build provenance. PLANNED, like the install: no release exists
-  yet, so there is nothing to verify today.
+- **SBOM and provenance.** Every release carries CycloneDX **and** SPDX SBOMs, both
+  attested, plus SLSA build provenance. All three are attached to the GitHub release.
 
 Verify a release yourself:
 
@@ -437,7 +430,7 @@ attestations. Verification is a step you run, not an assumption you inherit.
   vectors. We pass all six.
 
 What ships in this release, and what deliberately does not:
-**[release scope](https://github.com/dualeai/c2patxt/blob/main/docs/release-scope.md)** · **[changelog](https://github.com/dualeai/c2patxt/blob/main/CHANGELOG.md)**
+**[release scope](https://github.com/dualeai/c2patxt/blob/main/docs/release-scope.md)** · **[releases](https://github.com/dualeai/c2patxt/releases)**
 
 Four defects that cause silent divergence between conforming implementations are
 drafted for filing upstream: **[upstream filing](https://github.com/dualeai/c2patxt/blob/main/docs/upstream-filing.md)**.

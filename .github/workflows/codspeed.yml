@@ -52,9 +52,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read # For actions/checkout.
-      # OIDC upload. This repository is INTERNAL, so CodSpeed's tokenless path -- which
-      # is public-repositories-only -- is not available, and the alternative is a
-      # long-lived CODSPEED_TOKEN secret. Scoped to this job rather than the workflow:
+      # OIDC upload, chosen over a long-lived CODSPEED_TOKEN secret. Scoped to this job
+      # rather than the workflow:
       # GitHub does not restrict the OIDC permission by audience, so granting it at
       # workflow level would let every other job mint tokens for unrelated services.
       id-token: write

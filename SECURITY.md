@@ -5,20 +5,17 @@ written to serve as the documented, verifiable policy required of an open-source
 software steward under Article 24(1) of Regulation (EU) 2024/2847 (the Cyber
 Resilience Act), and not merely as a repository convention.
 
-> **Status.** `c2patxt` is not published and this repository is internal. The reporting
-> channel below works now; the GitHub and PyPI links elsewhere in this document become
-> live at the first release.
-
 ## Reporting a Vulnerability
 
-**Email `security@duale.ai`.** This works today and is the channel the timeline below
-is measured against.
+Two channels, both live:
 
-GitHub Security Advisories are the preferred route once this repository is public —
-private vulnerability reporting is enabled, and
-`https://github.com/dualeai/c2patxt/security/advisories/new` will accept reports at
-that point. It does not resolve while the repository is internal, which is why email
-comes first here rather than second.
+- **GitHub Security Advisories**, the preferred route — private vulnerability reporting
+  is enabled, so
+  [`/security/advisories/new`](https://github.com/dualeai/c2patxt/security/advisories/new)
+  accepts reports.
+- **Email `security@duale.ai`**, if you would rather not use GitHub.
+
+The timeline below is measured from whichever you use.
 
 Do not open a public issue for a suspected vulnerability.
 
@@ -113,14 +110,10 @@ that reporting them is unnecessary.
 
 ## Supply chain
 
-**No release exists yet**, so everything in this section describes what the release
-pipeline is configured to do rather than something you can check today. It becomes
-verifiable at the first release.
-
-Releases will be published to PyPI using Trusted Publishing (OIDC); no long-lived API
-token exists. Each release will carry PEP 740 digital attestations and SLSA build
-provenance binding the artifact to the source commit, plus CycloneDX and SPDX SBOMs
-attached to the GitHub release. Verify a release yourself:
+Releases are published to PyPI using Trusted Publishing (OIDC); no long-lived API token
+exists. Each release carries PEP 740 digital attestations and SLSA build provenance
+binding the artifact to the source commit, plus CycloneDX and SPDX SBOMs attached to
+the GitHub release. Verify a release yourself:
 
 ```bash
 # artifact -> commit (SLSA provenance)
