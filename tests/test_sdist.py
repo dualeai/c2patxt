@@ -55,7 +55,14 @@ def sdist(tmp_path_factory: pytest.TempPathFactory) -> pathlib.Path:
     assert len(archives) == 1, f"expected exactly one sdist, got {archives}"
 
     with tarfile.open(archives[0]) as archive:
-        archive.extractall(out, filter="data")
+        if hasattr(tarfile, "data_filter"):
+            archive.extractall(out, filter="data")
+        else:
+            # ``filter=`` arrived in 3.10.12, above our 3.10.0 floor, and an older
+            # patch raises TypeError on the kwarg -- which is what the macOS runner's
+            # 3.10.11 did. The archive here is one we built two lines up from our own
+            # tree, so the filter guards nothing; it is on for its own sake.
+            archive.extractall(out)  # noqa: S202
     unpacked = sorted(p for p in out.iterdir() if p.is_dir())
     assert len(unpacked) == 1, f"expected one unpacked tree, got {unpacked}"
     return unpacked[0]
