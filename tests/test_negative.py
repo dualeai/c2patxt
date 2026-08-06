@@ -1037,10 +1037,11 @@ def test_the_hard_binding_reports_each_way_it_can_be_wrong(
     ``c2pa.hash.data`` at all binds to nothing, and ``claim.hardBindings.missing`` says
     so rather than reporting a mismatch against a hash that does not exist.
 
-    Driven through ``_binding_status`` with a substituted assertion rather than through
-    ``verify``: the required-assertion check runs first in the full path and would answer
-    ``assertion.missing`` before any of these could be reached, which is correct
-    behaviour and would make every row here test the same thing.
+    Driven through ``_binding_status`` with a substituted assertion because these rows
+    need a `c2pa.hash.data` payload no producer emits. The required-assertion check does
+    NOT mask them in the full path -- a binding assertion that is linked and hash-matched
+    satisfies it whatever its payload holds, so ``verify`` reports
+    ``claim.hardBindings.missing`` alone.
     """
     import dataclasses
 

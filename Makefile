@@ -110,7 +110,13 @@ download-vectors-cbor:
 	  curl -sSfL "https://raw.githubusercontent.com/cbor-wg/cbor-test-vectors/main/tests/rfc8949-appendixA/mt$$m.edn" \
 	    -o "$(vectors_dir)/cbor/mt$$m.edn"; \
 	done
-	@echo "  $$(ls $(vectors_dir)/cbor/mt*.cbor | wc -l | tr -d ' ') CBOR major-type file(s)"
+	@for f in rfc8949/bad rfc8949-appendixA/streaming; do \
+	  curl -sSfL "https://raw.githubusercontent.com/cbor-wg/cbor-test-vectors/main/tests/$$f.cbor" \
+	    -o "$(vectors_dir)/cbor/$$(basename $$f).cbor"; \
+	  curl -sSfL "https://raw.githubusercontent.com/cbor-wg/cbor-test-vectors/main/tests/$$f.edn" \
+	    -o "$(vectors_dir)/cbor/$$(basename $$f).edn"; \
+	done
+	@echo "  $$(ls $(vectors_dir)/cbor/mt*.cbor | wc -l | tr -d ' ') CBOR major-type file(s), plus bad and streaming"
 
 download-vectors-third-party:
 	@echo "Downloading third-party A.8 vectors for interop cross-checks..."

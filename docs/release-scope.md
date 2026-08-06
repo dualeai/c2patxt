@@ -11,7 +11,7 @@ Every row was re-verified on 2026-08-06 and every one held.
 | Requirement | Status | Evidence |
 | --- | --- | --- |
 | The vector file's own rules hold, byte for byte | ✅ | `tests/test_vector_file.py` (41), `test_selectors.py` (rule 2), `test_locate.py` (rules 3, 5, 6) |
-| Three-way agreement with the encypher and writerslogic vectors | ✅ | `tests/test_third_party_interop.py` |
+| Three-way agreement with the encypher and writerslogic vectors | ✅ | `tests/test_third_party_interop.py` — their vectors against the spec transcribed a second time, AND against the shipped codec, encoding and reading both |
 | Coverage ≥ 90, and the gate is real rather than tautological | ✅ | 99.83%; mutation-verified — see below |
 | Exactly one runtime dependency | ✅ | `tests/test_package.py`, `tests/test_leaf_rule.py` |
 | README states its six load-bearing claims without hedging | ✅ | Review only. Nothing automated checks the wording |

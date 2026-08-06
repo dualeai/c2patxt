@@ -441,12 +441,12 @@ def load_anchors(pem: bytes | None = None) -> list[Certificate]:
     variable would falsify all three.
 
     There is deliberately no ``C2PATXT_TRUST_ANCHORS`` fallback, though there is one in
-    ``c2patool``. It was removed on 2026-08-05 for three reasons found by testing it:
-    a missing path raised ``FileNotFoundError`` and a malformed one raised
-    ``ValueError`` straight out of ``verify()``, which promises never to raise; the
-    read happened only on the signature-valid path, so unmarked and invalid text
-    verified fine while VALID text crashed -- a bomb that fires only on the happy
-    path; and the file was re-read on every call. A trust decision that depends on a
+    ``c2patool``. Three things go wrong when one exists, all measured: a missing path
+    raises ``FileNotFoundError`` and a malformed one raises ``ValueError`` straight out
+    of ``verify()``, which promises never to raise; the read happens only on the
+    signature-valid path, so unmarked and invalid text verifies fine while VALID text
+    crashes -- a bomb that fires only on the happy path; and the file is re-read on
+    every call. A trust decision that depends on a
     process environment variable is also neither reproducible nor auditable, which is
     the wrong property for the thing deciding whether a document is TRUSTED.
 

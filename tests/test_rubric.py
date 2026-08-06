@@ -22,7 +22,7 @@ six JMESPath expressions over a parsed manifest can give:
     referenced anywhere in the rubric.
   * There are NO WIRE VECTORS.
 
-That gap is exactly what tests/vectors/A8ConformanceTest-1.1.0.txt fills.
+That gap is exactly what tests/vectors/A8ConformanceTest-1.2.0.txt fills.
 
 PASSING IS SELF-ASSESSED. All 152 conformance-listed products are certified against
 specification 2.2 and none declares a text media type (one declares a bare non-IANA

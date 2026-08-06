@@ -20,13 +20,23 @@ from c2patxt import (
     EmbedContext,
     MarkCorruptError,
     Provenance,
+    StatusCode,
     embed,
     extract,
+    locate,
     strip,
     verify,
 )
-from c2patxt.constants import MAGIC, MARKER
-from c2patxt.signing import Signer
+from c2patxt._cose import COSE_HEADER_ALG, parse
+from c2patxt._selectors import selector_to_byte
+from c2patxt.constants import MAGIC, MARKER, VERSION
+from c2patxt.manifest import (
+    ASSERTION_ACTIONS,
+    ASSERTION_AI_DISCLOSURE,
+    ASSERTION_HASH_DATA,
+    ASSERTION_METADATA,
+)
+from c2patxt.signing import COSE_ALG_EDDSA, Signer
 from tests.conftest import DISCLOSURE, WHEN, build_certificate
 
 PINNED = EmbedContext(manifest_uuid=uuid.UUID(int=7), instance_id="xmp:iid:pinned", when=WHEN)
@@ -62,8 +72,24 @@ def signer(signing_key: Ed25519PrivateKey, signing_certificate: x509.Certificate
     ],
 )
 def test_embed_then_verify_round_trips(text: str, signer: Signer) -> None:
-    """The one test that proves producer and consumer agree, across byte costs."""
-    assert verify(embed(text, signer, DISCLOSURE, context=PINNED)).state is Provenance.VALID
+    """The one test that proves producer and consumer agree, across byte costs.
+
+    THE CODES ARE ASSERTED, NOT JUST THE STATE. ``VALID`` alone is reachable by more
+    than one route, and a mark that skipped the hard binding entirely would still
+    report it -- so the two codes that say the binding and the signature were actually
+    checked are named here. ``signingCredential.untrusted`` is expected and correct:
+    the credential is self-signed and we ship no anchors (C2PA 14.3.5).
+    """
+    verdict = verify(embed(text, signer, DISCLOSURE, context=PINNED))
+
+    assert verdict.state is Provenance.VALID
+    codes = set(verdict.codes())
+    assert {
+        StatusCode.DATA_HASH_MATCH,
+        StatusCode.CLAIM_SIGNATURE_VALIDATED,
+        StatusCode.CLAIM_SIGNATURE_INSIDE_VALIDITY,
+        StatusCode.SIGNING_CREDENTIAL_UNTRUSTED,
+    } <= codes
 
 
 def test_the_visible_text_is_unchanged(signer: Signer) -> None:
@@ -110,11 +136,72 @@ def test_the_exclusion_names_the_wrapper_exactly(signer: Signer) -> None:
 
 
 def test_the_wrapper_carries_the_magic_number(signer: Signer) -> None:
-    """A.8.2.2: the package name IS this constant."""
+    """A.8.2.2: the emitted wrapper opens with the magic, right after U+FEFF.
+
+    THE CONSTANT IS NOT THE SUBJECT. Asserting ``MAGIC == b"C2PATXT\\x00"`` compares a
+    constant with itself and passes even if nothing emits it; what has to hold is that
+    the bytes ``embed`` produced carry it. The declared value is checked against the
+    vector file in ``test_constants.py``.
+    """
     marked = embed("Hello world.", signer, DISCLOSURE, context=PINNED)
-    manifest = extract(marked)
-    assert manifest is not None
-    assert MAGIC == b"C2PATXT\x00"
+
+    span = locate(marked)
+    assert span is not None
+    emitted = marked.encode("utf-8")[span.utf8_start : span.utf8_stop].decode("utf-8")
+
+    assert emitted.startswith(MARKER)
+    body = bytes(selector_to_byte(ord(char)) or 0 for char in emitted[len(MARKER) :])
+    assert body[: len(MAGIC)] == MAGIC
+    assert body[len(MAGIC)] == VERSION
+
+
+def test_the_emitted_disclosure_states_the_model_type(signer: Signer) -> None:
+    """The one field the artefact exists to carry, read back off the wire.
+
+    Article 50(2) is about disclosing that content is machine-generated, and
+    ``modelType`` is where that disclosure lives. On the producer side it was checked
+    only as "the ``Disclosure`` constructor rejects an empty string" -- nothing read
+    it back out of a marked document.
+    """
+    marked = embed("Hello world.", signer, DISCLOSURE, context=PINNED)
+    store = extract(marked)
+    assert store is not None
+
+    disclosure = store.assertion(ASSERTION_AI_DISCLOSURE)
+    assert isinstance(disclosure, dict)
+    assert disclosure["modelType"] == DISCLOSURE.model_type
+    assert disclosure["modelName"] == DISCLOSURE.model_name
+
+
+def test_the_emitted_store_carries_exactly_the_four_assertions(signer: Signer) -> None:
+    """The label set of a store ``embed`` produced, not of a hand-built fixture.
+
+    ``test_extract.py`` asserts this against ``build_manifest_store`` with a fake
+    signature. Dropping an assertion from the emitted store leaves that test green.
+    """
+    marked = embed("Hello world.", signer, DISCLOSURE, context=PINNED)
+    store = extract(marked)
+    assert store is not None
+
+    assert set(store.assertions) == {
+        ASSERTION_ACTIONS,
+        ASSERTION_AI_DISCLOSURE,
+        ASSERTION_HASH_DATA,
+        ASSERTION_METADATA,
+    }
+
+
+def test_the_emitted_signature_declares_eddsa_in_the_protected_bucket(signer: Signer) -> None:
+    """13.2.1's algorithm, on a signature ``embed`` produced.
+
+    ``test_cose.py`` asserts it on ``sign_claim`` output directly, which does not say
+    what the embed path puts on the wire.
+    """
+    marked = embed("Hello world.", signer, DISCLOSURE, context=PINNED)
+    store = extract(marked)
+    assert store is not None
+
+    assert parse(store.signature).header()[COSE_HEADER_ALG] == COSE_ALG_EDDSA
 
 
 # --------------------------------------------------------------------------------

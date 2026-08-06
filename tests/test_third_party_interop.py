@@ -19,10 +19,16 @@ from __future__ import annotations
 
 import pathlib
 import struct
+import uuid
 
 import pytest
 
+from c2patxt import EmbedContext, embed, extract, locate
+from c2patxt._locate import payload_at
+from c2patxt._selectors import build_wrapper
+from c2patxt.signing import Signer
 from tests._json import load_object, str_fields
+from tests.conftest import DISCLOSURE, WHEN
 from tests.vectors.loader import load_vectors
 
 THIRD_PARTY = pathlib.Path(__file__).parent / "vectors" / "third_party"
@@ -30,6 +36,8 @@ ENCYPHER = THIRD_PARTY / "encypher-golden-vectors.json"
 WRITERSLOGIC = THIRD_PARTY / "writerslogic-a8-variation-selector.json"
 
 MAGIC = bytes.fromhex("4332504154585400")
+
+_PINNED = EmbedContext(manifest_uuid=uuid.UUID(int=11), instance_id="xmp:iid:interop", when=WHEN)
 
 
 def _byte_to_selector(b: int) -> str:
@@ -89,6 +97,68 @@ def test_writerslogic_wrapper_vector_reproduces() -> None:
     vector = _mapping(WRITERSLOGIC, "wrapperVector")
     derived = _wrapper(bytes.fromhex(vector["payload_hex"]))
     assert derived.encode("utf-8").hex() == vector["wrapper_utf8_hex"].lower()
+
+
+@pytest.mark.parametrize("name", ["ascii_small", "unicode_all_bytes"])
+def test_the_shipped_encoder_reproduces_the_encypher_vectors(name: str) -> None:
+    """The same comparison as above, made against ``build_wrapper`` instead.
+
+    The tests above compare EncypherAI's numbers with ``_wrapper``, the spec
+    transcribed a second time inside this file. That is a sound witness for the
+    SPECIFICATION and says nothing about the code we ship: both could agree while
+    ``c2patxt`` encodes something else. This closes that, and ``unicode_all_bytes``
+    is the case worth having -- 256 payload bytes crossing the 0x0F/0x10 boundary,
+    under text that is not ASCII.
+    """
+    record = next(r for r in _records(ENCYPHER, "unstructured_embed") if r["name"] == name)
+
+    marked = record["text"] + build_wrapper(bytes.fromhex(record["manifest_hex"]))
+    assert marked.encode("utf-8").hex() == record["expected_embed_hex"].lower()
+
+
+@pytest.mark.parametrize("name", ["ascii_small", "unicode_all_bytes"])
+def test_the_shipped_scanner_reads_text_marked_by_encypher(name: str) -> None:
+    """The consumer half: their marked text, read by our detector.
+
+    An encoder agreeing with theirs proves nothing about what we can READ. This
+    takes their published output verbatim -- text we never produced -- and requires
+    the scanner to find the wrapper and return the manifest bytes they put in it.
+    """
+    record = next(r for r in _records(ENCYPHER, "unstructured_embed") if r["name"] == name)
+    marked = bytes.fromhex(record["expected_embed_hex"]).decode("utf-8")
+
+    assert payload_at(marked) == bytes.fromhex(record["manifest_hex"])
+
+
+def test_the_shipped_codec_round_trips_the_writerslogic_wrapper_vector() -> None:
+    """Their wrapper vector, encoded and then read back by the shipped codec."""
+    vector = _mapping(WRITERSLOGIC, "wrapperVector")
+    payload = bytes.fromhex(vector["payload_hex"])
+
+    wrapper = build_wrapper(payload)
+    assert wrapper.encode("utf-8").hex() == vector["wrapper_utf8_hex"].lower()
+    assert payload_at("Doc." + wrapper) == payload
+
+
+def test_a_wrapper_embed_produced_re_derives_from_the_spec_formula(signer: Signer) -> None:
+    """A REAL mark, checked against the transcription rather than against ourselves.
+
+    Every test above works on payloads someone else chose. This one signs a document,
+    takes the wrapper bytes out of the emitted text, and rebuilds them from A.8.2.2
+    and A.8.3.1 alone -- big-endian length, the two selector blocks, one U+FEFF. A
+    wrong magic, a wrong version byte, a little-endian length or an off-by-one in the
+    mapping would be emitted and parsed consistently by our own round trip and caught
+    only here.
+    """
+    marked = embed("Interop.", signer, DISCLOSURE, context=_PINNED)
+
+    span = locate(marked)
+    store = extract(marked)
+    assert span is not None
+    assert store is not None
+    emitted = marked.encode("utf-8")[span.utf8_start : span.utf8_stop]
+
+    assert emitted == _wrapper(store.raw).encode("utf-8")
 
 
 def test_our_e0001_is_the_encypher_ascii_small_vector() -> None:

@@ -66,7 +66,7 @@ scanned as a wrapper candidate; it is rejected on the magic check, not specially
 # ISO-BMFF class syntax and the prose never states endianness -- the only clause in
 # the specification that omits it, where clause 11, clause 18.6 and A.3.x all state
 # it. Big-endian is confirmed by both public implementations and by re-deriving
-# their published vectors; see tests/vectors/A8ConformanceTest-1.0.0.txt note 1.
+# their published vectors; see tests/vectors/A8ConformanceTest-1.2.0.txt note 1.
 LENGTH_STRUCT_FORMAT: Final = ">I"
 
 # =============================================================================

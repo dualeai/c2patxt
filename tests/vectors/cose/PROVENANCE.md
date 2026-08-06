@@ -28,6 +28,13 @@ That is the single most valuable field here: it lets us assert our
 `["Signature1", protected, external_aad, payload]` assembly against an
 independently produced encoding rather than against ourselves.
 
+**All twelve are read.** Ten reproduce byte for byte. `sign-pass-02` is the only one
+carrying a non-empty `external_aad`, which §13.2.3 forbids, so it is asserted as a
+vector we must FAIL to reproduce — and to fail in that slot alone. `eddsa-01` is
+asserted to be the five-element `COSE_Sign` shape we never emit.
+`tests/test_cose.py::test_no_vendored_sig_structure_vector_goes_unread` holds the
+accounting, so a newly downloaded file cannot go unread.
+
 They exercise the **COSE layer**, not C2PA's narrowing of it. These remain ours to
 test: zero-length `external_aad` (§13.2.3), detached payload as `nil`/`0xf6`
 (§13.2.2), `x5chain` in the protected bucket only (§14.5), and exactly one identity

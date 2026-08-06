@@ -1,5 +1,5 @@
-# A8ConformanceTest-1.1.0.txt
-# Date: 2026-08-05
+# A8ConformanceTest-1.2.0.txt
+# Date: 2026-08-06
 # C2PA Technical Specification 2.4 (2026-04-01), HTML build c7e55d5a,
 # Annex A.8 "Embedding Manifests into Unstructured Text".
 #
@@ -11,9 +11,12 @@
 #     id; op; text_hex; payload_hex; expect_hex; status; flags
 #   Trailing '#' introduces an informative comment. Text after '#' is never data.
 #   Blank lines and lines whose first non-space character is '#' are ignored.
-#   Section markers have the form '@PartN' optionally followed by a '#' comment.
+#   Section markers begin '@Part' and run to the first space or '#' -- '@Part1',
+#   '@Part2b'. They carry no data.
 #
-#   ALL DATA IS US-ASCII. Byte-bearing fields are lowercase hex of UTF-8 bytes.
+#   ALL DATA IS US-ASCII, and every byte-bearing field is lowercase hex. 'text_hex'
+#   and an embed record's 'expect_hex' decode as UTF-8 text; 'payload_hex' and an
+#   extract record's 'expect_hex' are OPAQUE MANIFEST BYTES and need not.
 #   There are no \uXXXX escapes, no base64, no literal non-ASCII characters, and
 #   this file carries no byte-order mark. That is deliberate: the subject matter is
 #   invisible characters, and a file containing them literally would be mangled by
@@ -77,6 +80,15 @@
 # 8. CLOSED WORLD. For any text T containing no U+FEFF followed by a
 #    magic-matching variation-selector run, extract(T) == (none, NONE).
 #
+# 9. A CORRUPT CANDIDATE SHALL NOT DISCARD A GENUINE WRAPPER. Rule 4 says a
+#    magic-matching malformed candidate reports corruptedWrapper, and rule 1's
+#    hazard notes say a non-matching run is skipped. Neither says what to do when
+#    BOTH appear in one text. Report the failure only if no valid wrapper was
+#    found; otherwise return the valid one. The alternative hands a denial of
+#    service to anyone able to prepend twenty characters to a document. X0021 is
+#    the discriminating record: an implementation that raises on the first corrupt
+#    candidate and one that returns the wrapper pass every other record alike.
+#
 # Note 1: A.8.2.2 declares manifestLength in ISO-BMFF class syntax and the prose
 #    never states endianness -- the only place in the specification that omits it,
 #    where clause 11, clause 18.6 and A.3.x all state it explicitly. Big-endian is
@@ -110,6 +122,9 @@
 #   length-overrun declared manifestLength exceeds the bytes available
 #   trailing-vs    user variation selectors follow the wrapper and are not part of it
 #   pathological   input shaped to cost a naive implementation more than it should
+#   corrupt-prefix a magic-MATCHING but malformed candidate precedes a genuine wrapper
+#   empty-manifest declared manifestLength is 0: well formed, carrying no manifest
+#   boundary       payload straddles the 0x0F/0x10 mapping boundary on extract
 #
 @Part0 # Embed: canonical cases
 E0001;embed;68656c6c6f20776f726c64;deadbeef;68656c6c6f20776f726c64efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884f3a0878ef3a0869df3a086aef3a0879f;OK;ascii,minimal # "hello world" + 4-byte payload deadbeef; reproduces EncypherAI golden vector ascii_small
@@ -149,6 +164,11 @@ X0015;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a0
 X0016;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880f3a087aff3a087aff3a0878ef3a0869df3a086aef3a0879f;;;manifest.text.corruptedWrapper;length-overrun # declared manifestLength 65535 far exceeds the bytes available; must be rejected before allocating
 #
 
+@Part2e # Extract: rule 9, and two shapes the embed side reaches but extract does not
+X0021;extract;446f6320efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884f3a0878ef3a0869df3a086ae20626f6479efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884f3a0878ef3a0869df3a086aef3a0879f;;deadbeef;OK;corrupt-prefix # rule 9: a truncated MAGIC-MATCHING candidate, then a genuine wrapper. X0013 is the same shape with a run whose magic does not match
+X0022;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb880;;;OK;empty-manifest # manifestLength 0: well formed at the wire level, carrying nothing. Not corrupt and not absent. expect_hex is empty because the manifest is
+X0023;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884efb88eefb88ff3a08480f3a08481;;0e0f1011;OK;boundary # 0x0e,0x0f,0x10,0x11 -- the last U+FE00-block byte beside the first U+E0100-block byte. E0006 crosses the boundary on embed only
+#
 @Part2d # Wrapper extent (rule 7) and cost (rule 4)
 X0017;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884f3a0878ef3a0869df3a086aef3a0879fefb88fefb88e;;deadbeef;OK;trailing-vs # U+FE0F and U+FE0E follow the wrapper: emoji presentation selectors the user typed. The wrapper ends at 13 + manifestLength, so they are NOT payload
 X0018;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb883efb880f3a087aff3a08480f3a08480f3a08481;;00ff10;OK;trailing-vs # the same rule with SUPPLEMENTARY-plane selectors, which decode to bytes 0x10 and 0x11. An implementation that runs to the end of the selector run returns 5 bytes instead of 3

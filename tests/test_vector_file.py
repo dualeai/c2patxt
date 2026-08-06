@@ -41,7 +41,10 @@ def test_record_shape_matches_its_status(vector: Vector) -> None:
     assert vector.op in {"embed", "extract"}
     assert vector.text != b"" or "no-wrapper" in vector.flags or vector.id.startswith("X")
     if vector.is_ok:
-        assert vector.expect != b"", "an OK record must state its expected bytes"
+        # An empty `expect` normally means the author forgot to fill the column. It is
+        # a real value for exactly one shape -- a wrapper declaring manifestLength 0 --
+        # so that shape carries a flag saying the emptiness is the point.
+        assert vector.expect != b"" or "empty-manifest" in vector.flags, "an OK record must state its expected bytes"
     else:
         assert vector.expect == b"", "a failure record must not state expected bytes"
         assert vector.status == "NONE" or "." in vector.status, (

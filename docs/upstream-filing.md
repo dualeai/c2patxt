@@ -130,7 +130,7 @@ invalidates a document.
 
 ## Offering the vectors
 
-We publish a wire-format conformance vector file — `A8ConformanceTest-1.1.0.txt`, 26
+We publish a wire-format conformance vector file — `A8ConformanceTest-1.2.0.txt`, 29
 records, CC0 — because the C2PA text conformance rubric v0.1.0 has none. Format
 modelled on `NormalizationTest.txt`: ASCII-only data, one record per line, semicolon
 separated, `#` comments.

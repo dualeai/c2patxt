@@ -21,7 +21,7 @@ __all__ = [
     "vector_id",
 ]
 
-VECTOR_FILE = pathlib.Path(__file__).parent / "A8ConformanceTest-1.1.0.txt"
+VECTOR_FILE = pathlib.Path(__file__).parent / "A8ConformanceTest-1.2.0.txt"
 
 _COLUMNS = 7
 

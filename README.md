@@ -444,7 +444,7 @@ Detail: **[compatibility](https://github.com/dualeai/c2patxt/blob/main/docs/c2pa
 **[benchmarks](https://github.com/dualeai/c2patxt/blob/main/docs/benchmarks.md)**
 
 We publish a wire-format conformance vector file
-(`tests/vectors/A8ConformanceTest-1.1.0.txt`) because the rubric has none.
+(`tests/vectors/A8ConformanceTest-1.2.0.txt`) because the rubric has none.
 Interoperability with the two other public A.8 implementations is tested in
 `tests/test_third_party_interop.py`; where we deliberately disagree with them, and
 why, is in [known divergences](https://github.com/dualeai/c2patxt/blob/main/docs/known-divergences.md).

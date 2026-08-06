@@ -6,12 +6,14 @@
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding
 
-from c2patxt import _cbor, _cose
+from c2patxt import EmbedContext, _cbor, _cose, embed, extract
 from c2patxt._cose import (
     COSE_HEADER_ALG,
     COSE_HEADER_X5CHAIN,
@@ -22,9 +24,11 @@ from c2patxt._cose import (
     verify_claim,
 )
 from c2patxt.signing import COSE_ALG_EDDSA, Signer
-from tests._json import load_object, str_field
-from tests.conftest import build_certificate
+from tests._json import load_object, str_field, str_fields
+from tests.conftest import DISCLOSURE, WHEN, build_certificate
 from tests.test_external_vectors import COSE as COSE_VECTORS
+
+_PINNED = EmbedContext(manifest_uuid=uuid.UUID(int=13), instance_id="xmp:iid:cose", when=WHEN)
 
 CLAIM = b"\xa1\x63abc\x01"  # any deterministically-encoded CBOR stands in for a claim
 
@@ -159,18 +163,54 @@ def test_signing_is_byte_stable(signer: Signer) -> None:
     assert len({sign_claim(signer, CLAIM) for _ in range(20)}) == 1
 
 
-def test_our_sig_structure_matches_the_cose_wg_encoding() -> None:
-    """THE interop check for this module.
+#: Every vendored cose-wg file carrying a Sig_structure with a zero-length
+#: external_aad. Ten of the twelve; the two excluded are named in the tests below,
+#: which is deliberate -- a silent skip reads as coverage.
+_SIG_STRUCTURE_VECTORS = [
+    "eddsa-sig-01.json",
+    "eddsa-sig-02.json",
+    "sign-fail-01.json",
+    "sign-fail-02.json",
+    "sign-fail-03.json",
+    "sign-fail-04.json",
+    "sign-fail-06.json",
+    "sign-fail-07.json",
+    "sign-pass-01.json",
+    "sign-pass-03.json",
+]
 
-    cose-wg's eddsa-sig-01 publishes intermediates.ToBeSign_hex -- the serialized
+
+def test_no_vendored_sig_structure_vector_goes_unread() -> None:
+    """The list above must account for every file in the corpus.
+
+    A vendored vector nobody reads is a vector that is not an oracle. Adding a file
+    with ``make download-vectors`` and forgetting to list it would otherwise be
+    invisible, so the two deliberate exclusions are named here rather than omitted.
+    """
+    on_disk = {path.name for path in COSE_VECTORS.glob("*.json")}
+    accounted = set(_SIG_STRUCTURE_VECTORS) | {"sign-pass-02.json", "eddsa-01.json"}
+    assert on_disk == accounted, f"unread vectors: {sorted(on_disk - accounted)}"
+
+
+@pytest.mark.parametrize("name", _SIG_STRUCTURE_VECTORS)
+def test_our_sig_structure_matches_the_cose_wg_encoding(name: str) -> None:
+    """THE interop check for this module, over every vendored vector that has one.
+
+    Each file publishes ``intermediates.ToBeSign_hex`` -- the serialized
     Sig_structure. Reproducing it byte for byte proves our assembly matches an
     independently produced encoding rather than merely matching itself.
 
-    Their vector attaches the payload rather than detaching it, so the payload slot
+    THE ALGORITHMS AND THE PROTECTED HEADERS DIFFER ACROSS THE ROWS, which is the
+    reason to run all of them: eight are ES256 over P-256 and one is Ed448, none of
+    which C2PA 13.2.1 permits us to SIGN with, but the Sig_structure is
+    algorithm-independent and a header of a different length is where a width bug in
+    the bstr encoding would show.
+
+    Their vectors attach the payload rather than detaching it, so the payload slot
     carries their plaintext; the structure and the zero-length external_aad are what
     is being compared.
     """
-    doc = load_object(COSE_VECTORS / "eddsa-sig-01.json")
+    doc = load_object(COSE_VECTORS / name)
     expected = bytes.fromhex(str_field(doc, "intermediates", "ToBeSign_hex"))
 
     decoded = _cbor.loads(expected)
@@ -182,6 +222,105 @@ def test_our_sig_structure_matches_the_cose_wg_encoding() -> None:
     assert isinstance(protected, bytes)
     assert isinstance(payload, bytes)
     assert sig_structure(protected, payload) == expected
+
+
+def test_the_one_vector_with_external_aad_is_a_negative_oracle() -> None:
+    """``sign-pass-02`` is the only vendored vector using external_aad, so it is the
+    only one we must FAIL to reproduce.
+
+    13.2.3: "external authenticated data shall not be used". ``sig_structure`` hard-codes
+    a zero-length aad, so a vector carrying twelve bytes there cannot be re-derived --
+    and the difference must be in that slot and nowhere else. Asserting only that the
+    bytes differ would pass on any bug at all.
+    """
+    doc = load_object(COSE_VECTORS / "sign-pass-02.json")
+    expected = bytes.fromhex(str_field(doc, "intermediates", "ToBeSign_hex"))
+
+    decoded = _cbor.loads(expected)
+    assert isinstance(decoded, list)
+    context, protected, aad, payload = decoded
+    assert isinstance(protected, bytes)
+    assert isinstance(payload, bytes)
+
+    assert aad == bytes.fromhex("11aa22bb33cc44dd550066 99".replace(" ", ""))
+    assert sig_structure(protected, payload) != expected
+
+    # Everything BUT the aad agrees: put their aad back and the encoding matches.
+    assert _cbor.dumps([context, protected, aad, payload]) == expected
+    assert _cbor.loads(sig_structure(protected, payload)) == [context, protected, b"", payload]
+
+
+def test_the_multi_signer_vector_is_the_shape_c2pa_excludes() -> None:
+    """``eddsa-01`` carries no top-level ToBeSign, and the reason is the point.
+
+    It is a multi-signer ``COSE_Sign``: its Sig_structure is five elements and its
+    context string is "Signature", not "Signature1". C2PA 13.2 permits ``COSE_Sign1``
+    only, so this file is vendored as the shape we must never emit, and reading it
+    keeps ``PROVENANCE.md``'s claim about it checkable.
+    """
+    doc = load_object(COSE_VECTORS / "eddsa-01.json")
+    intermediates = doc["intermediates"]
+    assert isinstance(intermediates, dict)
+    signers = intermediates["signers"]
+    assert isinstance(signers, list)
+
+    decoded = _cbor.loads(bytes.fromhex(str_fields(signers[0], "eddsa-01.json:signers[0]")["ToBeSign_hex"]))
+    assert isinstance(decoded, list)
+    assert decoded[0] == "Signature", "the multi-signer context, which we never build"
+    assert len(decoded) == 5, "COSE_Sign adds the signer's own protected bucket"
+
+
+def _cbor_head(major: int, length: int) -> bytes:
+    """A definite-length CBOR head, RFC 8949 3.1. Transcribed, not imported."""
+    if length < 24:
+        return bytes([major << 5 | length])
+    if length < 0x100:
+        return bytes([major << 5 | 24, length])
+    if length < 0x10000:
+        return bytes([major << 5 | 25]) + length.to_bytes(2, "big")
+    return bytes([major << 5 | 26]) + length.to_bytes(4, "big")
+
+
+def _to_be_signed(protected: bytes, payload: bytes) -> bytes:
+    """RFC 9052 4.4 Sig_structure, built from the RFC rather than from ``_cose``.
+
+    ``[ "Signature1", protected, external_aad, payload ]`` as a definite-length
+    four-element array. ``external_aad`` is empty because C2PA 13.2.3 forbids it.
+    """
+    return (
+        b"\x84"
+        + _cbor_head(3, len(b"Signature1"))
+        + b"Signature1"
+        + _cbor_head(2, len(protected))
+        + protected
+        + _cbor_head(2, 0)
+        + _cbor_head(2, len(payload))
+        + payload
+    )
+
+
+def test_a_signature_embed_produced_verifies_over_a_hand_built_sig_structure(signer: Signer) -> None:
+    """The producer side of the COSE claim, checked against the RFC not against us.
+
+    ``test_our_sig_structure_matches_the_cose_wg_encoding`` reproduces cose-wg's
+    ToBeSign from THEIR protected header and THEIR payload. It never touches a
+    signature this package produced, so a claim signed over the wrong bytes would
+    pass it and pass ``verify()`` too -- the same wrong assembly on both sides.
+
+    Here the message comes out of a real ``embed``. The Sig_structure is rebuilt by
+    ``_to_be_signed`` above, and the arbiter is Ed25519 verification in
+    ``cryptography``: it succeeds only if the bytes we signed are the bytes RFC 9052
+    says to sign.
+    """
+    marked = embed("Signed.", signer, DISCLOSURE, context=_PINNED)
+    store = extract(marked)
+    assert store is not None
+
+    message = parse(store.signature)
+    signer.private_key.public_key().verify(
+        message.signature,
+        _to_be_signed(message.protected, store.claim_bytes),
+    )
 
 
 def test_a_non_map_protected_header_is_rejected() -> None:

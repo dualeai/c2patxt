@@ -3,17 +3,20 @@
 Wire-format conformance vectors for **C2PA Technical Specification 2.4 (2026-04-01),
 HTML build `c7e55d5a`, Annex A.8**, "Embedding Manifests into Unstructured Text".
 
-The normative artefact is `A8ConformanceTest-1.1.0.txt`. Everything a consuming
-implementation needs — the wire format, the eight conformance invariants, and the
+The normative artefact is `A8ConformanceTest-1.2.0.txt`. Everything a consuming
+implementation needs — the wire format, the nine conformance invariants, and the
 flag vocabulary — is stated in that file's header, so it is self-describing and
 needs no code to interpret.
 
 ## Using these from another language
 
-Split each data line on `;`, discard anything after `#`, and hex-decode the byte
-fields. No dependency, no parser generator, no toolchain. That is the whole point of
-the flat-file format: a Rust, Go or TypeScript implementer should not have to install
-a Python package to obtain a data file.
+**Discard anything from the first `#`, then split on `;`**, and hex-decode the byte
+fields. That order matters: ten comments contain a semicolon, so splitting first gives
+you eight or nine fields on 34% of the corpus.
+
+No dependency, no parser generator, no toolchain. That is the whole point of the
+flat-file format: a Rust, Go or TypeScript implementer should not have to install a
+Python package to obtain a data file.
 
 The data portion is **pure US-ASCII with no byte-order mark**. The subject matter is
 invisible characters, and a corpus that stored them literally would be silently
@@ -85,7 +88,7 @@ already in place so that move costs nothing.
 
 ## Scope, and what has no oracle at all
 
-The A.8 conformance file covers the **wire format only** — 6 `embed` records and 20
+The A.8 conformance file covers the **wire format only** — 6 `embed` records and 23
 `extract` records, with statuses limited to `manifest.text.corruptedWrapper`,
 `manifest.text.multipleWrappers`, `OK` and `NONE`. Nothing in it reaches the validator.
 
@@ -97,8 +100,8 @@ which is what makes them worth vendoring.
 publishes no A.8 vectors — that absence is why this file exists — and the manifest CBOR
 is deliberately opaque to it, so the claim's contents are checked only against tests
 written alongside the code they check. Where that matters, the tests say so: the
-round-trip assertions in `test_embed.py` pin the emitted claim fields, and
-`docs/mutation-audit.md` records what mutation testing found the day those were added.
+round trip in `test_embed.py` asserts only that a marked document verifies, and
+`docs/mutation-audit.md` records what mutation testing found against that.
 
 A reader should not infer from this directory that the validator is externally checked.
 It is not.

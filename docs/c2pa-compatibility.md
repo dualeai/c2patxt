@@ -276,7 +276,7 @@ matter more than the pass:
 - Neither `manifest.text.corruptedWrapper` nor `manifest.text.multipleWrappers` is
   referenced anywhere in it.
 - There are **no wire vectors**. That gap is what
-  `tests/vectors/A8ConformanceTest-1.1.0.txt` exists to fill.
+  `tests/vectors/A8ConformanceTest-1.2.0.txt` exists to fill.
 
 The rubric is also the only authority partitioning media types — A.8 names none at
 all:
