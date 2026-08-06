@@ -238,9 +238,13 @@ def test_decode_error_is_picklable_and_carries_position() -> None:
     assert (revived.msg, revived.pos) == ("boom", 7)
 
 
-#: One RFC 8949 Appendix A item: its description, its PUBLISHED bytes, and the
-#: diagnostic notation for what it should decode to.
-_CorpusItem = tuple[str, bytes, str]
+#: One RFC 8949 Appendix A item: its description and its PUBLISHED bytes.
+#:
+#: The sidecar's ``decoded`` field is deliberately NOT carried. It is CBOR diagnostic
+#: notation, and comparing a Python value against it would mean writing an EDN parser
+#: -- so the oracle for the decoded value is cbor2, an independent implementation,
+#: which is stronger than a string we would have had to interpret ourselves.
+_CorpusItem = tuple[str, bytes]
 
 #: Total items across mt0-mt6. Asserted so a corpus that silently shrinks -- a bad
 #: merge, a truncated download -- fails the build instead of quietly testing less.
@@ -267,14 +271,7 @@ def _corpus_items() -> list[_CorpusItem]:
             if encoded is None:
                 continue
             described = re.search(r'"description":\s*"([^"]*)"', block)
-            decoded = re.search(r'"decoded":\s*(.+?),?\s*$', block.strip(), re.DOTALL)
-            items.append(
-                (
-                    described.group(1) if described else path.stem,
-                    bytes.fromhex(encoded.group(1)),
-                    decoded.group(1).strip() if decoded else "",
-                )
-            )
+            items.append((described.group(1) if described else path.stem, bytes.fromhex(encoded.group(1))))
     return items
 
 
@@ -302,10 +299,8 @@ def _only_the_reader_admits(value: object) -> bool:
     return False
 
 
-@pytest.mark.parametrize(("description", "encoded", "expected"), _corpus_items(), ids=lambda v: str(v)[:40])
-def test_each_appendix_a_item_is_accepted_correctly_or_refused_with_a_reason(
-    description: str, encoded: bytes, expected: str
-) -> None:
+@pytest.mark.parametrize(("description", "encoded"), _corpus_items(), ids=lambda v: str(v)[:40])
+def test_each_appendix_a_item_is_accepted_correctly_or_refused_with_a_reason(description: str, encoded: bytes) -> None:
     """Every RFC 8949 Appendix A item, fed as its PUBLISHED BYTES.
 
     THE PREVIOUS VERSION OF THIS TEST PASSED WITH THE DECODER REPLACED BY AN
@@ -368,7 +363,71 @@ def test_each_appendix_a_item_is_accepted_correctly_or_refused_with_a_reason(
     else:
         assert value == oracle, f"{description}: disagreed with the reference decoder"
     assert dumps(value) == encoded, f"{description}: re-encoding was not byte-identical"
-    assert expected != "" or description
+
+
+def _sidecar_items(name: str) -> list[tuple[str, bytes]]:
+    """Parse one ``.edn`` sidecar into ``(description, published bytes)``."""
+    text = (CBOR_VECTORS / f"{name}.edn").read_text("utf-8")
+    items: list[tuple[str, bytes]] = []
+    for block in re.findall(r"\{(.*?)\}", text, re.DOTALL):
+        encoded = re.search(r'"encoded":\s*h\'([0-9a-fA-F]*)\'', block)
+        if encoded is None:
+            continue
+        described = re.search(r'"description":\s*"([^"]*)"', block)
+        items.append((described.group(1) if described else name, bytes.fromhex(encoded.group(1))))
+    return items
+
+
+#: Two items in the ill-formed corpus that this decoder ACCEPTS, correctly. Their
+#: upstream file is titled "Inputs that should fail for RFC 8949", which is RFC 8949
+#: VALIDITY -- wider than well-formedness. A tag 0 whose content is a map is invalid
+#: under 5.3.2 and still well-formed under Appendix C, and C2PA 15.10.3.1 rejects only
+#: content that is "NOT WELL-FORMED CBOR". Refusing them would be over-strictness, and
+#: it would contradict ``test_the_decoder_preserves_any_well_formed_tag``.
+_VALID_BUT_NOT_WELL_FORMED = {
+    "date: unexpected object instead of offset",
+    "date: unexpected object instead of string",
+}
+
+#: Items in each vendored sidecar. Asserted so a truncated download fails the build
+#: rather than parametrizing over nothing.
+_BAD_ITEM_COUNT = 47
+_STREAMING_ITEM_COUNT = 11
+
+
+@pytest.mark.parametrize(("description", "payload"), _sidecar_items("bad"), ids=lambda item: str(item)[:60])
+def test_the_ill_formed_corpus_is_refused_with_our_own_error(description: str, payload: bytes) -> None:
+    """cbor-wg's ``rfc8949/bad`` corpus: 47 inputs that must not decode.
+
+    THE EXCEPTION TYPE IS PART OF THE ASSERTION. ``verify()`` is documented never to
+    raise on hostile input, and it converts ``CborDecodeError`` and nothing else; a
+    ``struct.error`` or an ``IndexError`` escaping the decoder would reach a caller
+    from a manifest an attacker wrote.
+    """
+    if description in _VALID_BUT_NOT_WELL_FORMED:
+        loads(payload)  # accepted on purpose; see the constant above
+        return
+    with pytest.raises(CborDecodeError):
+        loads(payload)
+
+
+@pytest.mark.parametrize(("description", "payload"), _sidecar_items("streaming"), ids=lambda item: str(item)[:60])
+def test_every_indefinite_length_item_in_the_corpus_is_refused(description: str, payload: bytes) -> None:
+    """RFC 8949 Appendix A's streaming vectors, all eleven.
+
+    4.2.1 requires definite lengths, so every one of these is a refusal. They are the
+    published encodings rather than ones we constructed, which is the difference from
+    ``test_indefinite_lengths_are_rejected`` three hand-written rows above.
+    """
+    assert description
+    with pytest.raises(CborDecodeError):
+        loads(payload)
+
+
+def test_neither_vendored_sidecar_has_silently_shrunk() -> None:
+    """A glob over a missing corpus parametrizes over nothing and passes."""
+    assert len(_sidecar_items("bad")) == _BAD_ITEM_COUNT
+    assert len(_sidecar_items("streaming")) == _STREAMING_ITEM_COUNT
 
 
 def test_the_corpus_is_neither_all_accepted_nor_all_refused() -> None:
@@ -392,7 +451,7 @@ def test_the_corpus_is_neither_all_accepted_nor_all_refused() -> None:
             return False
         return True
 
-    accepted = sum(decodes(encoded) for _, encoded, _ in _corpus_items())
+    accepted = sum(decodes(encoded) for _, encoded in _corpus_items())
     assert accepted == _CORPUS_ITEM_COUNT - _CORPUS_REFUSED_COUNT, (
         f"{accepted} of {_CORPUS_ITEM_COUNT} items decoded; every Appendix A item is "
         "well-formed CBOR, and 15.10.3.1 rejects only content that is not -- so a drop "
@@ -415,7 +474,7 @@ def test_the_corpus_is_neither_all_accepted_nor_all_refused() -> None:
     # its output means decoding a second time; for the nine items the reader rejects,
     # that raises out of the test.
     refused_for_tag = refused_for_float = 0
-    for _, encoded, _ in _corpus_items():
+    for _, encoded in _corpus_items():
         if not decodes(encoded) or not writer_refuses(encoded):
             continue
         value = loads(encoded)

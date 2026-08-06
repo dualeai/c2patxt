@@ -77,9 +77,10 @@ def test_the_search_settles_in_a_modest_number_of_builds(signer: Signer) -> None
     for a reason that had nothing to do with a regression.
 
     The count varies because it depends on where Ed25519 signature noise lands, which
-    changes with the certificate and the text. Measured across eight inputs with the
-    pinned test certificate: median 29-30 and a best of 3 across two samples of 7 324 and
-    10 000 documents, but maxima of 434 and 479 and 95th percentiles of 154 and 129. The
+    changes with the certificate and the text. Measured 2026-08-06 across eight inputs
+    with the pinned test certificate: median 29-30 and a best of 3 across two samples of
+    7 324 and 10 000 documents, but maxima of 434 and 479 and 95th percentiles of 154
+    and 129. The
     CENTRE reproduces and the TAIL does not, because a sample maximum is a property of
     the corpus. A tight bound here is a flaky bound -- this figure has been understated
     three times, from samples of eight, of 400 and of 250 -- which is the argument for

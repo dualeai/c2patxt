@@ -7,9 +7,9 @@ wrapper's byte span, whose length depends on the manifest length, which contains
 exclusion range. With the SDK owning construction the circularity is internal and
 nothing is patched after signing.
 
-It has a second, better consequence. RFC-136 5 forbids any tenant, agent, account,
-end-user, author, prompt or conversation content in the manifest, on three
-independent legal grounds. Because the caller supplies a closed ``Disclosure`` rather
+It has a second, better consequence. This project's own marking policy forbids any
+tenant, agent, account, end-user, author, prompt or conversation content in the
+manifest, on three independent legal grounds. Because the caller supplies a closed ``Disclosure`` rather
 than arbitrary assertions, that legal constraint becomes a type-system constraint.
 There is deliberately no generic extra-assertions escape hatch; adding one is a
 decision with its own review, not a keyword argument.
@@ -17,8 +17,8 @@ decision with its own review, not a keyword argument.
 WHY A DATACLASS AND NOT A CALLABLE PROTOCOL
 -------------------------------------------
 A bytes-in/signature-out callable, letting the private key live in an HSM or KMS, is
-the obvious alternative. No such deployment exists: RFC-136 has the router signing
-locally from a Kubernetes secret, and 'Credential custody' is explicit that the
+the obvious alternative. No such deployment exists: the platform this was built for
+has the router signing locally from a Kubernetes secret, and 'Credential custody' is explicit that the
 private key reaches exactly one service so marking adds no network call. A Protocol
 needs either multiple concrete production implementations or a dependency that
 genuinely cannot run in tests; neither holds. Adding the seam later is a signposted
@@ -175,12 +175,12 @@ class Disclosure:
     gate A.8 itself never specifies.
 
     A note on ``media_type``: any ``text/*`` value is accepted. The marking-scope rule
-    -- which formats get marked at all -- lives in the platform router, not here
-    (RFC-136 2). Two things are worth knowing anyway. The C2PA text conformance
+    -- which formats get marked at all -- lives in the platform router, not here.
+    Two things are worth knowing anyway. The C2PA text conformance
     rubric v0.1.0, not the specification, is the only authority partitioning media
     types: ``text/plain``, ``text/csv`` and ``text/tab-separated-values`` to A.8;
     ``text/markdown`` and the XML family to A.9; ``text/html`` to A.7. A.8 itself
-    names no media type at all. RFC-136 2 deliberately marks ``text/markdown`` under
+    names no media type at all. That router deliberately marks ``text/markdown`` under
     A.8 rather than A.9, because A.9's visible delimiters would break the rendering
     invariant. And ``text/html`` is A.7 territory, for which this carrier is simply
     the wrong mechanism -- nothing here stops you, but the result is non-conformant.

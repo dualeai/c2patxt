@@ -1,7 +1,10 @@
 # pyright: reportPrivateUsage=false
-# Reaches _verify._check_assertions directly: it is the unit that decides whether an
-# assertion store is authentic, and driving it only through verify() would hide which
-# of several rejection paths fired.
+# Reaches _verify._check_assertions directly where a case needs a store no producer can
+# emit. It does NOT hide which rejection path fired -- _assertion_failure returns exactly
+# one code, verify adds it verbatim, and all three phases run unconditionally and
+# accumulate, so codes() discriminates exactly as the helper's return value does. Six
+# codes were held only at this layer on that mistaken reasoning; see
+# test_a_wire_legal_manifest_reports_its_defect_through_verify.
 """End-to-end tests for :func:`c2patxt.verify`.
 
 This is the first suite that exercises the whole stack -- selectors, JUMBF, CBOR,
@@ -381,6 +384,61 @@ def test_a_profile_violation_explains_which_rule_failed() -> None:
     explanations = [status.explanation for status in verdict.failure if status.explanation]
     assert explanations, "signingCredential.invalid arrived with no explanation"
     assert any("EKU" in text or "cA" in text or "keyCertSign" in text for text in explanations)
+
+
+#: One ``build_certificate`` keyword per 14.5.1.1 rule that a certificate can actually
+#: carry onto the wire. The version, uniqueID and signatureAlgorithm rules are absent
+#: because ``cryptography`` will not emit a certificate that breaks them; they are held
+#: by ``test_trust.py`` against hand-built DER.
+_PROFILE_VIOLATIONS: list[tuple[str, dict[str, object]]] = [
+    ("key-usage-absent", {"key_usage": False}),
+    ("no-digital-signature", {"digital_signature": False}),
+    ("key-cert-sign", {"key_cert_sign": True}),
+    ("unreadable-empty-eku", {"extended_key_usage": ()}),
+    ("timestamping-too", {"extra_ekus": ("1.3.6.1.5.5.7.3.8",)}),
+    ("ocsp-signing-too", {"extra_ekus": ("1.3.6.1.5.5.7.3.9",)}),
+    ("any-extended-key-usage", {"extra_ekus": ("2.5.29.37.0",)}),
+    ("not-self-issued-without-aki", {"issuer_name": "another issuer"}),
+]
+
+
+@pytest.mark.parametrize(("label", "keywords"), _PROFILE_VIOLATIONS, ids=[case[0] for case in _PROFILE_VIOLATIONS])
+def test_every_buildable_profile_violation_reaches_verify(label: str, keywords: dict[str, object]) -> None:
+    """The profile is wired to the verdict for every rule, not for one shape of leaf.
+
+    ``check_claim_signing_profile`` is called directly all over ``test_trust.py``, and
+    those tests pass whatever ``_accept_credential`` does with it -- including nothing.
+    Only two marks in this file carry a non-conformant leaf and both use the same one:
+    cA asserted, no EKU. Eight rules were proved at the unit and one on the wire.
+
+    Each row here signs a real document with a leaf breaking exactly one rule and
+    requires ``signingCredential.invalid`` in the verdict, with the diagnosis carried
+    through rather than flattened to a bare code.
+
+    SEVEN OF THE EIGHT FAIL WHEN THE PROFILE CALL IS REMOVED FROM ``_accept_credential``
+    while ``test_trust.py`` stays green -- that asymmetry is the point, since a unit
+    test on the checker cannot see whether anything calls it. ``unreadable-empty-eku``
+    is the exception: an EKU that will not parse is stopped by ``_load_chain``'s
+    hostile-parse boundary first, so that row holds the boundary rather than the
+    wiring. It stays because both must produce the same code from the same document.
+    """
+    key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    signer = Signer(
+        private_key=key,
+        # The producer applies the same profile, so every one of these is refused at
+        # construction; the hatch is what lets the VERIFIER be tested against them.
+        certificates=(build_certificate(key, **keywords),),  # pyright: ignore[reportArgumentType] -- one keyword per row, typed by build_certificate
+        allow_nonconformant=True,
+    )
+
+    verdict = verify(mark("Hello world.", signer))
+
+    assert verdict.state is Provenance.INVALID, label
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID in verdict.codes(), label
+    assert StatusCode.SIGNING_CREDENTIAL_UNTRUSTED not in verdict.codes(), label
+    assert [status.explanation for status in verdict.failure if status.explanation], (
+        f"{label}: signingCredential.invalid arrived with no explanation"
+    )
 
 
 def test_the_manifest_is_returned_even_when_validation_fails(signer: Signer) -> None:
@@ -2165,6 +2223,173 @@ def test_a_gathered_assertion_survives_the_wire(signer: Signer, declare: str, st
 
     assert verdict.state is state
     assert (StatusCode.ASSERTION_UNDECLARED in verdict.codes()) is (state is Provenance.INVALID)
+
+
+#: The six status codes that reached no verdict in any test until 2026-08-06. Each is
+#: produced here by re-signing a wire-legal manifest whose ONLY defect is the rule under
+#: test -- binding matched, signature valid, certificate inside its window -- which is
+#: the shape an attacker actually sends.
+_WIRE_DEFECTS = "wire defects"
+
+
+def _resigned(signer: Signer, mutate: Callable[[list[Assertion], dict[str, object]], None]) -> str:
+    """Marked text whose manifest is rebuilt, mutated and re-signed.
+
+    ``mutate`` receives the assertion list and the claim payload BEFORE the claim is
+    encoded, so a test can change either and still get a document that parses, links,
+    hash-matches and verifies its signature. Everything else about the mark is correct.
+
+    Built rather than embedded because ``embed()`` cannot emit any of these defects --
+    which is the point: a rule reachable only from a third party's manifest still has to
+    be driven from bytes.
+    """
+    import hashlib
+    import unicodedata
+    import uuid as uuid_module
+
+    from c2patxt import _cose
+    from c2patxt import manifest as manifest_module
+    from c2patxt.manifest import DEFAULT_HASH_ALGORITHM, hashed_uri
+    from tests.conftest import WHEN
+
+    normalized = unicodedata.normalize("NFC", "Hello world.")
+    start = len(normalized.encode("utf-8"))
+    digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+
+    def build(exclusion_length: int, pad: bytes) -> str:
+        items = [
+            manifest_module._actions_assertion(WHEN),
+            manifest_module._ai_disclosure_assertion(DISCLOSURE),
+            manifest_module._metadata_assertion(DISCLOSURE),
+            manifest_module._hash_data_assertion(digest, start, exclusion_length, DEFAULT_HASH_ALGORITHM, pad),
+        ]
+        payload: dict[str, object] = {
+            "instanceID": "xmp:iid:1",
+            "claim_generator_info": {"name": "c2patxt"},
+            "signature": "self#jumbf=c2pa.signature",
+            "alg": DEFAULT_HASH_ALGORITHM,
+        }
+        mutate(items, payload)
+        payload["created_assertions"] = [
+            hashed_uri(item.to_box(), f"self#jumbf=c2pa.assertions/{item.label}") for item in items
+        ]
+
+        claim_bytes = _cbor.dumps(payload)  # pyright: ignore[reportArgumentType] -- hand-built claim, as the sibling e2e test
+        boxes = (
+            JumbfBox(
+                description=DescriptionBox(uuid=UUID_ASSERTION_STORE, label=LABEL_ASSERTION_STORE),
+                content=tuple((b"jumb", _jumbf.serialize_superbox(item.to_box())[8:]) for item in items),
+            ),
+            JumbfBox(
+                description=DescriptionBox(uuid=UUID_CLAIM, label=LABEL_CLAIM),
+                content=((b"cbor", claim_bytes),),
+            ),
+            JumbfBox(
+                description=DescriptionBox(uuid=UUID_CLAIM_SIGNATURE, label=LABEL_CLAIM_SIGNATURE),
+                content=((b"cbor", _cose.sign_claim(signer, claim_bytes)),),
+            ),
+        )
+        manifest = JumbfBox(
+            description=DescriptionBox(uuid=UUID_MANIFEST, label="urn:c2pa:" + str(uuid_module.UUID(int=7))),
+            content=tuple((b"jumb", _jumbf.serialize_superbox(box)[8:]) for box in boxes),
+        )
+        store = JumbfBox(
+            description=DescriptionBox(uuid=UUID_MANIFEST_STORE, label=LABEL_MANIFEST_STORE),
+            content=((b"jumb", _jumbf.serialize_superbox(manifest)[8:]),),
+        )
+        return build_wrapper(_jumbf.serialize_superbox(store))
+
+    wrapper, _ = _fixpoint.solve(build)
+    return normalized + wrapper
+
+
+def _blank_disclosure(items: list[Assertion], _claim: dict[str, object]) -> None:
+    items[1] = Assertion(label=items[1].label, payload={})
+
+
+def _actions_without_source_type(items: list[Assertion], _claim: dict[str, object]) -> None:
+    items[0] = Assertion(label=items[0].label, payload={"actions": [{"action": "c2pa.created"}]})
+
+
+def _second_hard_binding(items: list[Assertion], _claim: dict[str, object]) -> None:
+    items.append(Assertion(label=f"{items[3].label}__1", payload=items[3].payload))
+
+
+def _unsupported_binding_algorithm(items: list[Assertion], _claim: dict[str, object]) -> None:
+    binding = items[3].payload
+    assert isinstance(binding, dict)
+    replaced: CborMap = {**binding, "alg": "md5"}
+    items[3] = Assertion(label=items[3].label, payload=replaced)
+
+
+def _icon_reference(url: str, digest: bytes) -> CborMap:
+    """A hashed-uri-map for a generator icon. Distinct from ``_icon`` below, which
+    derives one from a real store; this one takes an arbitrary url and digest."""
+    return {"url": url, "hash": digest, "alg": "sha256"}
+
+
+def _icon_digest_wrong(items: list[Assertion], claim: dict[str, object]) -> None:
+    generator = claim["claim_generator_info"]
+    assert isinstance(generator, dict)
+    claim["claim_generator_info"] = {
+        **generator,
+        "icon": _icon_reference(f"self#jumbf=c2pa.assertions/{items[2].label}", b"\x00" * 32),
+    }
+
+
+def _icon_destination_absent(items: list[Assertion], claim: dict[str, object]) -> None:
+    generator = claim["claim_generator_info"]
+    assert isinstance(generator, dict)
+    claim["claim_generator_info"] = {
+        **generator,
+        "icon": _icon_reference("self#jumbf=c2pa.assertions/c2pa.nonesuch", b"\x00" * 32),
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (_blank_disclosure, StatusCode.GENERAL_ERROR),
+        (_actions_without_source_type, StatusCode.ASSERTION_ACTION_MALFORMED),
+        (_second_hard_binding, StatusCode.ASSERTION_MULTIPLE_HARD_BINDINGS),
+        (_unsupported_binding_algorithm, StatusCode.ALGORITHM_UNSUPPORTED),
+        (_icon_digest_wrong, StatusCode.HASHED_URI_MISMATCH),
+        (_icon_destination_absent, StatusCode.HASHED_URI_MISSING),
+    ],
+    ids=[
+        "general.error",
+        "assertion.action.malformed",
+        "assertion.multipleHardBindings",
+        "algorithm.unsupported",
+        "hashedURI.mismatch",
+        "hashedURI.missing",
+    ],
+)
+def test_a_wire_legal_manifest_reports_its_defect_through_verify(
+    signer: Signer, mutate: Callable[[list[Assertion], dict[str, object]], None], expected: StatusCode
+) -> None:
+    """SIX CODES AN INTEGRATOR CAN RECEIVE, DRIVEN FROM BYTES.
+
+    Each was produced only by a direct call to ``_check_assertions``, ``_binding_status``
+    or ``_reference_status``, so the path from a wire document to a ``Verdict`` carrying
+    the code was unexercised -- including ``general.error``, which ``status.py`` calls the
+    Article 50(2) code, and ``assertion.action.malformed``, which fires when
+    ``digitalSourceType`` is missing.
+
+    DRIVING THEM THROUGH ``verify()`` DOES NOT BLUR THEM, which was the stated reason for
+    stopping at the helper. ``_assertion_failure`` returns exactly one code and ``verify``
+    adds it verbatim, and all three phases run unconditionally and accumulate -- so
+    ``codes()`` discriminates exactly as the helper's return value does. The assertion
+    below on ``dataHash.match`` is what proves it: the document is otherwise perfect.
+    """
+    verdict = verify(_resigned(signer, mutate))
+
+    assert verdict.state is Provenance.INVALID
+    assert expected in verdict.codes(), [code.value for code in verdict.codes()]
+    # THE REST OF THE MARK IS SOUND. Without this the test would pass on a document that
+    # failed for some unrelated reason -- a broken binding, an unparseable claim -- and
+    # the code under test would be incidental.
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
 
 
 def _poisoned_generator(store: ManifestStore, generator: CborMap) -> CborMap:

@@ -66,7 +66,7 @@ scanned as a wrapper candidate; it is rejected on the magic check, not specially
 # ISO-BMFF class syntax and the prose never states endianness -- the only clause in
 # the specification that omits it, where clause 11, clause 18.6 and A.3.x all state
 # it. Big-endian is confirmed by both public implementations and by re-deriving
-# their published vectors; see tests/vectors/A8ConformanceTest-1.0.0.txt note 1.
+# their published vectors; see tests/vectors/A8ConformanceTest-1.2.1.txt note 1.
 LENGTH_STRUCT_FORMAT: Final = ">I"
 
 # =============================================================================
@@ -121,8 +121,8 @@ bound must be applied BEFORE allocating, not after reading.
 Ed25519 manifest stores are 1,797 bytes self-signed and 2,120 bytes with a leaf and
 CA. Both are held by `tests/test_embed.py`, and the leaf+CA row NAMES ITS CONSTRUCTION
 there -- without that the number is not reproducible, which is how this file came to
-publish 2,102 while `docs/platform-handoff.md` published 2,090 a day apart, with
-nothing asserting either. Even an RSA-4096 chain
+publish 2,102 while another document published 2,090 a day apart, with nothing
+asserting either. Even an RSA-4096 chain
 lands near 4 KB. The headroom costs nothing and avoids
 rejecting a legitimate manifest carrying an unusually long certificate chain.
 """

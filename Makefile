@@ -86,7 +86,8 @@ download-vectors:
 # COSE_Sign1 examples from the COSE working group. Unlicense (public domain).
 # eddsa-* use Ed25519 (alg -8), the only algorithm THIS PACKAGE accepts. 13.2.1's
 # list is wider; within EdDSA it permits no instance but Ed25519.
-# sign1-* add three passing and six FAILING cases.
+# sign1-tests/ adds three passing and six FAILING cases, flattened to sign-pass-* and
+# sign-fail-* on disk. See tests/vectors/cose/PROVENANCE.md.
 download-vectors-cose:
 	@echo "Downloading COSE_Sign1 vectors (cose-wg/Examples, Unlicense)..."
 	@mkdir -p $(vectors_dir)/cose
@@ -110,7 +111,13 @@ download-vectors-cbor:
 	  curl -sSfL "https://raw.githubusercontent.com/cbor-wg/cbor-test-vectors/main/tests/rfc8949-appendixA/mt$$m.edn" \
 	    -o "$(vectors_dir)/cbor/mt$$m.edn"; \
 	done
-	@echo "  $$(ls $(vectors_dir)/cbor/mt*.cbor | wc -l | tr -d ' ') CBOR major-type file(s)"
+	@for f in rfc8949/bad rfc8949-appendixA/streaming; do \
+	  curl -sSfL "https://raw.githubusercontent.com/cbor-wg/cbor-test-vectors/main/tests/$$f.cbor" \
+	    -o "$(vectors_dir)/cbor/$$(basename $$f).cbor"; \
+	  curl -sSfL "https://raw.githubusercontent.com/cbor-wg/cbor-test-vectors/main/tests/$$f.edn" \
+	    -o "$(vectors_dir)/cbor/$$(basename $$f).edn"; \
+	done
+	@echo "  $$(ls $(vectors_dir)/cbor/mt*.cbor | wc -l | tr -d ' ') CBOR major-type file(s), plus bad and streaming"
 
 download-vectors-third-party:
 	@echo "Downloading third-party A.8 vectors for interop cross-checks..."

@@ -121,7 +121,7 @@ def test_disclosure_requires_a_model_type() -> None:
     ["text/plain", "text/markdown", "text/csv", "text/tab-separated-values", "text/html"],
 )
 def test_any_text_media_type_is_accepted(media_type: str) -> None:
-    """Marking scope is the router's rule (RFC-136 2), not the codec's.
+    """Marking scope is the platform router's rule, not the codec's.
 
     text/html is accepted even though C2PA assigns it to A.7 and this carrier is the
     wrong mechanism for it. Documented in the Disclosure docstring rather than
@@ -132,7 +132,7 @@ def test_any_text_media_type_is_accepted(media_type: str) -> None:
 
 
 def test_disclosure_is_frozen_and_carries_no_identifying_fields() -> None:
-    """RFC-136 5 forbids tenant, agent, account, user, author or prompt content.
+    """Our marking policy forbids tenant, agent, account, user, author or prompt content.
 
     A closed type turns that legal constraint into a type-system constraint: there
     is no field to put them in and no generic escape hatch.

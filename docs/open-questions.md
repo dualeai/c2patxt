@@ -1,42 +1,17 @@
 # Open questions
 
-Things we could not settle from evidence. Listed rather than resolved, because a
-compliance artefact that overstates its own evidence base is worse than one that says
-less. Nothing here gates anything that ships.
+Things we could not settle from evidence. Nothing here gates anything that ships.
 
 Last checked 2026-08-05.
 
 ## CAWG has no text-specific credential specification — VERIFIED ABSENT
 
 Checked against the Creator Assertions Working Group's own specification index at
-`cawg.io`, which lists every specification it publishes:
-
-| Specification | Status |
-| --- | --- |
-| Identity Assertion | current 1.2, draft 1.3 (+governance, +vc-vp, +vlei) |
-| Metadata Assertion | current 1.1, draft 1.2 |
-| Training and Data Mining Assertion | current 1.1 |
-| Consent Assertion | draft 1.0 |
-| Endorsement Assertion | draft 1.0 |
-| Organizational Identity Profile | current 1.0, draft 1.1 |
-| User Experience Guidance | current 1.0 |
-
-None is text-specific, and the index mentions neither `text/plain` nor "unstructured"
-anywhere. This is absence confirmed against the authoritative list, not a search that came back
-empty. We are not designing around a specification that does not exist.
-
-## HypoFuzz licensing — UNRESOLVED, and a legal question rather than a technical one
-
-The HypoFuzz licence simultaneously grants free use to "open source initiatives" and
-bars "any use within a commercial organization". Those clauses conflict for our exact
-situation: an open-source project developed inside a commercial organisation.
-`hypofuzz.com/pricing.html` returns **404** (the site itself returns 200), so the
-terms cannot be resolved from the vendor's own published material.
-
-**This gates nothing.** HypoFuzz would only be used by the optional post-v1 mutation
-audit. The property-based testing that ships uses Hypothesis, which is MPL-2.0 and
-carries no such restriction. If the audit is ever taken up, the licence needs a legal
-answer first; until then this is recorded, not blocking.
+`cawg.io`, which lists every specification it publishes. The seven it lists cover
+identity, metadata, training and data mining, consent, endorsement, organizational
+identity and user experience. None is text-specific, and the index mentions neither
+`text/plain` nor "unstructured". We are not designing around a specification that does
+not exist.
 
 ## No status code exists for "the manifest store is not parseable JUMBF" — UNRESOLVED
 
@@ -85,18 +60,6 @@ Signature-first would remove it at the root. Two things argue against doing it c
   whose disclosure is also missing tells an operator less than reporting the missing
   disclosure.
 
-The honest position is that the current order is a choice with a known cost, defended by
-one specific mitigation, and that anything added to the pre-signature path needs its work
-bounded the way `_assertion_digest` bounds hashing.
-
-## Closed
-
-- **JUMBF constants, `jumd` layout, toggle bits, content-type UUIDs, LBox/XLBox
-  semantics, the Padding Box.** Resolved by four independent sources plus verbatim
-  free normative text from the ISO clause 4.3 sample. No purchase was needed.
-- **The C2PA box type UUIDs** (`c2pa`, `c2ma`, `c2as`, `c2cl`, `c2cs`) were read from
-  the 2.0 PDF and have been re-verified byte for byte against the 2.4 build. See
-  [c2pa-compatibility.md](c2pa-compatibility.md).
-- **pytest-codspeed simulation mode** was adopted on 2026-08-05, in `tests/benchmarks/`
-  and `.github/workflows/codspeed.yml`. What is held by a benchmark and what is held by an assertion is
-  set out in [benchmarks.md](benchmarks.md).
+The current order is a choice with a known cost, defended by one mitigation. Anything
+added to the pre-signature path needs its work bounded the way `_assertion_digest`
+bounds hashing.

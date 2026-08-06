@@ -16,12 +16,27 @@ if both halves shared the bug being guarded against.
 
 from __future__ import annotations
 
-import pytest
+import uuid as uuid_module
 
-from c2patxt import _jumbf
+import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from c2patxt import EmbedContext, _jumbf, embed, extract
 from c2patxt._jumbf import DescriptionBox, JumbfBox, JumbfError, Toggle, parse_superbox, serialize_superbox
+from c2patxt._selectors import selector_to_byte
+from c2patxt.constants import HEADER_SIZE, MAGIC, MARKER
+from c2patxt.signing import Signer
+from tests.conftest import DISCLOSURE, WHEN
 
 UUID = _jumbf.content_type_uuid(b"cbor")
+
+_PINNED = EmbedContext(manifest_uuid=uuid_module.UUID(int=7), instance_id="xmp:iid:pinned", when=WHEN)
+
+
+@pytest.fixture(scope="session")
+def signer(signing_key: Ed25519PrivateKey, signing_certificate: x509.Certificate) -> Signer:
+    return Signer(private_key=signing_key, certificates=(signing_certificate,))
 
 
 def _description(toggles: int, tail: bytes) -> bytes:
@@ -52,8 +67,10 @@ def test_a_label_toggle_alone_is_enough_to_read_a_label() -> None:
     ISO 19566-5 gates the label on bit 0x02 alone; 0x01 is Requestable, an unrelated
     property. Five independent implementations test 0x02 on its own -- MIPAMS,
     ExifTool, thorfdbg, iLEAPP, exifmodern -- and a real file bears it out: our own
-    byte-level parse of ``image_5jumbf.jpg`` APP11 #1 shows a toggles=0x02 box
-    labelled "faiz mp3 data".
+    byte-level parse of ``image_5jumbf.jpg`` APP11 #1 showed a toggles=0x02 box
+    labelled "faiz mp3 data" -- an observation on an asset that is not vendored and
+    cannot be reproduced from this repository. The five implementations are the
+    checkable evidence.
 
     SVTA made the same mistake independently, which is why this is worth a test
     rather than a comment: two implementations converging on a wrong reading is how
@@ -74,8 +91,8 @@ def test_the_box_id_is_four_bytes_not_two() -> None:
     """DIVERGENCE: faceless2/c2pa reads and writes the jumd ID as 2 BYTES and clamps
     anything above 65535.
 
-    Every other implementation uses 4 bytes big-endian, and MIPAMS states it outright
-    as ``INT_BYTE_SIZE = 4``. The discriminating value is one above the 16-bit
+    Every other implementation surveyed uses 4 bytes big-endian, and MIPAMS states it
+    outright as ``INT_BYTE_SIZE = 4``. The discriminating value is one above the 16-bit
     ceiling: a 2-byte reader either truncates it or refuses it.
     """
     big = 70000
@@ -200,10 +217,12 @@ def test_an_unknown_box_uuid_is_skipped_not_rejected(four_cc: bytes) -> None:
 
 @pytest.mark.parametrize("bad", ["a/b", "a;b", "a?b", "a#b", "a﻿b", "a￿b", "a\x00b", "a\x1fb", "a\x7fb"])
 def test_forbidden_label_characters_are_refused(bad: str) -> None:
-    """WE ARE STRICTER THAN EVERY OTHER IMPLEMENTATION, on purpose.
+    """WE ARE STRICTER THAN EVERY IMPLEMENTATION SURVEYED, on purpose.
 
     C2PA 11.1.4.1.1 forbids U+0000-001F, U+007F-009F, ``/ ; ? #``, plus U+FEFF,
-    U+FFFF and the surrogate range. No implementation anywhere enforces this. Labels
+    U+FFFF and the surrogate range. None of the implementations surveyed in
+    docs/known-divergences.md enforces it -- an unbounded "nobody anywhere" is not a
+    claim this or any test holds. Labels
     become JUMBF URI path components, so an unescaped ``/`` or ``#`` in a label is a
     URI-injection primitive against any consumer that resolves ``self#jumbf=`` URIs
     by string manipulation -- which is how they are resolved.
@@ -238,3 +257,46 @@ def test_reserved_toggle_bits_are_refused() -> None:
     version's fields."""
     with pytest.raises(JumbfError, match="reserved toggle"):
         parse_superbox(_superbox(_description(0x80 | Toggle.LABEL, b"x\x00")))
+
+
+def test_our_padding_lives_inside_the_signed_claim_not_in_the_selector_run(signer: Signer) -> None:
+    """Item 8: A.8 defines no padding, so each implementation invented one.
+
+    encypherai/c2pa-text appends extra VS-encoded bytes AFTER the JUMBF container and
+    relies on ``manifestLength`` to tell a decoder where the manifest ends
+    (``encode_wrapper_padded``). writerslogic/c2pa-text-binding declares ``pad`` and
+    leaves it empty. We put the slack in the hash assertion's ``pad`` field, which
+    18.5.2 makes mandatory and 10.4 designates for exactly this -- so it sits INSIDE
+    the signed claim rather than in attacker-malleable space beside it.
+
+    That is the discriminating property, and it is checkable without their code: our
+    selector run must carry NOTHING past the declared ``manifestLength``. A wrapper
+    padded the other way has trailing selectors a decoder is told to ignore.
+
+    Unlike the rest of this file, this one drives our own encoder, because the claim
+    is about what WE emit. Building it by hand would assert the fixture, not the codec.
+    """
+    marked = embed("Hello world.", signer, DISCLOSURE, context=_PINNED)
+    store = extract(marked)
+    assert store is not None
+
+    wrapper = marked[marked.index(MARKER) :]
+    body = bytes(selector_to_byte(ord(char)) or 0 for char in wrapper[len(MARKER) :])
+    declared = int.from_bytes(body[len(MAGIC) + 1 : len(MAGIC) + 1 + 4], "big")
+
+    # header is magic(8) + version(1) + manifestLength(4); nothing may follow the store
+    assert declared == len(store.raw), f"declared {declared} B, store is {len(store.raw)} B"
+    assert len(body) == HEADER_SIZE + declared, (
+        f"{len(body) - HEADER_SIZE - declared} B of selector run past the manifest"
+    )
+
+    # and the slack the search needed is in the signed claim, where 10.4 puts it.
+    # NON-EMPTY, not merely present: 18.5.2 makes `pad` mandatory, so presence alone
+    # would also pass for writerslogic/c2pa-text-binding's `pad: Vec::new()` -- the
+    # implementation this test contrasts us with. Measured 8-10 bytes across the inputs
+    # tried, including the empty document.
+    hash_data = store.hash_data
+    assert hash_data is not None
+    pad = hash_data["pad"]
+    assert isinstance(pad, bytes)
+    assert pad, "pad is empty; the search's slack went somewhere outside the signed claim"

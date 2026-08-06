@@ -22,11 +22,13 @@ six JMESPath expressions over a parsed manifest can give:
     referenced anywhere in the rubric.
   * There are NO WIRE VECTORS.
 
-That gap is exactly what tests/vectors/A8ConformanceTest-1.1.0.txt fills.
+That gap is exactly what tests/vectors/A8ConformanceTest-1.2.1.txt fills.
 
-PASSING IS SELF-ASSESSED. All 152 conformance-listed products are certified against
+PASSING IS SELF-ASSESSED. Every conformance-listed product is certified against
 specification 2.2 and none declares a text media type (one declares a bare non-IANA
-`txt` token), so there is no certification to obtain here yet.
+`txt` token), so there is no certification to obtain here yet. 156 products at
+`7d19b332` in c2pa-org/conformance-public; the list syncs more than once a day, so it
+is pinned by commit rather than by date.
 """
 
 from __future__ import annotations
@@ -165,7 +167,7 @@ def test_every_media_type_the_rubric_assigns_to_a8_round_trips(media_type: str, 
 def test_markdown_is_marked_under_a8_as_a_deliberate_deviation(signer: Signer) -> None:
     """WE DEPART FROM THE RUBRIC HERE, on purpose, and this pins it.
 
-    The rubric partitions ``text/markdown`` to A.9 (structured text). RFC-136 2 marks
+    The rubric partitions ``text/markdown`` to A.9 (structured text). The platform marks
     it under A.8 instead, on rendering-invariant grounds: A.9's forms put VISIBLE
     delimiters into the document, which is exactly what A.8 exists to avoid, and
     markdown tolerates zero-width insertion the way plain text does.

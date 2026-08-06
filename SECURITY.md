@@ -1,25 +1,15 @@
-# Security Policy
+# Security policy
 
-This document is the coordinated vulnerability handling policy for `c2patxt`. It is
-written to serve as the documented, verifiable policy required of an open-source
-software steward under Article 24(1) of Regulation (EU) 2024/2847 (the Cyber
-Resilience Act), and not merely as a repository convention.
+**Report a vulnerability privately, either way:**
 
-## Reporting a Vulnerability
+- [`/security/advisories/new`](https://github.com/dualeai/c2patxt/security/advisories/new)
+  — private vulnerability reporting is enabled, and this is the preferred route.
+- **Email `security@duale.ai`** if you would rather not use GitHub.
 
-Two channels, both live:
+**Do not open a public issue for a suspected vulnerability.** The timeline below runs
+from whichever channel you use.
 
-- **GitHub Security Advisories**, the preferred route — private vulnerability reporting
-  is enabled, so
-  [`/security/advisories/new`](https://github.com/dualeai/c2patxt/security/advisories/new)
-  accepts reports.
-- **Email `security@duale.ai`**, if you would rather not use GitHub.
-
-The timeline below is measured from whichever you use.
-
-Do not open a public issue for a suspected vulnerability.
-
-### Response Timeline
+## Response timeline
 
 - **48 hours**: initial acknowledgment
 - **7 days**: assessment and action plan
@@ -35,21 +25,17 @@ request one through GitHub, which is a CNA, using the repository's Security Advi
 workflow. Advisories published this way propagate to Dependabot alerts for downstream
 users.
 
-### Third-Party Dependencies
+### Third-party dependencies
 
-This package has exactly one runtime dependency, `cryptography`. Vulnerabilities in
-it should be reported to [pyca/cryptography](https://github.com/pyca/cryptography)
-directly. We will still want to hear about it if the issue affects users of this
-package, so that we can pin or advise.
+This package has exactly one runtime dependency, `cryptography`. Report
+vulnerabilities in it to [pyca/cryptography](https://github.com/pyca/cryptography)
+directly. We still want to hear about it if the issue affects users of this package, so
+that we can pin or advise.
 
-## Supported Versions
+## Supported versions
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.x     | :white_check_mark: |
-
-The public API is explicitly unstable while the major version is 0. Security fixes
-are released against the latest `0.x` only.
+The public API is explicitly unstable while the major version is 0. Security fixes are
+released against the latest `0.x` only.
 
 ## Scope
 
@@ -60,8 +46,8 @@ are released against the latest `0.x` only.
   (false positive), including any input that yields `Provenance.VALID` or
   `Provenance.TRUSTED` without a genuine, verifying signature.
 - Memory or CPU exhaustion from adversarial input. This library parses untrusted text
-  and untrusted binary structures, and is expected to be run on a public,
-  unauthenticated verification surface. Unbounded allocation from an attacker-supplied
+  and untrusted binary structures, and we expect it to run on a public, unauthenticated
+  verification surface. Unbounded allocation from an attacker-supplied
   length field is a vulnerability, not a performance bug.
 - Information disclosure through exceptions, return values or timing that reveals more
   than the verdict and the manifest fields.
@@ -70,13 +56,25 @@ are released against the latest `0.x` only.
 
 ### Out of scope, by design
 
-These are documented properties of the format, not defects. They are stated here so
-that reporting them is unnecessary.
+These are documented properties of the format, not defects. Listed here so you need
+not report them.
 
-- **Mark removal.** Publishing a detector publishes a remover. The detection algorithm
+- **Mark removal.** Publishing a detector publishes a remover: the detection algorithm
   read backwards is a stripping algorithm. This is inherent to the design and is
   accepted; erasure of a mark by a computationally bounded attacker is possible even
   when insertion and detection share a secret.
+
+  **This is why `strip()` ships.** It converts the ten lines an attacker writes from
+  A.8.4.2 into one, which is a marginal gain for someone who already has everything
+  they need. What it gives a legitimate caller is the only correct way to re-mark a
+  document: `AlreadyMarkedError` tells you to remove the existing wrapper and call
+  again, and the span it hands you is in **bytes**. Slicing a `str` with byte offsets
+  silently leaves a zero-width residue on any non-ASCII text, and that failure is
+  invisible three times over — the residue does not render, it is shorter than the
+  magic number so `verify()` reports `UNMARKED` rather than corrupt, and `embed()` then
+  bakes it permanently inside the newly hashed text. Demonstrated by
+  `tests/test_strip.py::test_the_naive_string_slice_is_wrong_and_strip_is_not`. No
+  `remove` alias exists.
 - **Regeneration.** Any transform that reproduces the meaning and discards the bytes
   removes the mark. Paraphrase, retyping and truncation all defeat it.
 - **Absence of a mark.** Unmarked text is the normal case for almost all text. A
@@ -92,10 +90,13 @@ that reporting them is unnecessary.
 - **No network.** Verification is a pure function of its arguments. The test suite
   runs with `pytest-socket` and `--disable-socket`, so any egress fails the build.
 - **No logging.** This library emits no log records, so it cannot leak partial-match
-  detail into a host application's logs. Asserted in CI over real embed and
-  verify calls, captured at the root logger.
+  detail into a host application's logs. Held by
+  `tests/test_package.py::test_no_log_records_are_emitted_while_doing_real_work`, over
+  real embed and verify calls captured at the root logger.
 - **No ambient configuration.** No environment scanning, no implicit credential store,
   no configuration file discovery. Trust anchors are supplied explicitly by the caller.
+  Held by `tests/test_trust.py::test_no_anchors_ship_by_default` and
+  `::test_the_environment_cannot_supply_anchors`.
 - **One runtime dependency.** `cryptography`, and nothing else. Check it yourself:
 
   ```console
@@ -107,6 +108,11 @@ that reporting them is unnecessary.
   Asserted by `tests/test_package.py::test_the_package_declares_exactly_one_runtime_dependency`,
   which runs on every CI job. (`uv tree --no-dev` is NOT a useful check here: the dev
   set is an extra rather than a dependency group, so `--no-dev` is a no-op.)
+
+  The optional `[trust]` extra adds `pyhanko-certvalidator` for callers building their
+  own `TrustEvaluator`. Nothing in this package imports it.
+- **Licence.** Apache-2.0, including its express patent grant.
+- **Supported Python.** 3.10 – 3.14, CPython.
 
 ## Supply chain
 
@@ -123,8 +129,23 @@ gh attestation verify ./c2patxt-<version>-py3-none-any.whl -R dualeai/c2patxt
 pypi-attestations verify pypi \
   --repository https://github.com/dualeai/c2patxt \
   https://files.pythonhosted.org/packages/.../c2patxt-<version>-py3-none-any.whl
+
+# pin the whole tree by hash
+uv export --frozen --no-emit-project -o requirements.txt
+pip install --require-hashes -r requirements.txt
 ```
 
 An attestation tells you *where* a package came from, not *whether* you should trust
 it. Neither `pip` nor `uv` gate installation on attestations, so verification is a
 step you run deliberately.
+
+## Regulatory basis
+
+We are an open-source **steward** under Article 24 of Regulation (EU) 2024/2847, the
+Cyber Resilience Act, not a manufacturer. The Act applies in stages: Chapter IV
+(Articles 35-51, notification of conformity assessment bodies) from 11 June 2026,
+Article 14's reporting duties from 11 September 2026, and the substantive obligations
+including Article 24 from 11 December 2027.
+
+This document is the Article 24(1) artefact for `c2patxt`. It does not speak for the
+organisation that maintains the package, which owns its own obligations separately.

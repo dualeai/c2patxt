@@ -1,15 +1,14 @@
-# Upstream filing — drafted, not sent
+# Four ambiguities in Annex A.8
 
 Four defects in C2PA 2.4 Annex A.8 that cause **silent divergence**: two conforming
-implementations produce different bytes and neither is wrong. They are drafted here in
-full and ready to send.
+implementations produce different bytes and neither is wrong. Each is written up here
+as it would be filed.
 
-> **NOT YET FILED.** Posting public issues on a specification repository is an
-> outward-facing act on behalf of Duale AI, so it needs a person to press send. The
-> exact command for each is given below. The other **fourteen** ambiguities we found
-> are deliberately *not* separate issues — filing eighteen issues against an annex
-> maintained by a small task force is noise, and noise gets ignored. They are listed
-> once, as a list, inside issue 1.
+**Not yet filed.** Posting public issues on a specification repository is an
+outward-facing act on behalf of Duale AI, so it needs a person to press send. The other
+**fourteen** ambiguities we found are deliberately not separate issues — filing eighteen
+against an annex maintained by a small task force is noise, and noise gets ignored. They
+are listed once, inside issue 1.
 
 Target: `c2pa-org/specifications`. All quotations are from 2.4 build `c7e55d5a`.
 
@@ -34,7 +33,7 @@ Computed from the Unicode Character Database:
 
 It is resolvable — A.8.5 delegates to the Validation clause for the normative
 procedure — but the contradictory sentence is unretracted and has survived from 2.3's
-A.7 through all eleven published 2.4 builds.
+A.7 through every published 2.4 build.
 
 **Likely cause, offered as a lead:** A.8.7.2 and A.8.7.3 carry `shall` requirements
 while nested under a heading titled *"Validation Status Codes"*. Normative text
@@ -60,7 +59,7 @@ three be satisfied (25); a reference into a data box, which 10.2.3.2 makes a SHO
 decline (26); and no status code for a manifest store that fails to parse at all,
 recorded in [open-questions.md](open-questions.md).
 
-**U+FEFF is not on this list**, because it is Issue 3 above.
+**U+FEFF is not on this list**, because it is Issue 3 below.
 
 ---
 
@@ -130,7 +129,7 @@ invalidates a document.
 
 ## Offering the vectors
 
-We publish a wire-format conformance vector file — `A8ConformanceTest-1.1.0.txt`, 26
+We publish a wire-format conformance vector file — `A8ConformanceTest-1.2.1.txt`, 29
 records, CC0 — because the C2PA text conformance rubric v0.1.0 has none. Format
 modelled on `NormalizationTest.txt`: ASCII-only data, one record per line, semicolon
 separated, `#` comments.
@@ -139,27 +138,11 @@ Offered **once**, to C2PA or to C2SP under the CCTV model (*"All cryptography-re
 test vectors are welcome… projects are encouraged to reuse them and contribute back"*).
 If there is no uptake we keep it in-repo and move on.
 
-## Commands to send
+## What we do not do
 
-```console
-$ gh issue create --repo c2pa-org/specifications \
-    --title "A.8.7.3 contradicts 15.12.1.3.1 on normalization order, producing different hashes" \
-    --body-file <(sed -n '/^## Issue 1/,/^---$/p' docs/upstream-filing.md)
-```
-
-…and the same for issues 2–4. Read each body before sending; these are public and
-attributed to Duale AI.
-
-## What we deliberately do not do
-
-No coordinated engagement programme with the other implementations, no direct query to
+**Byte-for-byte agreement is a better contribution than correspondence.** So: no
+coordinated engagement programme with the other implementations, no direct query to
 CAWG (its specification index is [already conclusive](open-questions.md)), and no
-scheduled tracking of `c2pa-rs` PR #2117. Instead we cross-validate against their
-published vectors in CI and open an issue only on a genuine disagreement.
-**Byte-for-byte agreement is a better contribution than correspondence.**
-
-Worth knowing, not worth a task: `c2pa-rs` PR #2117 (TextIO behind a non-default
-`plain_text` feature, depending on the encypher `c2pa-text` crate) has been open since
-2026-05-05 with no maintainer merge in roughly three months. If it lands, the reference
-implementation gains A.8 support and our conformance target gains a second authority.
-Check it next time we touch conformance, not on a schedule.
+scheduled tracking of `c2pa-rs` PR #2117, which has been open since 2026-05-05. Instead
+we cross-validate against their published vectors in CI and open an issue only on a
+genuine disagreement.

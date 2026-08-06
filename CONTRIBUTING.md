@@ -10,6 +10,15 @@ Both must be green before a pull request. CI runs `make test-static` and
 `make test-func` — the same checks, not the same targets: it cannot run `make lint`,
 which rewrites files rather than reporting on them.
 
+**Branch from `develop` and open the pull request against `develop`.** `main` is the
+release branch: it is what the publish workflow reads and what `git describe` tags. Work
+lands on `develop` first and reaches `main` when a release is cut.
+
+**Commit subjects are [Conventional Commits](https://www.conventionalcommits.org)** —
+`feat:`, `fix:`, `docs:`, `test:`, `ci:`, `refactor:` — because the release notes are
+written from the log. No CLA and no DCO sign-off; the Apache-2.0 licence on the
+repository covers the contribution.
+
 ## Rules that are not obvious, and are not negotiable
 
 These exist because breaking them produces tests that pass while the code is wrong —
@@ -46,15 +55,32 @@ unit/integration split would label tests without letting anyone select different
 invisible characters; a file containing them literally is one no reviewer, diff tool
 or terminal renders honestly.
 
+**If you break the code deliberately — to check a test bites — two traps turn a broken
+probe green.** Both have caught someone here:
+
+- **Stale bytecode after a same-length revert.** Python invalidates a `.pyc` on source
+  size and mtime, and `0xFFFE` → `0xFFFF` changes neither at second granularity, so the
+  restored file keeps loading the mutant. Run
+  `find src -name __pycache__ -type d -exec rm -rf {} +` after reverting.
+- **zsh does not word-split unquoted expansions.** `pytest $ARGS` with
+  `ARGS="file -k selector"` hands pytest ONE argument, selects nothing, and prints
+  `no tests ran` — which reads like success at a glance. Use `${=ARGS}`, and read the
+  result as the literal words `1 failed` rather than as the absence of a failure.
+
 **Every lint suppression carries a reason.** `# noqa: S607` alone is not acceptable;
 say why the rule does not apply here. Rules for static analysis are strict on purpose:
 **if it fails, fix the issue — never turn off the linter.**
 
 **New deviations from the specification go in [docs/deviations.md](docs/deviations.md)
 with both sides quoted**, not in a code comment. The document exists because that
-reasoning is recoverable from nowhere else. If a clause is cited in `src/`, it must
-also appear in [docs/c2pa-compatibility.md](docs/c2pa-compatibility.md) — a test
-enforces this.
+reasoning is recoverable from nowhere else. A clause cited in `src/` should also appear
+in [docs/c2pa-compatibility.md](docs/c2pa-compatibility.md).
+
+**One direction of that is checked, and only one.**
+`tests/test_compatibility.py::test_every_where_column_names_a_file_that_cites_its_clause`
+holds that each file a row NAMES cites that clause. Two gaps, both on review: a row
+naming no file at all passes, and nothing checks the reverse direction — a clause you
+cite in `src/` and forget to add to the document goes unnoticed.
 
 ## Changing the wire format
 
@@ -96,72 +122,8 @@ you reading a local run are in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Cutting a release
 
-Publishing is triggered by a **GitHub Release**, not by pushing a tag. `git push --tags`
-runs nothing: the workflow's `push` trigger filters on `branches: [main]`, and a branch
-filter excludes tag pushes.
-
-1. Land everything on `main`. There is no changelog file to edit: **the release notes
-   are the changelog**, written on the Release itself, so nothing about them can go
-   stale in a checkout.
-2. Tag that commit `vX.Y.Z` and push the tag. Nothing runs yet; the tag exists so the
-   next step can point at it, and so `cicd/version.sh` can find it.
-3. Create a GitHub Release for that tag. **This is the step that publishes.** Write the
-   notes there, and say what was evaluated and rejected as well as what shipped — a
-   release nobody can read the reasoning for gets the same question asked again.
-
-The workflow file is read from the **tagged commit**, not from `main`. A fix landed on
-`main` after the tag does nothing for that release, and re-running the failed run
-re-reads the same broken file: move the tag, or cut the next version.
-
-What then happens. Every job needs `build`, and the publish chain is sequential:
-
-| Job | Does | Gate |
-| --- | --- | --- |
-| `build` | injects the version from `git describe --tags --abbrev=0`, builds sdist and wheel, generates CycloneDX and SPDX SBOMs, attests both plus build provenance | **no `if:` — every trigger**, including the release event |
-| `publish-testpypi` | uploads to TestPyPI | `release` event |
-| `publish-pypi` | uploads to PyPI | `release` event, after TestPyPI |
-| `upload-release` | attaches artifacts and SBOMs to the Release | `release` event, after PyPI |
-
-**`build` runs again at release time, and that run is the one that ships.**
-`publish-testpypi` downloads the `dist` artifact with no `run-id`, so it takes it from
-the current workflow run — not from the earlier push to `main`. Two consequences a
-maintainer should expect rather than discover:
-
-- the build's two hard assertions are live gates at release time, not formalities
-  already passed: the wheel-content check and `test "$COMPONENTS" -le 8` on the SBOM;
-- the two builds inject **different versions**. On a push to `main`, `git describe`
-  resolves to the *previous* tag; on the release event the checkout is at the tagged
-  commit and resolves to the new one. So the `main` build exercises the chain — which
-  is why it exists — but it is not the artifact.
-
-TestPyPI gating PyPI is deliberate: an upload that fails only on the real index is one
-that cannot be retried under the same version, because PyPI filenames are immutable.
-
-`workflow_dispatch` runs `build` alone. Useful for exercising the chain without
-publishing.
-
-**Before the first release**, both the `testpypi` and `pypi` environments need a
-trusted publisher configured on the respective index. Three fields have to match
-exactly, and a mismatch in any of them is the standard first-release failure:
-`dualeai/c2patxt`, the workflow filename `release.yml`, and the environment name
-(`testpypi` or `pypi`). No API token exists or should; see [SECURITY.md](SECURITY.md).
-
-> **The repository was renamed** from `dualeai/c2pa-text` to `dualeai/c2patxt`. If a
-> trusted publisher was configured under the old name it must be updated on **both**
-> indexes. GitHub's rename redirect does not help: the OIDC token the workflow mints
-> carries the *current* repository, and the index compares that claim against what it
-> has stored. A stale entry fails the upload at `publish-testpypi` — after `build` has
-> already run and attested — and because TestPyPI gates PyPI, someone fixing only the
-> one they hit will meet the other on the next attempt.
-
-Nothing published predates the rename, so no released artifact carries provenance
-naming the old repository and there is no historical mismatch for an auditor to
-reconcile. That is only true until the first release.
-
-**The version comes from the tag**, via `cicd/version.sh`, which falls back to `0.1.0`
-when `git describe` finds nothing. `fetch-depth: 0` in the workflow is what makes tags
-available to it — nothing asserts that the resolved version matches the Release tag, so
-check the "Injecting version:" line in the build log before trusting the artifact.
+A GitHub Release publishes. `git push --tags` does not. The runbook, the job graph and
+the trusted-publisher setup are in [docs/releasing.md](docs/releasing.md).
 
 ## Writing
 

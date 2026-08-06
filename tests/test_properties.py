@@ -312,7 +312,7 @@ def test_marking_never_changes_what_the_reader_sees(signer: Signer, text: str) -
     delimiters, and it is the property a customer notices being broken before they
     notice anything else.
 
-    Asserted as a PROPERTY rather than spot-checked, per the founding memo, and
+    Asserted as a PROPERTY rather than spot-checked, and
     stated the honest way: the visible text of the output equals the NFC form of the
     input. embed() normalizes before marking, so for already-NFC text -- effectively
     all real text -- that is the input unchanged, and for NFD input it is a real and
@@ -343,7 +343,7 @@ def test_marking_never_changes_what_the_reader_sees(signer: Signer, text: str) -
 def test_the_full_remark_cycle_is_byte_stable(signer: Signer, text: str) -> None:
     """embed -> strip -> embed produces identical bytes, over arbitrary input.
 
-    The founding memo asks for this cycle specifically, and for it to be run more than
+    This cycle was called for specifically, and for it to be run more than
     once -- "a determinism test that runs once tests nothing". Hypothesis supplies the
     repetition, over inputs nobody chose by hand.
 
@@ -364,7 +364,7 @@ def test_the_full_remark_cycle_is_byte_stable(signer: Signer, text: str) -> None
 @given(TEXT)
 @settings(max_examples=25, deadline=None, suppress_health_check=[HealthCheck.function_scoped_fixture])
 def test_the_located_span_always_decodes_back_to_the_wrapper(signer: Signer, text: str) -> None:
-    """The founding memo's second property, which was only ever spot-checked.
+    """The second such property, which was only ever spot-checked.
 
     ``locate()`` must return a range that IS the wrapper -- not merely a range near
     it. Sliced out of the caller's own bytes it must start with the U+FEFF marker,

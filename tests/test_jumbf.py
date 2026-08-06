@@ -103,8 +103,9 @@ def test_a_label_only_box_parses() -> None:
 
     c2pa-rs requires ``(toggles & 0x03) == 0x03`` before reading a label and so FAILS
     on this legal box. Five independent implementations test 0x02 alone, and real
-    files carry such boxes -- image_5jumbf.jpg APP11 #1 has toggles=0x02 with the
-    label 'faiz mp3 data'.
+    files carry such boxes: a parse of image_5jumbf.jpg APP11 #1 showed toggles=0x02
+    with the label 'faiz mp3 data'. That asset is not vendored and the observation is
+    not reproducible here -- see docs/known-divergences.md.
     """
     description = DescriptionBox(uuid=UUID_JSON, label="my xml data", requestable=False)
     assert description.toggles == Toggle.LABEL
@@ -150,7 +151,8 @@ def test_a_requestable_box_must_carry_a_label() -> None:
 
 @pytest.mark.parametrize("char", ["/", ";", "?", "#", "\x01", "\x7f", "﻿", "￿"])
 def test_forbidden_label_characters_are_rejected(char: str) -> None:
-    """C2PA 11.1.4.1.1. NO implementation anywhere enforces these -- we do.
+    """C2PA 11.1.4.1.1. No implementation surveyed in docs/known-divergences.md
+    enforces these -- we do.
 
     U+FEFF is on the list, which is a quiet irony given it is our wrapper marker.
     """

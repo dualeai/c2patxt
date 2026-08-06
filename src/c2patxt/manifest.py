@@ -264,7 +264,7 @@ class ManifestStore:
 
 
 def _actions_assertion(when: datetime.datetime) -> Assertion:
-    """The ``c2pa.created`` action (RFC-136 4).
+    """The ``c2pa.created`` action.
 
     ``digitalSourceType`` is ``trainedAlgorithmicMedia``: this content was produced
     by a generative model, which is the single fact the mark exists to carry.

@@ -45,6 +45,7 @@ def build_certificate(
     key_usage: bool = True,
     basic_constraints: bool = True,
     digital_signature: bool = True,
+    key_cert_sign: bool = False,
     extra_ekus: tuple[str, ...] = (),
     extended_key_usage: tuple[str, ...] | None = None,
     issuer_name: str | None = None,
@@ -77,6 +78,9 @@ def build_certificate(
     ``digital_signature=False``
         keep Key Usage but assert ``contentCommitment`` in place of
         ``digitalSignature``, so the extension is present and still unauthorized.
+    ``key_cert_sign=True``
+        assert ``keyCertSign`` alongside ``digitalSignature``: a leaf that may also
+        issue certificates.
     ``extra_ekus``
         append further EKU OIDs, for the purpose-exclusivity rules. Ignored when
         ``extended_key_usage`` is given, which replaces the list outright.
@@ -112,7 +116,14 @@ def build_certificate(
     # caller combining them is asking for something this builder cannot make. Silently
     # ignoring an argument is how a test comes to assert something about a certificate it
     # did not build.
-    varied = (not key_usage, not basic_constraints, not digital_signature, extra_ekus, extended_key_usage is not None)
+    varied = (
+        not key_usage,
+        not basic_constraints,
+        not digital_signature,
+        key_cert_sign,
+        extra_ekus,
+        extended_key_usage is not None,
+    )
     if not conformant and any(varied):
         msg = "conformant=False ignores the profile knobs; build a conformant certificate and vary it instead"
         raise ValueError(msg)
@@ -135,7 +146,7 @@ def build_certificate(
                     key_encipherment=False,
                     data_encipherment=False,
                     key_agreement=False,
-                    key_cert_sign=False,
+                    key_cert_sign=key_cert_sign,
                     crl_sign=False,
                     encipher_only=False,
                     decipher_only=False,

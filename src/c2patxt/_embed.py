@@ -3,8 +3,9 @@
 
 WHY THE WRAPPER IS ALWAYS A SUFFIX, AND THE TEXT IS ALWAYS NFC
 --------------------------------------------------------------
-A.8 leaves both open -- placement "at the end" is a SHOULD, and A.8.6.1 requires NFC
-for HASHING without saying anything about embedding. Left open, they produce the two
+A.8 leaves both open -- A.8.4.1's placement "at the end" is a SHOULD, and A.8.7.2
+requires NFC for HASHING without saying anything about embedding. (A.8.6.1 states the
+validation requirement those two serve; the procedure is 15.12.1.3.1's.) Left open, they produce the two
 divergence classes this format has:
 
 * 15.12.1.3.1 removes the wrapper and then normalizes; A.8.7.3 normalizes first. The
@@ -32,8 +33,8 @@ library: pyca/cryptography's Ed25519 documentation never states determinism. If
 ES256 is ever added, byte-stability disappears -- ECDSA is randomized -- and the
 determinism tests must be skipped for it rather than quietly relaxed.
 
-The founding memo asked for this to be exercised under ``pytest-repeat``, on the
-grounds that "a determinism test that runs once tests nothing". We do not take that
+Exercising this under ``pytest-repeat`` was proposed, on the grounds that "a
+determinism test that runs once tests nothing". We do not take that
 dependency. Repetition samples for instability; :class:`EmbedContext` REMOVES the
 sources of it, which is the stronger move, and the residual risk -- a seed we forgot
 to pin -- is covered instead by a Hypothesis property that re-marks arbitrary text
