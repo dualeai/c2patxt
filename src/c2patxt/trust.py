@@ -1,50 +1,37 @@
-"""
-Trust evaluation: the certificate profile, and the seam for chain building.
+"""C2PA certificate-profile checks and the caller-owned trust seam.
 
-WHY CHAIN VALIDATION IS NOT IN THE DEFAULT INSTALL
---------------------------------------------------
-``cryptography``'s ``x509.verification`` cannot validate an Ed25519 chain at all.
-Its permitted-algorithm lists are compile-time constants in
-``cryptography-x509-verification/src/policy/mod.rs`` covering RSA, P-256/384/521 and
-ML-DSA; there is no ``ed25519`` entry and no Python override. Tracked as
-pyca/cryptography#13391, open since 2025-09-03 with no PR landed. Two further gaps
-compound it: there is no generic or code-signing verifier -- only ``server`` and
-``client``, which demand ``serverAuth``/``clientAuth`` EKUs and a SAN that C2PA
-claim-signing certificates do not carry -- and there is no revocation support.
+The base implementation checks the carried certificate profile, claim signature, and
+carried-certificate validity. It does not provide an RFC 5280 path-building backend,
+trust anchors, revocation processing, or remote fetching. With the default
+:class:`NoTrustEvaluator`, an intact mark can therefore be ``VALID`` with
+``signingCredential.untrusted`` but cannot become ``TRUSTED``.
 
-The API is stable as of 50.0.0. Stable and unusable-for-Ed25519 are independent facts.
-
-So the default install validates everything it can and stops honestly at
-``signingCredential.untrusted``: C2PA state **Valid**, but never **Trusted**. Reaching
-Trusted needs a :class:`TrustEvaluator`, which the optional ``[trust]`` extra can
-back with ``pyhanko-certvalidator`` (RFC 5280 6 path validation, Ed25519 and Ed448,
-offline by default). Hand-rolling RFC 5280 6 is roughly 1,200 lines of name
-constraints, policy mapping and path-length arithmetic that we would get subtly
-wrong, so we do not.
-
-WE BUNDLE NO TRUST ANCHORS
---------------------------
-Not the Duale root -- it does not exist yet; Terraform owns it and it is out of scope
-here -- and not the official C2PA trust list. This matches ``c2pa-rs``, which sets
-``trust_anchors: None`` and includes anchors only under ``#[cfg(test)]``. Anchors
-arrive only through the caller. There is no ambient discovery and no implicit file
-read, and nothing here ever touches the network: a verifier whose answer depends on
-network conditions, or on whoever controls an endpoint, is not the offline verifier
-this package claims to be.
+Callers supply anchors and a :class:`TrustEvaluator` when they need trust evaluation.
+The evaluator is invoked synchronously and owns its path policy, external state, and
+I/O. Package-owned code performs no ambient trust-store discovery or network access.
+The optional ``[trust]`` extra is retained for install-contract compatibility; this
+package does not import or adapt its backend.
 """
 
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509 import (
     AuthorityKeyIdentifier,
     BasicConstraints,
     Certificate,
+    DuplicateExtension,
     ExtendedKeyUsage,
     ExtensionNotFound,
+    InvalidVersion,
     KeyUsage,
+    SubjectKeyIdentifier,
     Version,
     load_pem_x509_certificates,
 )
@@ -57,6 +44,7 @@ __all__ = [
     "NoTrustEvaluator",
     "ProfileError",
     "TrustEvaluator",
+    "check_certificate_chain_profile",
     "check_claim_signing_profile",
     "load_anchors",
 ]
@@ -78,10 +66,9 @@ _EXCLUSIVE_PURPOSES = {
 #: The eight values 14.5.1.1 permits in "the algorithm field of the signatureAlgorithm
 #: field", verbatim from the clause's table.
 #:
-#: THIS IS THE ISSUER'S SIGNATURE, NOT THE CLAIM'S. This package restricts the key we verify
-#: a claim with to Ed25519; this restricts the algorithm the certificate itself was
-#: signed with. An ALLOWLIST rather than a weak-algorithm blocklist, which is what
-#: keeps Ed448 -- stronger than Ed25519 and still absent from the profile -- out.
+#: THIS IS THE ISSUER'S SIGNATURE, NOT THE CLAIM'S. Claim-signature algorithms are
+#: checked separately in ``_cose``; this allowlist constrains the algorithm the
+#: certificate itself was signed with.
 PERMITTED_SIGNATURE_ALGORITHMS: frozenset[ObjectIdentifier] = frozenset(
     {
         SignatureAlgorithmOID.ECDSA_WITH_SHA256,
@@ -102,6 +89,26 @@ _UNIQUE_ID_TAGS = frozenset({0x81, 0x82})
 #: DER length octet: the high bit distinguishes the long form from the short.
 _DER_LONG_FORM = 0x80
 
+#: Minimum RSA subject-key size in C2PA 14.5.1.1.
+_MIN_RSA_MODULUS_BITS = 2048
+
+# DER tags used by the one nested structure cryptography does not expose fully:
+# RSASSA-PSS-params. These remain local rather than growing into an ASN.1 layer.
+_DER_SEQUENCE = 0x30
+_DER_OBJECT_IDENTIFIER = 0x06
+_PSS_HASH_ALGORITHM = 0xA0
+_PSS_MASK_GEN_ALGORITHM = 0xA1
+_PSS_PARAMETER_TAGS = frozenset({_PSS_HASH_ALGORITHM, _PSS_MASK_GEN_ALGORITHM, 0xA2, 0xA3})
+
+# OBJECT IDENTIFIER contents, without the DER tag and length.
+_RSASSA_PSS_OID = bytes.fromhex("2a864886f70d01010a")
+_MGF1_OID = bytes.fromhex("2a864886f70d010108")
+_PSS_HASH_OIDS = {
+    bytes.fromhex("608648016503040201"): "id-sha256",
+    bytes.fromhex("608648016503040202"): "id-sha384",
+    bytes.fromhex("608648016503040203"): "id-sha512",
+}
+
 
 def _tbs_carries_unique_ids(tbs: bytes) -> bool:
     """True if the TBSCertificate carries issuerUniqueID or subjectUniqueID.
@@ -110,8 +117,8 @@ def _tbs_carries_unique_ids(tbs: bytes) -> bool:
     TBSCertificate sequence shall not be present, as per RFC 5280, section 4.1.2.8."
 
     ``cryptography`` exposes no accessor for either -- they are v2 legacy syntax it
-    declines to surface -- so this is the ONE profile rule that requires reading the
-    DER ourselves.
+    declines to surface -- so this is one of two narrow profile checks that read DER
+    directly. The other checks explicit RSASSA-PSS parameters below.
 
     THE WALK NEVER DESCENDS. It steps across the top-level members of the
     TBSCertificate SEQUENCE and looks at their tags, so a ``0x81`` occurring as a
@@ -145,21 +152,14 @@ def _der_contents(encoded: bytes, offset: int) -> tuple[int, int]:
 
     Raises:
         ValueError: the length is indefinite, which DER forbids, or runs past the end.
-        IndexError: the buffer ends inside the length field. Not converted, because the
-            only caller catches both together and translating it would cost a branch
-            that no input reaches -- but a reader REUSING this helper needs to know, and
-            an undocumented IndexError from a parser is the kind that escapes.
+        IndexError: the buffer ends inside the length field. Every production entry
+            path translates it together with ``ValueError`` at its profile boundary.
     """
     length_offset = offset + 2
     first = encoded[offset + 1]
     if first == _DER_LONG_FORM:
         msg = "indefinite length is not valid DER"
         raise ValueError(msg)
-    # `<` versus `<=` on the next line is PROVABLY EQUIVALENT, and a mutation audit
-    # filed it as a survivor. The check above means control reaches here only when
-    # first != 0x80, so both comparisons agree for all 256 byte values. This helper has
-    # exactly two callers, both downstream of that guard. No test can distinguish them;
-    # do not write one, and do not "tighten" the comparison expecting a behaviour change.
     if first < _DER_LONG_FORM:
         length = first
     else:
@@ -173,14 +173,126 @@ def _der_contents(encoded: bytes, offset: int) -> tuple[int, int]:
     return length_offset, end
 
 
+def _algorithm_identifier(encoded: bytes, offset: int) -> tuple[bytes, int, int]:
+    """Return ``(OID contents, parameters offset, sequence end)`` for one DER AlgorithmIdentifier."""
+    if encoded[offset] != _DER_SEQUENCE:
+        msg = "AlgorithmIdentifier is not a DER SEQUENCE"
+        raise ValueError(msg)
+    contents, end = _der_contents(encoded, offset)
+    if contents >= end or encoded[contents] != _DER_OBJECT_IDENTIFIER:
+        msg = "AlgorithmIdentifier does not begin with an OBJECT IDENTIFIER"
+        raise ValueError(msg)
+    oid_contents, oid_end = _der_contents(encoded, contents)
+    if oid_end > end:
+        msg = "AlgorithmIdentifier OID runs past its SEQUENCE"
+        raise ValueError(msg)
+    if oid_end < end:
+        _, parameters_end = _der_contents(encoded, oid_end)
+        if parameters_end != end:
+            msg = "AlgorithmIdentifier has more than one parameters value"
+            raise ValueError(msg)
+    return encoded[oid_contents:oid_end], oid_end, end
+
+
+def _pss_parameter_fields(certificate: Certificate) -> tuple[bytes, dict[int, tuple[int, int]]]:
+    """Return the explicit fields from the certificate's outer RSASSA-PSS-params."""
+    encoded = certificate.public_bytes(Encoding.DER)
+    if encoded[0] != _DER_SEQUENCE:
+        msg = "Certificate is not a DER SEQUENCE"
+        raise ValueError(msg)
+    certificate_contents, certificate_end = _der_contents(encoded, 0)
+    if certificate_end != len(encoded):
+        msg = "Certificate has bytes after its outer SEQUENCE"
+        raise ValueError(msg)
+
+    # Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue }
+    _, tbs_end = _der_contents(encoded, certificate_contents)
+    pss_oid, parameters_offset, signature_algorithm_end = _algorithm_identifier(encoded, tbs_end)
+    if pss_oid != _RSASSA_PSS_OID:
+        msg = "certificate reports id-RSASSA-PSS but its outer AlgorithmIdentifier does not"
+        raise ValueError(msg)
+    if parameters_offset >= signature_algorithm_end or encoded[parameters_offset] != _DER_SEQUENCE:
+        msg = "id-RSASSA-PSS parameters are absent or are not a SEQUENCE"
+        raise ValueError(msg)
+    parameters_contents, parameters_end = _der_contents(encoded, parameters_offset)
+    if parameters_end != signature_algorithm_end:
+        msg = "id-RSASSA-PSS parameters do not fill the AlgorithmIdentifier"
+        raise ValueError(msg)
+
+    fields: dict[int, tuple[int, int]] = {}
+    offset = parameters_contents
+    while offset < parameters_end:
+        tag = encoded[offset]
+        if tag not in _PSS_PARAMETER_TAGS or tag in fields:
+            msg = "id-RSASSA-PSS parameters contain an unknown or duplicate field"
+            raise ValueError(msg)
+        field_contents, field_end = _der_contents(encoded, offset)
+        if field_end > parameters_end:
+            msg = "id-RSASSA-PSS parameter runs past its SEQUENCE"
+            raise ValueError(msg)
+        fields[tag] = (field_contents, field_end)
+        offset = field_end
+    return encoded, fields
+
+
+def _pss_hash(encoded: bytes, field: tuple[int, int]) -> tuple[bytes, str]:
+    """Read and validate the explicit PSS hashAlgorithm field."""
+    oid, _, end = _algorithm_identifier(encoded, field[0])
+    if end != field[1]:
+        msg = "id-RSASSA-PSS hashAlgorithm has trailing data"
+        raise ValueError(msg)
+    name = _PSS_HASH_OIDS.get(oid)
+    if name is None:
+        msg = "id-RSASSA-PSS hashAlgorithm must be id-sha256, id-sha384, or id-sha512 (C2PA 14.5.1.1)"
+        raise ProfileError(msg)
+    return oid, name
+
+
+def _pss_mask_hash(encoded: bytes, field: tuple[int, int]) -> bytes:
+    """Read the hash OID inside the explicit PSS maskGenAlgorithm field."""
+    oid, parameters_offset, end = _algorithm_identifier(encoded, field[0])
+    if end != field[1] or oid != _MGF1_OID or parameters_offset >= end:
+        msg = "id-RSASSA-PSS maskGenAlgorithm must be MGF1 with hash parameters (RFC 8017 A.2.3)"
+        raise ProfileError(msg)
+    hash_oid, _, hash_end = _algorithm_identifier(encoded, parameters_offset)
+    if hash_end != end:
+        msg = "id-RSASSA-PSS MGF1 hash parameters have trailing data"
+        raise ValueError(msg)
+    return hash_oid
+
+
+def _check_pss_parameters(certificate: Certificate) -> None:
+    """Enforce C2PA 14.5.1.1's explicit SHA-2 and MGF1 requirements."""
+    try:
+        encoded, fields = _pss_parameter_fields(certificate)
+        hash_field = fields.get(_PSS_HASH_ALGORITHM)
+        if hash_field is None:
+            msg = "id-RSASSA-PSS hashAlgorithm shall be present (C2PA 14.5.1.1)"
+            raise ProfileError(msg)
+        hash_oid, hash_name = _pss_hash(encoded, hash_field)
+
+        mask_field = fields.get(_PSS_MASK_GEN_ALGORITHM)
+        if mask_field is None:
+            msg = "id-RSASSA-PSS maskGenAlgorithm shall be present (C2PA 14.5.1.1)"
+            raise ProfileError(msg)
+        mask_hash_oid = _pss_mask_hash(encoded, mask_field)
+        if mask_hash_oid != hash_oid:
+            mask_name = _PSS_HASH_OIDS.get(mask_hash_oid, "an unsupported hash")
+            msg = f"id-RSASSA-PSS MGF1 uses {mask_name}, not hashAlgorithm {hash_name} (C2PA 14.5.1.1)"
+            raise ProfileError(msg)
+    except ProfileError:
+        raise
+    except (IndexError, ValueError) as exc:
+        msg = f"the certificate's id-RSASSA-PSS parameters could not be parsed: {exc}"
+        raise ProfileError(msg) from exc
+
+
 class ProfileError(C2paTextError, ValueError):
     """A certificate does not satisfy the C2PA claim-signing profile (14.5.1.1).
 
-    Catchable as ``C2paTextError`` and as ``ValueError``. The ``ValueError`` base is kept
-    because callers catch it; the ``C2paTextError`` base was added on 2026-08-05, because
-    this is what ``Signer()`` raises for the default ``openssl req -x509``
-    misconfiguration and a caller following the package's own "catch ``C2paTextError``"
-    instruction did not catch it.
+    It inherits from both ``C2paTextError`` and ``ValueError``, so callers may catch
+    package errors together or handle invalid caller-supplied certificate material as a
+    value error.
 
     Distinct from "not trusted". A profile violation yields
     ``signingCredential.invalid`` -- a hard reject where the manifest is not even
@@ -193,21 +305,19 @@ class ProfileError(C2paTextError, ValueError):
 class TrustEvaluator(Protocol):
     """Decides whether a certificate chain reaches a trusted anchor.
 
-    A PROTOCOL RATHER THAN A CONCRETE CLASS, and the bar for that is a real
-    implementation this package cannot provide: the real
-    implementation is a dependency that genuinely cannot run in the default install,
-    because ``cryptography`` refuses Ed25519 chains outright. Integrators plug in the
-    ``[trust]`` extra, a corporate PKI, or the C2PA Trust List.
+    A protocol keeps corporate PKI policy replaceable. The optional ``[trust]`` extra
+    is retained for install compatibility only; it supplies no evaluator, and this
+    package endorses no backend while pyHanko#809 remains open. Evaluators used through
+    this synchronous protocol must not fetch; remote validation needs a future async
+    interface.
     """
 
     def is_trusted(self, chain: list[Certificate], anchors: list[Certificate]) -> bool:
         """True if ``chain`` (leaf first) validates to one of ``anchors``.
 
-        RETURN ``False`` FOR AN UNREACHABLE ANCHOR; do not raise. That is not a
-        formality: the ``[trust]`` extra ships ``pyhanko-certvalidator``, whose path
-        validation signals exactly that case with ``PathBuildingError`` /
-        ``PathValidationError``, so the obvious implementation of this Protocol raises
-        on its most common outcome.
+        Return ``False`` when no path reaches an anchor; do not raise for that normal
+        result. An adapter must translate its backend's documented no-path result to
+        ``False`` without swallowing unrelated faults.
 
         An exception is caught and mapped to ``signingCredential.untrusted`` with the
         type and message carried into the verdict's explanation -- ``verify()`` is
@@ -223,9 +333,8 @@ class TrustEvaluator(Protocol):
 class NoTrustEvaluator:
     """The default: nothing is ever trusted, and that is reported honestly.
 
-    Not a stub standing in for missing work. With no anchors bundled there is
-    genuinely nothing to chain to, so ``signingCredential.untrusted`` is the correct
-    and expected answer for a self-signed credential -- C2PA state Valid, not Trusted.
+    With no anchors bundled there is nothing to chain to, so a self-signed credential
+    yields ``signingCredential.untrusted`` and may still be C2PA Valid.
     """
 
     def is_trusted(self, chain: list[Certificate], anchors: list[Certificate]) -> bool:
@@ -233,8 +342,19 @@ class NoTrustEvaluator:
         return False
 
 
+def _is_self_signed(certificate: Certificate) -> bool:
+    """Whether the certificate names itself and verifies under its own subject key."""
+    if certificate.issuer != certificate.subject:
+        return False
+    try:
+        certificate.verify_directly_issued_by(certificate)
+    except (InvalidSignature, UnsupportedAlgorithm, TypeError, ValueError):
+        return False
+    return True
+
+
 def _check_x509_structure(certificate: Certificate) -> None:
-    """Apply 14.5.1.1's four structural requirements, which precede any C2PA role.
+    """Apply 14.5.1.1 requirements shared by leaf and CA certificates.
 
     Most govern "all certificates except those in the private credential store"; the
     signatureAlgorithm allowlist is from the earlier group, "All certificates shall
@@ -253,6 +373,25 @@ def _check_x509_structure(certificate: Certificate) -> None:
             "which 14.5.1.1 does not list"
         )
         raise ProfileError(msg)
+    if certificate.signature_algorithm_oid == SignatureAlgorithmOID.RSASSA_PSS:
+        _check_pss_parameters(certificate)
+
+    public_key = certificate.public_key()
+    if isinstance(public_key, ec.EllipticCurvePublicKey) and not isinstance(
+        public_key.curve,
+        (ec.SECP256R1, ec.SECP384R1, ec.SECP521R1),
+    ):
+        msg = (
+            f"the certificate's subjectPublicKeyInfo uses {public_key.curve.name}; "
+            "14.5.1.1 permits only prime256v1, secp384r1, and secp521r1"
+        )
+        raise ProfileError(msg)
+    if isinstance(public_key, rsa.RSAPublicKey) and public_key.key_size < _MIN_RSA_MODULUS_BITS:
+        msg = (
+            f"the certificate's subjectPublicKeyInfo carries a {public_key.key_size}-bit RSA modulus; "
+            "14.5.1.1 requires at least 2048 bits"
+        )
+        raise ProfileError(msg)
 
     if certificate.version is not Version.v3:
         msg = f"the certificate is {certificate.version.name}; 14.5.1.1 requires v3"
@@ -262,95 +401,87 @@ def _check_x509_structure(certificate: Certificate) -> None:
         msg = "issuerUniqueID and subjectUniqueID shall not be present in the TBSCertificate (14.5.1.1)"
         raise ProfileError(msg)
 
-    # "shall be present in any certificate that is not self-signed". Self-signed is
-    # decided by issuer == subject, which is self-ISSUED strictly speaking; a leaf
-    # self-issued but signed by another key is pathological and would fail chain
-    # building regardless. Checking it this way keeps the package's own self-signed
-    # test credential -- and every self-signed credential C2PA expects to land on
-    # signingCredential.untrusted rather than .invalid -- out of a hard reject.
-    if certificate.issuer != certificate.subject:
-        try:
-            certificate.extensions.get_extension_for_class(AuthorityKeyIdentifier)
-        except ExtensionNotFound as exc:
+    # AKI may be absent only on a verifiably self-signed certificate. Read it first so
+    # ordinary issued certificates do not pay for a needless self-signature check.
+    try:
+        authority_key_identifier = certificate.extensions.get_extension_for_class(AuthorityKeyIdentifier)
+    except ExtensionNotFound as exc:
+        if not _is_self_signed(certificate):
             msg = (
                 "the Authority Key Identifier extension shall be present in a certificate "
                 "that is not self-signed (14.5.1.1)"
             )
             raise ProfileError(msg) from exc
+    else:
+        if authority_key_identifier.critical:
+            msg = "the Authority Key Identifier extension must be non-critical (RFC 5280 4.2.1.1; C2PA 14.5.1.1)"
+            raise ProfileError(msg)
+        if authority_key_identifier.value.key_identifier is None:
+            msg = "the Authority Key Identifier extension must include keyIdentifier (RFC 5280 4.2.1.1; C2PA 14.5.1.1)"
+            raise ProfileError(msg)
 
 
 def check_claim_signing_profile(certificate: Certificate) -> None:
     """Apply the C2PA 14.5.1.1 profile checks that govern claim-signing certificates.
 
-    Scoped deliberately to claim signing, which is narrower than 14.5.1.1 as a whole
-    but not narrower than it is for the certificate in our hands. We do not validate
-    time-stamping or OCSP-signing certificates -- time-stamping needs network access
-    and is out of scope, and OCSP arrives stapled in the ``rVals`` unprotected header,
-    which we do not parse -- but the clause's mutual-exclusivity rule constrains the
-    CLAIM-SIGNING certificate, so it is checked here. The rules look like they govern certificate roles we never
-    validate. They do not: a credential able both to sign claims and to mint the
-    time-stamps attesting to when they were signed is the separation-of-duties failure
-    the clause exists to prevent.
+    This function applies the claim-signing role of the profile, including its
+    purpose-separation rules. It does not parse or validate ``sigTst``, ``sigTst2``, or
+    ``rVals``.
 
-    Two rules from the clause are deliberately NOT implemented, because they cannot
-    apply. The named-curve and 2048-bit-modulus requirements govern ``id-ecPublicKey``
-    and RSA subject keys, and THIS PACKAGE restricts the key we verify a claim with to
-    Ed25519, so a certificate that would reach either rule has already been rejected.
     The Subject Key Identifier requirement is a SHOULD for end-entity certificates,
-    and a SHOULD is not a rejection condition.
+    and a SHOULD is not a rejection condition. Subject-key restrictions still run in
+    the shared check; claim-algorithm/key compatibility is checked later in ``_cose``.
 
     Raises:
         ProfileError: mapping to ``signingCredential.invalid``.
 
-    Note what this catches in practice. A default ``openssl req -x509`` certificate
-    asserts ``cA`` and carries no EKU, so it fails here -- yielding a hard reject
-    rather than the ``signingCredential.untrusted`` a self-signed credential is meant
-    to produce. That is the misconfiguration the Terraform-generated credential is at
-    risk of.
+    A profile failure maps to ``signingCredential.invalid``. Trust-anchor reachability
+    is a separate decision and maps to trusted or untrusted.
     """
-    # A MALFORMED EXTENSION POISONS THE WHOLE SET, not just its own field. rust-asn1
-    # parses extensions lazily, so an empty ExtKeyUsageSyntax -- legal to build, illegal
-    # to read -- makes the FIRST get_extension_for_class raise ValueError, whichever
-    # extension it asks for. That certificate arrives in the COSE x5chain, from the wire,
-    # so without this the exception escapes _accept_credential and escapes verify(),
-    # which is documented never to raise for absent, corrupt or invalid marks.
-    #
-    # BOTH halves are inside the try.
-    # _check_x509_structure reads AuthorityKeyIdentifier for any certificate whose issuer
-    # differs from its subject -- catching ExtensionNotFound alone -- so a wire
-    # certificate that was not self-issued still escaped.
-    #
-    # signingCredential.invalid is the honest answer: a credential we cannot parse is one
-    # we cannot accept, and 14.5.1.1's profile is exactly what it fails.
+    # ``cryptography`` parses extensions lazily. Translate its documented and observed
+    # parse failures at this exported profile boundary, while preserving ProfileError
+    # raised by the profile checks themselves.
     try:
         _check_x509_structure(certificate)
-        _check_extensions(certificate)
+        _check_leaf_extensions(certificate)
     except ProfileError:
-        # RE-RAISED UNCHANGED, and this clause is load-bearing rather than tidy.
-        # ProfileError subclasses ValueError, so without it the handler below catches
-        # every genuine profile violation and re-labels it a parse failure -- which is
-        # what happened for two hours after this wrapper was added. Every rule in
-        # _check_extensions reported as "the certificate's extensions could not be
-        # parsed", and the tests missed it because they match on the inner text, which
-        # the wrapper preserved.
+        # ProfileError subclasses ValueError, so it must remain distinct from parse
+        # failures caught below.
         raise
     except CERTIFICATE_PARSE_ERRORS as exc:
-        msg = f"the certificate's extensions could not be parsed: {exc}"
+        msg = f"the certificate could not be parsed: {exc}"
         raise ProfileError(msg) from exc
 
 
-#: Raised by ``cryptography`` when a DER structure inside a certificate will not parse.
-#: A ValueError from the Rust layer, not a Python-level type error.
-CERTIFICATE_PARSE_ERRORS = (ValueError,)
+#: Observed lazy parse failures from ``cryptography`` certificate field access.
+#: Keep this finite: a broad catch here would hide programming errors in these
+#: exported helpers. ``verify`` has its own broad hostile-DER boundary before this.
+CERTIFICATE_PARSE_ERRORS = (
+    DuplicateExtension,
+    InvalidVersion,
+    KeyError,
+    TypeError,
+    UnsupportedAlgorithm,
+    ValueError,
+)
 
 
-def _check_extensions(certificate: Certificate) -> None:
-    """The extension half of 14.5.1.1, split out so one ``try`` covers every access.
+def _check_leaf_extensions(certificate: Certificate) -> None:
+    """Apply the extension requirements for a claim-signing leaf.
 
     Raises:
         ProfileError: an extension is present and violates the profile.
         ValueError: an extension will not parse. Translated by the caller.
     """
+    try:
+        subject_key_identifier = certificate.extensions.get_extension_for_class(SubjectKeyIdentifier)
+    except ExtensionNotFound:
+        pass  # C2PA says a leaf SHOULD carry SKI; absence is not a rejection.
+    else:
+        if subject_key_identifier.critical:
+            msg = "a claim-signing certificate must mark Subject Key Identifier non-critical (RFC 5280 4.2.1.2)"
+            raise ProfileError(msg)
+
     try:
         constraints = certificate.extensions.get_extension_for_class(BasicConstraints).value
         is_ca = constraints.ca
@@ -361,10 +492,8 @@ def _check_extensions(certificate: Certificate) -> None:
         msg = "a claim-signing certificate must not assert cA in BasicConstraints (14.5.1.1)"
         raise ProfileError(msg)
 
-    # "the Key Usage extension shall be present and should be marked as critical."
-    # PRESENCE IS REQUIRED IN ITS OWN RIGHT. Tolerating an absent
-    # extension -- correctly reasoning that a certificate with no KeyUsage cannot
-    # assert keyCertSign, and wrongly concluding there was nothing to check.
+    # 14.5.1.1 requires the Key Usage extension itself, not merely the absence of a
+    # forbidden keyCertSign bit.
     try:
         usage = certificate.extensions.get_extension_for_class(KeyUsage).value
     except ExtensionNotFound as exc:
@@ -387,12 +516,9 @@ def _check_extensions(certificate: Certificate) -> None:
         msg = "a claim-signing certificate must carry a non-empty EKU extension (14.5.1.1)"
         raise ProfileError(msg) from exc
 
-    # "shall be present and non-empty". Only presence is checked: RFC 5280 declares
-    # ExtKeyUsageSyntax ::= SEQUENCE SIZE (1..MAX) OF KeyPurposeId, so an empty EKU is
-    # not a certificate we could reject -- it is one that cannot be encoded, and
-    # cryptography's parser refuses it with InvalidSize before we are reached. A branch
-    # for it would be permanently unexecuted code standing in for a guarantee ASN.1
-    # already makes.
+    # RFC 5280 declares ExtKeyUsageSyntax as a non-empty sequence. cryptography may
+    # defer rejecting an encoded empty sequence until this access; the public profile
+    # boundary translates that lazy parse failure to ProfileError.
     oids = list(ekus)
     if _ANY_EXTENDED_KEY_USAGE in oids:
         msg = "anyExtendedKeyUsage (2.5.29.37.0) shall not be present (14.5.1.1)"
@@ -405,58 +531,100 @@ def _check_extensions(certificate: Certificate) -> None:
             )
             raise ProfileError(msg)
 
-    # NO REQUIRED OID, and demanding c2pa-kp-claimSigning here on 14.4.1's authority is
-    # wrong twice over.
-    #
-    # 14.5.1.1's EKU rules are exhaustively: present and non-empty on a non-CA
+    # 14.5.1.1's EKU rules are: present and non-empty on a non-CA
     # certificate, no anyExtendedKeyUsage, the timeStamping/OCSPSigning exclusivity
     # rule, and "the presence of any EKUs not mentioned in this profile ... shall not
     # cause the certificate to be rejected". It names no OID at all.
     #
-    # 14.4.1 is addressed to VALIDATORS, about their own configuration -- "For each
-    # accepted EKU value, a list of trust anchor configurations" -- and it explicitly
-    # anticipates other EKUs: a validator "should allow a user to configure additional
-    # trust anchor configurations for that EKU and/or for other EKUs (e.g.,
-    # id-kp-emailProtection ... or id-kp-documentSigning)". It warns in the same
-    # paragraph that "Previous versions of this specification required the presence of
-    # id-kp-emailProtection or id-kp-documentSigning EKUs", and the change log records
-    # claimSigning as new at 2.2 -- so the whole pre-2.2 installed base carries the older
-    # pair alone, and we were giving every one of them signingCredential.INVALID, a hard
-    # reject where the manifest is not even Valid.
-    #
-    # The decisive argument is our own configuration. Under 14.5.1.2 a claim-signing
-    # certificate "shall have at least one of the EKUs FOR WHICH THE VALIDATOR HAS AN
-    # ASSOCIATED LIST OF TRUST ANCHORS" -- and we ship none, so our accepted-EKU list is
-    # empty and the EKU question decides nothing about validity. It is a TRUST question,
-    # and the answer for a credential we cannot anchor is signingCredential.untrusted,
-    # which leaves the manifest Valid. Which EKUs a deployment will accept belongs to the
-    # TrustEvaluator seam, where anchor-to-EKU association lives.
+    # 14.4.1 and 14.5.1.2 associate accepted EKUs with trust-anchor configuration.
+    # That deployment policy belongs to the TrustEvaluator seam, not this profile
+    # rejection check.
 
     # Unknown EKUs shall NOT cause rejection (14.5.1.1). Deliberately not checked --
     # over-strictness here is as much a conformance bug as under-strictness.
 
 
+def _check_ca_extensions(certificate: Certificate) -> None:
+    """Apply the extension requirements for a carried CA certificate."""
+    try:
+        constraints_extension = certificate.extensions.get_extension_for_class(BasicConstraints)
+    except ExtensionNotFound as exc:
+        msg = "a carried CA must carry Basic Constraints with cA asserted (14.5.1.1)"
+        raise ProfileError(msg) from exc
+    constraints = constraints_extension.value
+    if not constraints.ca:
+        msg = "a carried CA must assert cA in Basic Constraints (14.5.1.1)"
+        raise ProfileError(msg)
+    if not constraints_extension.critical:
+        msg = "a carried CA must mark Basic Constraints critical (RFC 5280 4.2.1.9; C2PA 14.5.1.1)"
+        raise ProfileError(msg)
+
+    try:
+        subject_key_identifier = certificate.extensions.get_extension_for_class(SubjectKeyIdentifier)
+    except ExtensionNotFound as exc:
+        msg = "a carried CA must carry a Subject Key Identifier extension (14.5.1.1)"
+        raise ProfileError(msg) from exc
+    if subject_key_identifier.critical:
+        msg = "a carried CA must mark Subject Key Identifier non-critical (RFC 5280 4.2.1.2; C2PA 14.5.1.1)"
+        raise ProfileError(msg)
+
+    try:
+        usage = certificate.extensions.get_extension_for_class(KeyUsage).value
+    except ExtensionNotFound as exc:
+        msg = "a carried CA must carry a Key Usage extension (14.5.1.1)"
+        raise ProfileError(msg) from exc
+    if not usage.key_cert_sign:
+        msg = "a carried CA must assert keyCertSign in Key Usage (RFC 5280 4.2.1.3; C2PA 14.5.1.1)"
+        raise ProfileError(msg)
+
+    # 14.5.1.1 makes EKU mandatory only where Basic Constraints is absent or cA is
+    # false. If a CA carries EKU anyway, its values do not affect profile acceptance.
+
+
+def _check_carried_ca_profile(certificate: Certificate, index: int) -> None:
+    """Check one carried CA and add its x5chain index to any failure."""
+    try:
+        _check_x509_structure(certificate)
+        _check_ca_extensions(certificate)
+    except ProfileError as exc:
+        msg = f"x5chain[{index}] carried CA: {exc}"
+        raise ProfileError(msg) from exc
+    except CERTIFICATE_PARSE_ERRORS as exc:
+        msg = f"x5chain[{index}] carried CA could not be parsed: {exc}"
+        raise ProfileError(msg) from exc
+
+
+def check_certificate_chain_profile(certificates: Sequence[Certificate]) -> None:
+    """Check the C2PA profile of a carried x5chain, leaf first.
+
+    This checks each certificate's own profile. It does not build or validate a path,
+    choose a trust anchor, or apply revocation policy; those remain the caller's
+    :class:`TrustEvaluator` work under 14.5.1.2.
+
+    Raises:
+        ProfileError: the leaf or a carried intermediate violates 14.5.1.1.
+    """
+    if not certificates:
+        msg = "the carried x5chain has no leaf certificate"
+        raise ProfileError(msg)
+
+    try:
+        check_claim_signing_profile(certificates[0])
+    except ProfileError as exc:
+        msg = f"x5chain[0] leaf: {exc}"
+        raise ProfileError(msg) from exc
+
+    for index, certificate in enumerate(certificates[1:], start=1):
+        _check_carried_ca_profile(certificate, index)
+
+
 def load_anchors(pem: bytes | None = None) -> list[Certificate]:
     """Load trust anchors from the supplied PEM bundle, or return an empty list.
 
-    THE ``pem`` ARGUMENT IS THE ONLY CHANNEL. There is no environment variable, no
-    bundled store, no directory scan and no network request. That is the package's
-    stated contract in three places -- the package docstring, ``VerifyContext`` and
-    ``SECURITY.md`` all promise no ambient configuration -- and an environment
-    variable would falsify all three.
-
-    There is deliberately no ``C2PATXT_TRUST_ANCHORS`` fallback, though there is one in
-    ``c2patool``. Three things go wrong when one exists, all measured: a missing path
-    raises ``FileNotFoundError`` and a malformed one raises ``ValueError`` straight out
-    of ``verify()``, which promises never to raise; the read happens only on the
-    signature-valid path, so unmarked and invalid text verifies fine while VALID text
-    crashes -- a bomb that fires only on the happy path; and the file is re-read on
-    every call. A trust decision that depends on a
-    process environment variable is also neither reproducible nor auditable, which is
-    the wrong property for the thing deciding whether a document is TRUSTED.
-
-    An empty result is the normal, shipped default. Verification still reaches C2PA
-    state Valid; it simply never reaches Trusted.
+    ``pem`` is the sole input. The function reads no environment variable, bundled
+    store, directory or network resource. ``None`` and an empty bundle both mean no
+    anchors; a valid self-signed mark can therefore remain C2PA Valid without becoming
+    Trusted.
     """
     if pem is None:
         return []

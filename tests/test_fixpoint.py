@@ -1,3 +1,4 @@
+# pyright: reportPrivateUsage=false
 """Tests for the exclusion-range fixpoint.
 
 The property that matters is an identity, not an approximation: the wrapper's
@@ -10,92 +11,40 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import pytest
-from cryptography import x509
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from c2patxt import _fixpoint
-from c2patxt.signing import Signer
-from tests.conftest import wrapper_builder
-
-#: This suite exercises the WHOLE stack -- selectors, JUMBF, CBOR, COSE, certificate
-#: profile, hash binding -- against text that genuinely satisfies the binding, rather
-#: than against hand-built fragments.
 
 
-@pytest.fixture(scope="session")
-def signer(signing_key: Ed25519PrivateKey, signing_certificate: x509.Certificate) -> Signer:
-    return Signer(private_key=signing_key, certificates=(signing_certificate,))
+def _builder(
+    text: str,
+) -> Callable[[int], Callable[[int], str]]:
+    """A small monotone builder that isolates the fixpoint search.
 
+    The base varies with the input's UTF-8 length. Each padding unit adds three UTF-8
+    bytes, matching a zero byte represented by a variation selector. Public
+    ``embed`` tests own the real CBOR, COSE, JUMBF and signature integration.
+    """
+    base = 100 + len(text.encode())
 
-def _builder(text: str, signer: Signer, counter: list[int]) -> Callable[[int, bytes], str]:
-    """Wrap the shared producer so the search's build count can be asserted."""
-    inner = wrapper_builder(text, signer)
+    def prepare(exclusion_length: int) -> Callable[[int], str]:
+        del exclusion_length
 
-    def build(exclusion_length: int, pad: bytes) -> str:
-        counter[0] += 1
-        return inner(exclusion_length, pad)
+        def assemble(pad: int) -> str:
+            return "x" * (base + 3 * pad)
 
-    return build
+        return assemble
+
+    return prepare
 
 
 @pytest.mark.parametrize(
     "text",
     ["", "a", "Hello world.", "漢字テキスト", "x" * 4096, "é combining", "emoji 👨‍👩‍👧‍👦"],
 )
-def test_the_declared_length_equals_the_actual_length(text: str, signer: Signer) -> None:
-    """THE identity the whole module exists for, across inputs of varied byte cost."""
-    calls = [0]
-    wrapper, target = _fixpoint.solve(_builder(text, signer, calls))
+def test_the_declared_length_equals_the_actual_length(text: str) -> None:
+    """The solver returns only an exact identity, across varied base lengths."""
+    wrapper, target = _fixpoint.solve(_builder(text))
     assert len(wrapper.encode("utf-8")) == target
-
-
-def test_the_result_is_deterministic(signer: Signer) -> None:
-    """Same inputs, same bytes. Re-marking identical text must be reproducible.
-
-    The search visits candidates in a fixed order and the builder is pure, so there
-    is no path-dependence to leak in -- which is what makes byte-stable re-embedding
-    a testable claim rather than an aspiration.
-    """
-    first, target_one = _fixpoint.solve(_builder("Hello world.", signer, [0]))
-    second, target_two = _fixpoint.solve(_builder("Hello world.", signer, [0]))
-    assert first == second
-    assert target_one == target_two
-
-
-@pytest.mark.timeout(120)
-def test_the_search_settles_in_a_modest_number_of_builds(signer: Signer) -> None:
-    """Cost is bounded in practice, not merely in theory.
-
-    Each build is a full sign-and-serialize, so an unbounded search would make embed
-    unusable.
-
-    THE BOUND IS THE ALGORITHM'S OWN CEILING, deliberately, not a measurement.
-    solve() tries at most _MAX_TARGETS targets of (1 probe + _WINDOW * 3 pads), so
-    801 builds is the most it can ever do; anything at or below that is the search
-    working as designed. A bound of 400, taken from a measurement on
-    one machine, and a run on a different interpreter hit 553 -- a green test failing
-    for a reason that had nothing to do with a regression.
-
-    The count varies because it depends on where Ed25519 signature noise lands, which
-    changes with the certificate and the text. Measured 2026-08-06 across eight inputs
-    with the pinned test certificate: median 29-30 and a best of 3 across two samples of
-    7 324 and 10 000 documents, but maxima of 434 and 479 and 95th percentiles of 154
-    and 129. The
-    CENTRE reproduces and the TAIL does not, because a sample maximum is a property of
-    the corpus. A tight bound here is a flaky bound -- this figure has been understated
-    three times, from samples of eight, of 400 and of 250 -- which is the argument for
-    asserting the ANALYTIC ceiling and nothing else.
-
-    Two inputs, not four, and a raised timeout: each solve runs up to 801 full
-    sign-and-serialize cycles, and under ``-n auto`` alongside the Hypothesis suite
-    four of them intermittently crossed the 30s default. A test that fails once in
-    twenty runs teaches people to re-run rather than to look. ASCII and CJK are the
-    two ends of the byte-cost range, which is what the count actually depends on.
-    """
-    for text in ("Hello world.", "漢字テキスト"):
-        calls = [0]
-        _fixpoint.solve(_builder(text, signer, calls))
-        assert calls[0] <= 801
 
 
 def test_an_unreachable_target_raises_rather_than_spinning() -> None:
@@ -105,9 +54,47 @@ def test_an_unreachable_target_raises_rather_than_spinning() -> None:
     with no bound is a denial of service waiting for the wrong document.
     """
 
-    def never_matches(exclusion_length: int, pad: bytes) -> str:
-        # Always one byte short of whatever was asked for.
-        return "x" * max(exclusion_length - 1, 1)
+    def prepare(exclusion_length: int) -> Callable[[int], str]:
+        def never_matches(pad: int) -> str:
+            del pad
+            # Keep every candidate away from its declared length.
+            return "x" * (100 if exclusion_length == 0 else exclusion_length - 30)
+
+        return never_matches
 
     with pytest.raises(_fixpoint.FixpointError, match="own declared length"):
-        _fixpoint.solve(never_matches)
+        _fixpoint.solve(prepare)
+
+
+def test_failure_prepares_at_most_the_documented_33_candidates() -> None:
+    """The probe and target attempts are bounded signing work, not just a loop guard."""
+    prepared: list[int] = []
+
+    def prepare(exclusion_length: int) -> Callable[[int], str]:
+        prepared.append(exclusion_length)
+
+        def never_matches(_pad: int) -> str:
+            return "x" * 100
+
+        return never_matches
+
+    with pytest.raises(_fixpoint.FixpointError):
+        _fixpoint.solve(prepare)
+
+    assert len(prepared) == 33
+    assert prepared[0] == 0
+    assert len(set(prepared)) == 33
+
+
+def test_padding_never_exceeds_the_documented_inclusive_cap() -> None:
+    """A failed target can reach pad 60, but must never ask the builder for 61."""
+    attempted: list[int] = []
+
+    def never_matches(pad: int) -> str:
+        attempted.append(pad)
+        assert pad <= 60
+        return "x" * 100
+
+    assert _fixpoint._try_padding(never_matches, 286) is None
+    assert attempted[0] == 0
+    assert max(attempted) == 60

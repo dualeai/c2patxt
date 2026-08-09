@@ -4,8 +4,8 @@ Embed, extract and verify C2PA Content Credentials in plain Unicode text.
 
 Implements **C2PA Technical Specification 2.4 (2026-04-01), HTML build `c7e55d5a`,
 Annex A.8 "Embedding Manifests into Unstructured Text"** — a manifest store encoded as
-Unicode variation selectors, appended after the visible text. Marked text renders
-exactly as the original: the mark is zero-width.
+Unicode variation selectors appended after NFC-normalized text. The selectors are
+designed not to render; actual rendering depends on the consuming text system.
 
 This is Duale AI's implementation of C2PA text marking. It is **not** a C2PA
 consortium release and carries no conformance certification.
@@ -14,7 +14,7 @@ consortium release and carries no conformance certification.
 $ pip install c2patxt
 ```
 
-Python 3.10+. One runtime dependency: `cryptography`.
+Python 3.10+. The base install has one direct runtime dependency: `cryptography`.
 
 Or from a checkout:
 
@@ -66,6 +66,7 @@ def build_leaf(key):
         .serial_number(x509.random_serial_number())
         .not_valid_before(start)
         .not_valid_after(end)
+        # Optional on a leaf; when present, cA must be false.
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(
             x509.KeyUsage(
@@ -84,7 +85,7 @@ def build_leaf(key):
         # Omit this line and Signer refuses to construct (14.5.1.1), unless you
         # also pass allow_nonconformant=True.
         .add_extension(x509.ExtendedKeyUsage([C2PA_CLAIM_SIGNING_EKU]), critical=False)
-        .sign(key, None)  # None: Ed25519 prehashes internally (RFC 8032)
+        .sign(key, None)  # Ed25519 takes no separately selected certificate hash
     )
 
 
@@ -95,7 +96,7 @@ signer = Signer(private_key=key, certificates=(leaf,))
 disclosure = Disclosure(media_type="text/plain", model_type=ModelType.GENERIC)
 
 marked = embed("Text your model produced.", signer, disclosure)
-# renders identically to the input; the mark is zero-width
+# NFC-normalized text followed by selectors designed not to render
 
 result = verify(marked)
 match result.state:
@@ -109,17 +110,14 @@ match result.state:
         ...  # no mark. NOT a finding about the text.
 ```
 
-`strip(text)` removes a mark. `extract(text)` returns the manifest without validating
-it. `locate(text)` returns the wrapper's byte span without decoding the manifest.
+`strip(text)` removes a mark. `extract(text)` parses and returns the manifest without
+cryptographic validation. `locate(text)` returns the wrapper's byte span without
+decoding the manifest.
 
 Those five are the call surface, and producing a mark also needs `Signer`, `Disclosure`
-and `ModelType`. `__all__` exports thirty names in all: those eight, plus five
-exceptions, the two context objects that buy determinism (`EmbedContext`,
-`VerifyContext`), five verdict and status types, `ManifestStore` and `Span` for what
-`extract` and `locate` return, `TrustEvaluator`, `MODEL_TYPES`,
-`C2PA_CLAIM_SIGNING_EKU`, the three allocation bounds, and two version strings. Read
-`c2patxt.__all__` for the list; anything not in it is private and may change without
-notice.
+and `ModelType`. Context, result, error and resource-limit types are exported beside
+them. Read `c2patxt.__all__` for the exact list; anything not in it is private and may
+change without notice.
 
 **`strip(embed(x))` is not always `x`.** `embed` normalizes to NFC before marking,
 because the hard binding is defined over the NFC form; `strip` only removes the
@@ -130,7 +128,8 @@ what you passed in. Both halves are correct and the asymmetry is the surprising 
 
 The leaf **must** carry an EKU extension, present and non-empty (C2PA 14.5.1.1), must
 not assert `cA` or `keyCertSign`, and must assert `digitalSignature`. Miss any of those
-and every verifier — including this one — rejects it as `signingCredential.invalid`.
+and this implementation rejects it as `signingCredential.invalid`. C2PA separately
+permits a validator's private credential store to accept an exact credential.
 `Signer` refuses a non-conformant certificate at construction, so you find out now
 rather than after the bytes ship — unless you pass `allow_nonconformant=True`, which
 exists so the verifier can be tested against credentials it must reject.
@@ -143,9 +142,10 @@ certificate, so a credential carrying no EKU a trust store recognises cannot cha
 whatever else is right about it. A leaf carrying only `id-kp-emailProtection` verifies
 here as `VALID` (untrusted).
 
-The builder is in [Five minutes](#five-minutes) above, annotated. Every extension
-there is one of the four rules in this section; drop any of them and `Signer` refuses
-to construct, unless you pass `allow_nonconformant=True`.
+The builder is in [Five minutes](#five-minutes) above, annotated. Basic Constraints
+may be absent on a leaf; when present, it must not assert `cA`. Key Usage and a
+non-empty EKU are required, and `Signer` refuses violations unless you pass
+`allow_nonconformant=True`.
 
 `C2PA_CLAIM_SIGNING_EKU` is `1.3.6.1.4.1.62558.2.1`. You need the number, not the name,
 if you mint the leaf with OpenSSL or a CA rather than with the code above.
@@ -171,9 +171,8 @@ rely on its own detection solution". That is the design brief here, and the esca
 hatch is why: the format is a published specification, the vectors are CC0, and
 verification needs this package or any other A.8 implementation — not us.
 
-Guidelines under Art. 96 do not bind, and these are **not yet formally adopted**: the
-accompanying Communication says they apply only once adopted in all language versions.
-Read them as the Commission's stated expectation, not as law.
+The Commission adopted the Guidelines on 20 July 2026. They give practical guidance
+under Article 96; they do not turn this package or C2PA into a legal safe harbour.
 
 **What this does not do.** It does not make anyone compliant, and the law mandates no
 standard: the Code of Practice on Transparency of AI-generated Content (10 June 2026)
@@ -187,9 +186,10 @@ library.
 
 ## What this proves, and what it does not
 
-**Proves.** That the text was marked by the holder of a specific signing key, that it
-declares itself machine-generated, and that **not one byte of the covered text has
-changed since**. A cryptographic statement, not a probabilistic one.
+**Proves.** That the holder of the signing key bound the signed declaration to the
+NFC-normalized covered text and that the signature and binding still validate. This is
+a cryptographic statement, not a claim that the stored bytes are unchanged:
+canonically equivalent text can have different UTF-8 bytes and the same binding input.
 
 **Does not prove.** That the content is accurate, that the claims in it are true, or
 who the signer *is* in the world — that last one depends entirely on which trust
@@ -230,14 +230,16 @@ The third is the subtle one: `claimSignature.validated` is genuinely present on 
 document whose text was rewritten. The signature over the *claim* really is intact;
 only its binding to the text broke.
 
-`verdict.manifest` is `None` for unmarked text, a corrupt wrapper, more than one
-wrapper, and any structural failure inside the manifest, so
-`verdict.manifest.assertions` raises `AttributeError` on exactly the hostile inputs
-where you most need it not to. `verdict.span` is `None` in those cases too.
+`verdict.manifest` is `None` when no manifest can be parsed and selected: unmarked
+text, a corrupt wrapper, or plural wrappers whose signed exclusions do not identify
+exactly one of them. Once selected, it remains available when later assertion,
+binding, signature or credential validation fails. `verdict.span` is `None` only when
+no structurally valid wrapper was located; a plural-selection failure reports the
+first located span but no manifest.
 
 | State | Say | Never say |
 | --- | --- | --- |
-| `TRUSTED` | "Signed by «name», verified against your trust list" | — |
+| `TRUSTED` | "Signature and certificate path accepted by your trust policy" | "Signed by «name»" unless your application obtained that identity separately |
 | `VALID` | "Declares AI generation; signer not independently verified" | "Unverified", "Suspicious" |
 | `INVALID` | "Carries a credential that failed validation — may have been edited" | "Fake" |
 | `UNMARKED` | "No credential present" | "Human-written", "Fake", "Failed" |
@@ -272,12 +274,12 @@ validity is judged against and must be timezone-aware — a naive datetime raise
 ### `verdict.failure` is not empty on a good mark
 
 The codes are bucketed three ways — `verdict.success`, `verdict.failure`,
-`verdict.informational`. **Every mark this package produces puts one entry in
-`failure`**, because a self-signed credential cannot be corroborated:
+`verdict.informational`. With the default context and this self-signed example, the
+mark carries one `failure` entry because no trust evaluator corroborates it:
 
 ```text
 state   : valid
-success : assertion.hashedURI.match, assertion.dataHash.match,
+success : assertion.hashedURI.match (4 entries), assertion.dataHash.match,
           claimSignature.validated, claimSignature.insideValidity
 failure : signingCredential.untrusted
 ```
@@ -291,11 +293,14 @@ Reaching `TRUSTED` needs `VerifyContext(anchors_pem=...)` **and** a `trust_evalu
 `anchors=` is not a keyword you can pass: it is derived, and passing it is a
 `TypeError`.
 
-### `verify` never raises; `extract`, `strip` and `locate` do
+### Validation failures are verdicts; producer input errors are exceptions
 
-`verify` is total: absent, corrupt and invalid marks are all `Verdict`s. The other
-three are not. On a malformed wrapper — the 13-byte header declaring a 4 GiB manifest
-from [Limits](#limits) — the split is:
+Absent, corrupt and invalid marks are all `Verdict`s from `verify`. A string containing
+an unpaired surrogate raises `UnencodableTextError` at every text entry point because
+it cannot be represented on the A.8 UTF-8 wire. `embed` raises
+`TextNormalizationError` when normalization would exceed the limit below; verification
+reports the same condition as `assertion.dataHash.malformed`. The other three entry
+points also raise on malformed wrappers. For example:
 
 ```text
 verify   -> Verdict(state=invalid)
@@ -304,28 +309,28 @@ strip    -> raises MarkCorruptError
 locate   -> raises MarkCorruptError
 ```
 
-Catch `C2paTextError`; `MarkCorruptError`, `AlreadyMarkedError`,
-`UnencodableTextError` and `ProfileError` all derive from it. `ProfileError` is the one
-most integrators meet first — it is what `Signer(...)` raises for a non-conformant
-certificate. Catch the base class rather than the four subclasses; the list can grow. An uncaught
-`MarkCorruptError` on a public verification endpoint is a disclosure surface — see
-[SECURITY.md](https://github.com/dualeai/c2patxt/blob/main/SECURITY.md). The same split
-applies when a limit trips: `verify` returns `INVALID`, the other three raise.
+Catch `C2paTextError`; every named package error exported through `c2patxt.__all__`
+derives from it. `ProfileError` is what `Signer(...)` raises for a non-conformant
+certificate. An uncaught `MarkCorruptError` on a public verification endpoint is a
+disclosure surface — see
+[SECURITY.md](https://github.com/dualeai/c2patxt/blob/main/SECURITY.md).
 
 ## Limits
 
 | Property | Answer |
 | --- | --- |
 | Survives copy-paste of the full text | Yes, where the application preserves variation selectors |
-| Survives any edit to the visible text | **No.** By design — see [robustness](https://github.com/dualeai/c2patxt/blob/main/docs/robustness.md) |
-| Survives NFC/NFD/NFKC/NFKD | The **mark** does; the binding does not. Decomposing is enough — see below |
-| Detects tampering | Yes; that is the mechanism |
+| Detects every stored-byte edit | No. The binding covers NFC-normalized text; canonically equivalent equal-width rewrites can still validate |
+| Survives NFC/NFD/NFKC/NFKD | The mark does. The binding fails when normalization changes the declared wrapper offset or the NFC-normalized covered text — see below |
+| Detects a surviving mark whose NFC-normalized covered text changed | Yes; removing the whole mark yields `UNMARKED`, not evidence about origin |
 | Identifies the signer | Only against anchors you supply |
-| Network access | None, ever. No revocation fetch, no OCSP, no timestamp authority |
-| Determinism | Only with `VerifyContext(now=...)`. By default `verify` reads the clock — see below |
-| Signature algorithm | Ed25519 only — our narrowing; 13.2.1 also allows ES256/384/512 and PS256/384/512 |
-| Size cost | **3.90 UTF-8 bytes per manifest byte, measured** — that ratio is the stable figure, and the manifest is dominated by your certificate chain. One reproducible point: 7,001 B per mark for a single self-signed Ed25519 leaf, under the test suite's pinned context AND its pinned key (`tests/conftest.py` seeds both; `tests/test_embed.py` asserts the 1,797 B store). Vary the key alone and the same configuration spans 6,993-7,009 B, because the signature's own bytes cost 3 or 4 UTF-8 bytes each. Your own total moves with the serial length, the subject name and the chain depth, so measure it rather than budgeting from ours |
-| Thread safety | Safe to share, exercised by `tests/test_embed.py::test_one_signer_marks_correctly_from_many_threads`. Every public type is a frozen dataclass, the digest cache is per-call, and there is no module-level mutable state. A `Signer` wraps a `cryptography` `Ed25519PrivateKey`, whose signing operation is safe to call from multiple threads |
+| Package-owned network access | None. No revocation fetch, OCSP, or timestamp authority |
+| Determinism | With `VerifyContext(now=...)` and an offline deterministic evaluator. By default `verify` reads the clock — see below |
+| Signature algorithm | Generation: Ed25519. Validation: ES256/384/512, PS256/384/512 and Ed25519, the full C2PA 13.2.1 set |
+| Manifest hash algorithm | Generation: SHA-256 by default; SHA-384 and SHA-512 are also permitted for the hard binding and hashed assertion references. This setting does not select the claim-signature algorithm |
+| Quantum resistance | No. Generated marks use Ed25519, and every signature algorithm accepted by the C2PA 2.4 profile is classical. See [Cryptographic profile and quantum scope](docs/c2pa-compatibility.md#cryptographic-profile-and-quantum-scope) |
+| Size cost | Each manifest byte becomes one variation selector costing 3 or 4 UTF-8 bytes, plus the A.8 header and marker. Certificate fields and chain depth determine the manifest size, so measure your own credential |
+| Thread safety | One `Signer` is exercised concurrently by `tests/test_embed.py::test_one_signer_marks_correctly_from_many_threads`; verification caches are per-call |
 | Maximum input length | **None, deliberately — body-size limiting is yours.** See below |
 
 **Decomposing a marked document breaks it, with nothing visibly edited.** The mark
@@ -342,8 +347,9 @@ normalizes — macOS filenames, some CMSes, some Java stacks — will do this to
 nobody edited. Note the code is `malformed`, not `mismatch`: the wrapper moved, so the
 declared exclusion no longer names it.
 
-**A verdict has a shelf life.** C2PA 15.8 judges certificate validity at *validation*
-time, not signing time, so the same bytes give different answers as the leaf expires:
+**A verdict has a shelf life when no validated trusted timestamp is available.** This
+implementation does not validate `sigTst2`, so it uses the validation clock. The same
+bytes therefore give different answers as a carried certificate expires:
 
 ```python
 from c2patxt import VerifyContext
@@ -358,32 +364,31 @@ verify(marked, context=VerifyContext(now=after)).state  # Provenance.INVALID
 The second carries `claimSignature.outsideValidity`. Nothing was tampered with; the
 credential simply expired between the two calls.
 
-Pass `VerifyContext(now=...)` to fix the instant and make `verify` a pure function of
-its arguments — which is what makes a stored verdict reproducible. Without it, do not
-cache one and treat it as permanent.
+Pass `VerifyContext(now=...)` with a deterministic evaluator to make `verify` a pure
+function of its arguments. Without both, do not cache a verdict and treat it as
+permanent.
 
 ### Resource limits
 
-Verification allocates in proportion to its input and refuses to grow past three
-bounds, all of which are ours rather than the specification's:
+Verification allocates in proportion to its input and applies four component bounds.
+They are implementation policy, not limits from the specification:
 
 | Bound | Value | What it stops |
 | --- | --- | --- |
-| `MAX_MANIFEST_LENGTH` | 2 MiB | A 13-byte header declaring a 4 GiB manifest |
-| `MAX_SELECTOR_RUN` | 2 MiB + 13 | Walking an unbounded run of variation selectors |
-| `MAX_JUMBF_DEPTH` | 32 | Unbounded recursion in JUMBF *and* in CBOR |
+| `MAX_MANIFEST_LENGTH` | 2 MiB | Accepting or emitting a larger manifest payload |
+| `MAX_SELECTOR_RUN` | 2 MiB + 13 | Decoding an unbounded candidate run of variation selectors |
+| `MAX_CBOR_DEPTH` | 32 | Deeply nested attacker-controlled CBOR |
+| `MAX_NONSTARTERS` | 30 | Canonically ordering an unbounded Unicode nonstarter sequence during NFC normalization |
+
+The last value is [Unicode UAX #15's Stream-Safe Text Format
+boundary](https://www.unicode.org/reports/tr15/#Stream_Safe_Text_Format). This package
+rejects longer sequences rather than inserting U+034F, because UAX #15 says that
+insertion can make the result no longer canonically equivalent to the input.
 
 **There is no limit on the length of the text you pass in, and that is deliberate** —
 this library cannot know what your endpoint considers a reasonable request. Cap the
-body size at your edge. Two figures to budget from, each with the fixture it was taken
-under:
-
-- **Unmarked text: about 0.10 ms of CPU per MB**, linear to 4.32 MB. What is pinned is
-  the mechanism rather than the timing — one `str.find` and one encode per call, held
-  by `tests/test_regressions.py::test_verify_walks_unmarked_text_exactly_once`.
-- **Marked text: peak memory about 3.4x the manifest store**, not the document — 1.77
-  MiB peak on a 0.53 MiB store, `tracemalloc`. Held as a ratio by
-  `tests/test_regressions.py::test_a_repeated_actions_link_allocates_a_bounded_multiple_of_its_input`.
+body size at your edge. CodSpeed owns the CPU and memory measurements; the functional
+suite checks results and security bounds, not machine-dependent performance figures.
 
 Per-attack survival rates are in **[docs/robustness.md](https://github.com/dualeai/c2patxt/blob/main/docs/robustness.md)** (PAN'26
 Text Watermarking task dataset, 300 documents, CC-BY-4.0, DOI
@@ -400,33 +405,25 @@ do not repeat vendor claims about it.
 
 ## Security review
 
-Everything an AppSec questionnaire asks is in
+Security properties and release-verification commands are in
 [SECURITY.md](https://github.com/dualeai/c2patxt/blob/main/SECURITY.md): the security
-properties and what holds each, the one runtime dependency with the command to check
+properties and what holds each, the base runtime dependency with the command to check
 it, the supply-chain attestations with the commands to verify a release yourself, and
-the CRA Article 24(1) reporting policy. In short: Apache-2.0, one runtime dependency,
-CPython 3.10–3.14, no network, no ambient configuration, no log records.
+the CRA Article 24(1) reporting policy. In short: Apache-2.0, one base direct runtime dependency,
+CPython 3.10–3.14, no package-owned network, no ambient configuration, no log records.
 
 ---
 
 ## Specification status
 
-- **A.8 is under review.** The specification says of itself that it "remains under
-  review and may be subject to change based on implementation feedback and
-  interoperability testing". That sentence was *added* on 2026-04-01 (commit
-  `666bdf8f`) and is the only change to A.8 across the published 2.4 builds.
-- **2.4 has no release tag.** The last tag is 2.3, where the clause is numbered A.7.
-  The 2.4 PDF and HTML are published. That is why our claim cites a build hash.
-- **No certification exists to obtain.** Every conformance-listed product is certified
-  against specification 2.2, and none declares a valid text media type (one declares a
-  bare non-IANA `txt` token). 156 products at `7d19b332`.
-- **The text conformance rubric is v0.1.0** — six manifest-level checks, no wire
-  vectors. We pass all six.
+- **A.8 is under review.** The specification says it "remains under review and may be
+  subject to change based on implementation feedback and interoperability testing".
+- **The implementation claim names an exact build.** The 2.4 HTML and PDF are
+  published; [compatibility](https://github.com/dualeai/c2patxt/blob/main/docs/c2pa-compatibility.md)
+  records the source commit reviewed by this package.
+- **This is not a C2PA consortium release and carries no conformance certification.**
 
-We publish a wire-format conformance vector file
-(`tests/vectors/A8ConformanceTest-1.2.1.txt`) because the rubric has none.
-`tests/test_third_party_interop.py` tests interoperability with the two other public
-A.8 implementations.
+The repository includes a local wire fixture derived from the C2PA A.8 rules.
 
 ### The rest of the documentation
 
@@ -434,12 +431,11 @@ A.8 implementations.
 | --- | --- |
 | [compatibility](https://github.com/dualeai/c2patxt/blob/main/docs/c2pa-compatibility.md) | Which clauses we implement, and what the claim excludes |
 | [deviations](https://github.com/dualeai/c2patxt/blob/main/docs/deviations.md) | How we read the specification where it was unclear |
-| [known divergences](https://github.com/dualeai/c2patxt/blob/main/docs/known-divergences.md) | Where we deliberately disagree with another implementation |
 | [open questions](https://github.com/dualeai/c2patxt/blob/main/docs/open-questions.md) | What we could not settle |
-| [upstream filing](https://github.com/dualeai/c2patxt/blob/main/docs/upstream-filing.md) | Four defects causing silent divergence, written up for the C2PA |
+| [upstream filing](https://github.com/dualeai/c2patxt/blob/main/docs/upstream-filing.md) | Four Annex A.8 ambiguities prepared for upstream review |
 | [robustness](https://github.com/dualeai/c2patxt/blob/main/docs/robustness.md) | What a marked document survives, measured |
-| [release scope](https://github.com/dualeai/c2patxt/blob/main/docs/release-scope.md) | What ships, and what deliberately does not |
-| [mutation audit](https://github.com/dualeai/c2patxt/blob/main/docs/mutation-audit.md) · [benchmarks](https://github.com/dualeai/c2patxt/blob/main/docs/benchmarks.md) | Whether the tests bite, and what CodSpeed holds |
+| [implementation scope](https://github.com/dualeai/c2patxt/blob/main/docs/release-scope.md) | What the package includes and excludes |
+| [test design](https://github.com/dualeai/c2patxt/blob/main/docs/mutation-audit.md) · [benchmarks](https://github.com/dualeai/c2patxt/blob/main/docs/benchmarks.md) | Manual mutation method, test-layer rules, and what CodSpeed holds |
 | [releasing](https://github.com/dualeai/c2patxt/blob/main/docs/releasing.md) | How a release is cut (maintainers) |
 
 ---
@@ -447,7 +443,7 @@ A.8 implementations.
 ## Reproduce
 
 ```console
-$ make install && make test        # static checks + every test except the benchmarks
+$ make install && make test        # static checks + every test except benchmarks
 $ make lint                        # ruff, pyright strict, vulture
 $ curl -sSL -o train.jsonl \
     "https://zenodo.org/records/18620130/files/train.jsonl?download=1"

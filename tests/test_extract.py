@@ -1,25 +1,25 @@
 # pyright: reportPrivateUsage=false
-# Drives the private units directly. A mutation audit showed several of these guards
-# were only ever exercised through a public entry point that another check answered
-# first, so the guard itself could be deleted unnoticed.
-"""extract(): parses, never verifies, and never raises on absence."""
+"""Extraction-layer tests: parse without verification; absence returns ``None``."""
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import uuid
 
 import pytest
 
-from c2patxt import _cbor
-from c2patxt._extract import extract, parse_manifest_store
+from c2patxt import Provenance, _cbor, _jumbf, verify
+from c2patxt._extract import _reparse, extract, parse_manifest_store
+from c2patxt._jumbf import parse_superbox
 from c2patxt._selectors import build_wrapper
 from c2patxt.exceptions import C2paTextError, MarkCorruptError
 from c2patxt.manifest import (
     ASSERTION_ACTIONS,
-    ASSERTION_AI_DISCLOSURE,
-    ASSERTION_HASH_DATA,
     ASSERTION_METADATA,
+    LABEL_ASSERTION_STORE,
+    LABEL_CLAIM,
+    LABEL_CLAIM_SIGNATURE,
     UUID_MANIFEST,
     build_manifest_store,
     content_type_uuid,
@@ -29,6 +29,97 @@ from c2patxt.status import StatusCode
 from tests.conftest import mark
 
 WHEN = datetime.datetime(2026, 8, 5, 12, 0, tzinfo=datetime.timezone.utc)
+_UNKNOWN_STRUCTURAL_UUID = content_type_uuid(b"c2tm")
+_EMBEDDED_FILE_UUID = bytes.fromhex("40CB0C32BB8A489DA70B2AD6F47F4369")
+_LEGACY_MANIFEST_UUID = bytes.fromhex("63326D6400110010800000AA00389B71")
+
+
+def _retype_required_structure(raw: bytes, target: str) -> bytes:
+    """Change one structural UUID without changing its label or payload."""
+    store, _ = parse_superbox(raw)
+    if target == "store":
+        return _jumbf.serialize_superbox(
+            dataclasses.replace(
+                store,
+                description=dataclasses.replace(store.description, uuid=_UNKNOWN_STRUCTURAL_UUID),
+            )
+        )
+
+    manifest, _ = _reparse(store.content[0][1])
+    if target == "manifest":
+        manifest = dataclasses.replace(
+            manifest,
+            description=dataclasses.replace(manifest.description, uuid=_UNKNOWN_STRUCTURAL_UUID),
+        )
+    else:
+        found = False
+        rebuilt: list[tuple[bytes, bytes]] = []
+        for tbox, payload in manifest.content:
+            child, _ = _reparse(payload)
+            if child.description.label == target:
+                child = dataclasses.replace(
+                    child,
+                    description=dataclasses.replace(child.description, uuid=_UNKNOWN_STRUCTURAL_UUID),
+                )
+                found = True
+            rebuilt.append((tbox, _jumbf.serialize_superbox(child)[8:]))
+        assert found, f"fixture carries no structural box labelled {target!r}"
+        manifest = dataclasses.replace(manifest, content=tuple(rebuilt))
+
+    return _jumbf.serialize_superbox(
+        dataclasses.replace(
+            store,
+            content=((_jumbf.TBOX_SUPERBOX, _jumbf.serialize_superbox(manifest)[8:]),),
+        )
+    )
+
+
+def _clear_requestable(raw: bytes, target_label: str) -> bytes:
+    """Clear one description's Requestable toggle without changing its label."""
+
+    def rewrite(box: _jumbf.JumbfBox) -> _jumbf.JumbfBox:
+        description = box.description
+        if description.label == target_label:
+            description = dataclasses.replace(description, requestable=False)
+        content: list[tuple[bytes, bytes]] = []
+        for tbox, payload in box.content:
+            if tbox == _jumbf.TBOX_SUPERBOX:
+                child, _ = _reparse(payload)
+                child_payload = _jumbf.serialize_superbox(rewrite(child))[8:]
+            else:
+                child_payload = payload
+            content.append((tbox, child_payload))
+        return dataclasses.replace(box, description=description, content=tuple(content))
+
+    store, _ = parse_superbox(raw)
+    return _jumbf.serialize_superbox(rewrite(store))
+
+
+def _replace_assertion_content(raw: bytes, label: str, content: tuple[tuple[bytes, bytes], ...]) -> bytes:
+    """Replace one assertion's content boxes while preserving the public wire shape."""
+    store, _ = parse_superbox(raw)
+    manifest, _ = _reparse(store.content[0][1])
+    found = False
+    manifest_content: list[tuple[bytes, bytes]] = []
+    for tbox, payload in manifest.content:
+        child, _ = _reparse(payload)
+        if child.description.label == LABEL_ASSERTION_STORE:
+            assertions: list[tuple[bytes, bytes]] = []
+            for assertion_tbox, assertion_payload in child.content:
+                assertion, _ = _reparse(assertion_payload)
+                if assertion.description.label == label:
+                    assertion = dataclasses.replace(assertion, content=content)
+                    found = True
+                assertions.append((assertion_tbox, _jumbf.serialize_superbox(assertion)[8:]))
+            child = dataclasses.replace(child, content=tuple(assertions))
+        manifest_content.append((tbox, _jumbf.serialize_superbox(child)[8:]))
+    assert found, f"fixture carries no assertion labelled {label!r}"
+    manifest = dataclasses.replace(manifest, content=tuple(manifest_content))
+    store = dataclasses.replace(
+        store,
+        content=((_jumbf.TBOX_SUPERBOX, _jumbf.serialize_superbox(manifest)[8:]),),
+    )
+    return _jumbf.serialize_superbox(store)
 
 
 def _store() -> bytes:
@@ -44,7 +135,7 @@ def _store() -> bytes:
         exclusion_length=74,
         signature=b"\xaa" * 64,
         instance_id="xmp:iid:00000000-0000-4000-8000-000000000002",
-        manifest_uuid=uuid.UUID(int=1),
+        manifest_uuid=uuid.UUID("00000000-0000-4000-8000-000000000001"),
         when=WHEN,
         generator_name="c2patxt",
     )
@@ -60,36 +151,6 @@ def test_unmarked_text_returns_none_and_never_raises() -> None:
     assert extract("Just ordinary prose.") is None
     assert extract("") is None
     assert extract("﻿") is None
-
-
-def test_round_trip_recovers_the_manifest() -> None:
-    manifest = extract(_marked())
-    assert manifest is not None
-    assert manifest.manifest_label == f"urn:c2pa:{uuid.UUID(int=1)}"
-    assert manifest.signature == b"\xaa" * 64
-    assert set(manifest.assertions) == {
-        ASSERTION_ACTIONS,
-        ASSERTION_AI_DISCLOSURE,
-        ASSERTION_METADATA,
-        ASSERTION_HASH_DATA,
-    }
-
-
-def test_the_claim_carries_the_required_fields() -> None:
-    """15.6.2: instanceID, signature, created_assertions, claim_generator_info."""
-    manifest = extract(_marked())
-    assert manifest is not None
-    assert {"instanceID", "signature", "created_assertions", "claim_generator_info"} <= set(manifest.claim)
-
-
-def test_the_hard_binding_is_reachable() -> None:
-    manifest = extract(_marked())
-    assert manifest is not None
-    hash_data = manifest.hash_data
-    assert hash_data is not None
-    assert hash_data["alg"] == "sha256"
-    assert hash_data["exclusions"] == [{"start": 11, "length": 74}]
-    assert hash_data["pad"] == b"", "18.5.2 requires pad to be present"
 
 
 def test_extraction_does_not_depend_on_position_in_the_text() -> None:
@@ -118,7 +179,7 @@ def test_extract_performs_no_verification() -> None:
         exclusion_length=1,
         signature=b"\x00" * 64,
         instance_id="xmp:iid:1",
-        manifest_uuid=uuid.UUID(int=2),
+        manifest_uuid=uuid.UUID("00000000-0000-4000-8000-000000000002"),
         when=WHEN,
         generator_name="c2patxt",
     )
@@ -140,6 +201,21 @@ def test_a_malformed_manifest_raises_rather_than_returning_none(payload: bytes) 
     distinct from absence, which returns None."""
     with pytest.raises(MarkCorruptError):
         extract("x" + build_wrapper(payload))
+
+
+def test_bytes_after_the_outer_manifest_store_are_rejected(signer: Signer) -> None:
+    """A.8.2: manifestLength contains one complete C2PA Manifest Store."""
+    original = mark("Hello world.", signer)
+    store = extract(original)
+    assert store is not None
+    forged = "Hello world." + build_wrapper(store.raw + b"JUNK")
+
+    with pytest.raises(MarkCorruptError, match="Manifest Store ends at byte"):
+        extract(forged)
+
+    verdict = verify(forged)
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.TEXT_CORRUPTED_WRAPPER in verdict.codes()
 
 
 def test_the_error_is_catchable_as_the_package_root() -> None:
@@ -250,13 +326,7 @@ def test_the_last_manifest_in_the_store_is_the_active_one() -> None:
     """C2PA 15.5.2.1: "The last C2PA Manifest superbox in the C2PA Manifest Store
     superbox shall be considered the active manifest."
 
-    A sixteen-line comment in ``_extract`` justifies following that rule, and a
-    mutation audit changed ``list(manifests)[-1]`` to ``[0]`` without a single test
-    noticing. The rule is what makes plural manifests DETERMINISTIC -- every
-    conforming consumer picks the same one -- which is the entire argument for
-    following it rather than rejecting.
-
-    Two manifests under DIFFERENT labels, since duplicates are refused outright.
+    Two manifests use distinct labels; the last one must be returned.
     """
     import dataclasses
 
@@ -297,22 +367,16 @@ def test_the_last_manifest_in_the_store_is_the_active_one() -> None:
     ids=["assertion-cbor", "no-claim-box", "claim-box-no-content"],
 )
 def test_the_parse_reports_the_code_the_clause_names(signer: Signer, damage: str, expected: StatusCode) -> None:
-    """Three parse failures that all reported ``manifest.text.corruptedWrapper``.
-
-    15.10.3.1: "If the content of a standard assertion is not well-formed CBOR or is
+    """15.10.3.1: "If the content of a standard assertion is not well-formed CBOR or is
     non-conforming JSON, the claim shall be rejected with a failure code of
     `assertion.cbor.invalid` or `assertion.json.invalid`."
 
     15.11.3.3: "Locate the claim, as described in Locating and Validating the Claim. If
     unable to, reject claim with a `claim.missing` failure code."
 
-    ``manifest.text.corruptedWrapper`` is 15.12.1.3.2's code for a wrapper with an
-    "invalid version, algorithm, or manifest length" -- damage to the SELECTOR RUN
-    carrying the manifest. Every one of these three is a perfectly intact wrapper
-    around a manifest that is wrong INSIDE. Reporting the carrier's code sends an
-    investigator hunting for text corruption that is not there, which is exactly the
-    substitution ``MarkCorruptError``'s overridable ``code`` parameter exists to
-    prevent, and the same one already fixed for the claim's own CBOR.
+    These inputs carry intact selector wrappers around invalid manifest content, so
+    they use the claim- or assertion-specific code rather than the corrupted-wrapper
+    code.
 
     ``claim-box-no-content`` is the case a presence check alone would miss: the
     ``c2pa.claim`` box is right there, correctly labelled, and holds a ``json`` content
@@ -367,8 +431,16 @@ def test_the_parse_reports_the_code_the_clause_names(signer: Signer, damage: str
     assert caught.value.code is expected
 
 
-@pytest.mark.parametrize("tag", [b"c2ma", b"c2md"], ids=["c2ma", "c2md"])
-def test_a_standard_manifest_is_accepted_under_either_type_uuid(signer: Signer, tag: bytes) -> None:
+@pytest.mark.parametrize(
+    ("type_uuid", "tag"),
+    [(UUID_MANIFEST, b"c2ma"), (_LEGACY_MANIFEST_UUID, b"c2md")],
+    ids=["c2ma", "c2md"],
+)
+def test_a_standard_manifest_is_accepted_under_either_type_uuid(
+    signer: Signer,
+    type_uuid: bytes,
+    tag: bytes,
+) -> None:
     """C2PA 11.2.2: "Manifest Consumers **shall** also accept standard C2PA Manifests
     specified with JUMBF type UUID 63326D64-0011-0010-8000-00AA00389B71 (`c2md`), but
     claim generators shall not create manifests with this JUMBF type UUID."
@@ -376,10 +448,7 @@ def test_a_standard_manifest_is_accepted_under_either_type_uuid(signer: Signer, 
     A `shall` on the CONSUMER and a prohibition on the PRODUCER, which is why the two
     halves are asserted separately: we accept both on read and continue to emit `c2ma`.
     Rejecting a `c2md` manifest would make us the implementation that breaks on valid
-    input -- the defect class docs/known-divergences.md catalogues in five others.
-
-    ``c2md`` is also one of the two box types docs/known-divergences.md records as
-    MISSING from c2pa-rs. Being able to read it is the point of that entry.
+    input.
     """
     from c2patxt import _jumbf
     from c2patxt._extract import _reparse
@@ -387,13 +456,13 @@ def test_a_standard_manifest_is_accepted_under_either_type_uuid(signer: Signer, 
 
     original = extract(mark("Hello world.", signer))
     assert original is not None
-    assert original.raw.count(UUID_MANIFEST) == 1, "the emitted manifest must be c2ma"
 
     store, _ = parse_superbox(original.raw)
     manifest, _ = _reparse(store.content[0][1])
+    assert manifest.description.uuid == UUID_MANIFEST, "the producer emits c2ma"
     retyped = JumbfBox(
         description=DescriptionBox(
-            uuid=content_type_uuid(tag),
+            uuid=type_uuid,
             label=manifest.description.label,
             requestable=manifest.description.requestable,
         ),
@@ -406,61 +475,167 @@ def test_a_standard_manifest_is_accepted_under_either_type_uuid(signer: Signer, 
         )
     )
 
-    parsed = parse_manifest_store(forged)
+    marked = "Hello world." + build_wrapper(forged)
+    parsed = extract(marked)
+    assert parsed is not None
+    verdict = verify(marked)
 
     assert parsed.manifest_label == original.manifest_label
     assert parsed.claim_bytes == original.claim_bytes
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
 
 
 @pytest.mark.parametrize(
-    ("content", "expected"),
+    ("target", "expected"),
     [
-        ((b"bfdb", b"image/svg+xml\x00"), None),
-        ((b"bidb", b"<svg/>"), None),
-        ((b"uuid", b"\x00" * 16), None),
-        ((b"cbor", b"\xff"), StatusCode.ASSERTION_CBOR_INVALID),
+        ("store", StatusCode.TEXT_CORRUPTED_WRAPPER),
+        ("manifest", StatusCode.TEXT_CORRUPTED_WRAPPER),
+        (LABEL_ASSERTION_STORE, StatusCode.ASSERTION_MISSING),
+        (LABEL_CLAIM, StatusCode.CLAIM_MISSING),
+        (LABEL_CLAIM_SIGNATURE, StatusCode.CLAIM_SIGNATURE_MISSING),
     ],
-    ids=["bfdb", "bidb", "uuid", "broken-cbor"],
+    ids=["store", "manifest", "assertion-store", "claim", "signature"],
+)
+def test_an_unknown_structural_uuid_is_not_dispatched_by_its_label(
+    signer: Signer,
+    target: str,
+    expected: StatusCode,
+) -> None:
+    """C2PA 11.1.2 skips an unrecognized JUMBF type and its contents.
+
+    Each mutation preserves the known label, payload and byte length, so the type UUID
+    is the field that must prevent dispatch.
+    """
+    marked = mark("Hello world.", signer)
+    original = extract(marked)
+    assert original is not None
+    assert verify(marked).state is Provenance.VALID
+
+    forged = "Hello world." + build_wrapper(_retype_required_structure(original.raw, target))
+    verdict = verify(forged)
+
+    assert verdict.state is Provenance.INVALID
+    assert expected in verdict.codes()
+
+
+def test_an_unknown_manifest_type_cannot_shadow_a_known_manifest_label(signer: Signer) -> None:
+    """Skipping happens before duplicate-label rejection under C2PA 11.1.2."""
+    original = extract(mark("Hello world.", signer))
+    assert original is not None
+    store, _ = parse_superbox(original.raw)
+    manifest, _ = _reparse(store.content[0][1])
+    unknown = dataclasses.replace(
+        manifest,
+        description=dataclasses.replace(manifest.description, uuid=_UNKNOWN_STRUCTURAL_UUID),
+    )
+    forged = _jumbf.serialize_superbox(
+        dataclasses.replace(
+            store,
+            content=(
+                (_jumbf.TBOX_SUPERBOX, _jumbf.serialize_superbox(unknown)[8:]),
+                *store.content,
+            ),
+        )
+    )
+
+    parsed = parse_manifest_store(forged)
+
+    assert parsed.claim_bytes == original.claim_bytes
+
+
+@pytest.mark.parametrize("tag", [b"c2cm", b"c2um"], ids=["compressed", "update"])
+def test_an_unsupported_last_c2pa_manifest_never_falls_back_to_an_older_one(signer: Signer, tag: bytes) -> None:
+    """15.5.1 selects the last C2PA Manifest before its supported type is checked."""
+    from c2patxt._jumbf import DescriptionBox, JumbfBox
+
+    original = extract(mark("Hello world.", signer))
+    assert original is not None
+    store, _ = parse_superbox(original.raw)
+    unsupported = JumbfBox(
+        description=DescriptionBox(
+            uuid=content_type_uuid(tag),
+            label=f"urn:c2pa:{tag.decode('ascii')}",
+            requestable=True,
+        ),
+        content=((b"cbor", b"\xa0"),),
+    )
+    forged = _jumbf.serialize_superbox(
+        dataclasses.replace(
+            store,
+            content=(*store.content, (_jumbf.TBOX_SUPERBOX, _jumbf.serialize_superbox(unsupported)[8:])),
+        )
+    )
+
+    with pytest.raises(MarkCorruptError, match=rf"active C2PA Manifest type {tag.decode('ascii')}") as caught:
+        extract("Document." + build_wrapper(forged))
+    assert caught.value.code is StatusCode.GENERAL_ERROR
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["c2pa", "urn:c2pa:00000000-0000-4000-8000-000000000007", ASSERTION_METADATA],
+    ids=["manifest-store", "manifest", "assertion"],
+)
+def test_every_c2pa_description_sets_label_and_requestable(signer: Signer, target: str) -> None:
+    """C2PA 11.1.4.1.2 requires both toggles throughout a C2PA Manifest."""
+    original = extract(mark("Hello world.", signer))
+    assert original is not None
+    forged = _clear_requestable(original.raw, target)
+
+    with pytest.raises(MarkCorruptError, match="Label Present and Requestable") as caught:
+        parse_manifest_store(forged)
+    assert caught.value.code is StatusCode.GENERAL_ERROR
+
+
+@pytest.mark.parametrize(
+    ("label", "uuid", "content", "expected"),
+    [
+        (
+            "c2pa.icon",
+            _EMBEDDED_FILE_UUID,
+            ((b"bfdb", b"\x00image/svg+xml\x00"), (b"bidb", b"<svg/>")),
+            None,
+        ),
+        ("c2patxt.uuid", content_type_uuid(b"uuid"), ((b"uuid", b"\x00" * 16),), None),
+        (
+            "c2patxt.broken",
+            _jumbf.UUID_CBOR,
+            ((b"cbor", b"\xff"),),
+            StatusCode.ASSERTION_CBOR_INVALID,
+        ),
+    ],
+    ids=["embedded-file", "uuid", "broken-cbor"],
 )
 def test_an_assertion_may_carry_a_content_type_other_than_cbor(
-    signer: Signer, content: tuple[bytes, bytes], expected: StatusCode | None
+    signer: Signer,
+    label: str,
+    uuid: bytes,
+    content: tuple[tuple[bytes, bytes], ...],
+    expected: StatusCode | None,
 ) -> None:
-    """C2PA 11.1.4: "The JUMBF Content Type ... box(es) contained in each assertion
+    """C2PA 11.1.4 permits standard assertion content types beyond CBOR.
+
+    "The JUMBF Content Type ... box(es) contained in each assertion
     superbox **should be CBOR Content Type (`cbor`), JSON Content Type (`json`),
     Embedded File Content Type (`bfdb` & `bidb`) or UUID Content Type (`uuid`)** though
     any Content Type defined in JUMBF ... is permitted."
 
-    WE REJECTED THE WHOLE STORE for anything but `cbor`, and at 2.4 that is not an edge
-    case: the specification "replaced data boxes with embedded data assertions", so a
-    claim generator's **icon** now lives in a `bfdb`/`bidb` assertion. The 15.10.3.3
-    reference validation added for exactly that icon could therefore never reach its
-    match path -- the box it points at was unparseable before verification began.
-
-    THE #58 GUARD IS NOT REOPENED, and that is the whole design of this change. The
-    smuggling hole it closed was that a non-`cbor` box vanished from
-    ``assertion_bytes``, so the "every assertion is linked by the claim" comparison
-    never saw it. Here every assertion keeps its RAW BYTES whatever its content type --
-    so the undeclared check still sees it, and the hashed URI still authenticates it --
-    and only the DECODED VALUE is omitted, because there is nothing generic to decode.
-    Hashing operates on bytes and never needed the decode.
-
-    ``broken-cbor`` is the control: a box that CLAIMS to be CBOR and is not stays a
-    rejection, with 15.10.3.1's code.
+    Every content type retains its raw bytes for hashed-URI and undeclared-assertion
+    checks. Only known CBOR/JSON content is decoded. The malformed-CBOR row remains a
+    15.10.3.1 rejection.
     """
     from c2patxt import _jumbf
     from c2patxt._extract import _reparse
     from c2patxt._jumbf import DescriptionBox, JumbfBox, parse_superbox
     from c2patxt.manifest import LABEL_ASSERTION_STORE
 
-    label = "c2patxt.embedded"
     original = extract(mark("Hello world.", signer))
     assert original is not None
     store, _ = parse_superbox(original.raw)
     manifest, _ = _reparse(store.content[0][1])
 
-    extra = JumbfBox(
-        description=DescriptionBox(uuid=_jumbf.UUID_CBOR, label=label, requestable=True), content=(content,)
-    )
+    extra = JumbfBox(description=DescriptionBox(uuid=uuid, label=label, requestable=True), content=content)
     rebuilt: list[tuple[bytes, bytes]] = []
     for tbox, payload in manifest.content:
         child, _ = _reparse(payload)
@@ -500,10 +675,8 @@ def test_malformed_json_in_a_metadata_assertion_gets_the_json_code(signer: Signe
     **or is non-conforming JSON**, the claim shall be rejected with a failure code of
     `assertion.cbor.invalid` **or `assertion.json.invalid`**."
 
-    The CBOR half landed and the JSON half did not, so malformed JSON-LD in
-    `c2pa.metadata` -- the one assertion 18.17.2 requires to be JSON rather than CBOR --
-    reported `assertion.missing`, which says the store lacks an assertion the claim
-    named. The store has it; it does not parse.
+    A malformed JSON-LD ``c2pa.metadata`` assertion exists and hashes, so the precise
+    result is ``assertion.json.invalid`` rather than ``assertion.missing``.
     """
     from c2patxt import _jumbf
     from c2patxt._extract import _reparse
@@ -550,39 +723,54 @@ def test_malformed_json_in_a_metadata_assertion_gets_the_json_code(signer: Signe
 @pytest.mark.parametrize(
     ("label", "payload", "expected"),
     [
-        ("c2pa.metadata", b"[1, 2, 3]", StatusCode.ASSERTION_JSON_INVALID),
-        ("c2pa.metadata", b'"a string"', StatusCode.ASSERTION_JSON_INVALID),
+        ("c2pa.metadata", b"[1, 2, 3]", [1, 2, 3]),
+        ("c2pa.metadata", b'[[1], {"a": 2.5}]', [[1], {"a": 2.5}]),
+        ("c2pa.metadata", b'"a string"', "a string"),
+        ("c2pa.metadata", b"NaN", StatusCode.ASSERTION_JSON_INVALID),
+        ("c2pa.metadata", b"Infinity", StatusCode.ASSERTION_JSON_INVALID),
+        ("c2pa.metadata", b"-Infinity", StatusCode.ASSERTION_JSON_INVALID),
         ("c2pa.metadata", b"{not json", StatusCode.ASSERTION_JSON_INVALID),
+        ("c2pa.metadata__1", b'{"dc:format":"text/plain"}', {"dc:format": "text/plain"}),
+        ("c2pa.metadata__22", b'{"dc:format":"text/plain"}', {"dc:format": "text/plain"}),
+        ("c2pa.xmetadata", b'{"dc:format":"text/plain"}', None),
+        ("c2pa.metadata__x", b'{"dc:format":"text/plain"}', None),
+        ("c2pa.metadata_1", b'{"dc:format":"text/plain"}', None),
+        ("c2pa.repository-receipt", b'{"@context": {}}', {"@context": {}}),
+        ("c2pa.repository-receipt", b"{not json", StatusCode.ASSERTION_JSON_INVALID),
         ("c2patxt.notes", b"{not json", None),
         ("c2patxt.notes", b"[1, 2, 3]", None),
     ],
-    ids=["metadata-array", "metadata-string", "metadata-malformed", "other-malformed", "other-array"],
+    ids=[
+        "metadata-array",
+        "metadata-nested-values",
+        "metadata-string",
+        "metadata-nan",
+        "metadata-positive-infinity",
+        "metadata-negative-infinity",
+        "metadata-malformed",
+        "metadata-instance-1",
+        "metadata-instance-22",
+        "not-metadata-without-dot",
+        "not-metadata-nondigit-instance",
+        "not-metadata-single-underscore",
+        "receipt-object",
+        "receipt-malformed",
+        "other-malformed",
+        "other-array",
+    ],
 )
-def test_json_decoding_is_scoped_to_metadata_labels(
-    signer: Signer, label: str, payload: bytes, expected: StatusCode | None
+def test_json_decoding_is_scoped_to_json_ld_assertion_labels(
+    signer: Signer, label: str, payload: bytes, expected: object
 ) -> None:
-    """Two rules in one table, because they are two halves of the same decision.
+    """Decode the standard JSON-LD assertions without imposing their producer schema.
 
-    C2PA 18.17.2 requires ``c2pa.metadata`` to carry JSON-LD, and 15.10.3.1 names
-    ``assertion.json.invalid`` for content that "is non-conforming JSON". A payload that
-    is well-formed JSON but not an OBJECT is non-conforming: the clause's CDDL and
-    18.17.2's "JSON-LD serialization of one or more metadata values" both require a map.
-    Returning ``None`` for it -- as the code did under mutation -- leaves the assertion
-    with its raw bytes recorded, so the hashed URI still authenticates it and the
-    undeclared check still clears it, and the manifest verifies with an assertion
-    NOTHING DECODED. That mutation survived the whole suite.
+    C2PA 15.10.3.1 points its ``assertion.json.invalid`` test at RFC 8259 clause 2.
+    RFC 8259 defines a JSON text as any serialized JSON value, not only an object.
+    C2PA Table 7 lists both metadata and repository receipts as JSON-LD.
 
-    THE SCOPING IS THE OTHER HALF, and it was equally unheld. ``_json_ld_assertion``'s
-    docstring calls the ``.metadata`` restriction deliberate and "NOT widened to 'any
-    json box'", and dropping it also survived the whole suite -- a non-metadata
-    assertion carrying malformed JSON would start being rejected as
-    ``assertion.json.invalid`` where it should simply be an assertion we do not decode.
-    11.1.4 permits any JUMBF content type in an assertion, and #89 made us record raw
-    bytes for all of them; deciding that one of them must ALSO be valid JSON would
-    re-narrow what that change deliberately widened.
-
-    The two ``c2patxt.notes`` rows are what make this a scoping test rather than a JSON
-    test: identical bytes, different label, opposite outcome.
+    The custom ``c2patxt.notes`` rows hold the other boundary: 11.1.4 permits any
+    content type in a custom assertion, so a JSON content box does not by itself make
+    that assertion subject to a standard JSON-LD schema.
     """
     from c2patxt import _jumbf
     from c2patxt._extract import _reparse
@@ -595,7 +783,7 @@ def test_json_decoding_is_scoped_to_metadata_labels(
     manifest, _ = _reparse(store.content[0][1])
 
     replacement = JumbfBox(
-        description=DescriptionBox(uuid=_jumbf.UUID_CBOR, label=label, requestable=True),
+        description=DescriptionBox(uuid=_jumbf.UUID_JSON, label=label, requestable=True),
         content=((b"json", payload),),
     )
     rebuilt: list[tuple[bytes, bytes]] = []
@@ -625,37 +813,26 @@ def test_json_decoding_is_scoped_to_metadata_labels(
         )
     )
 
+    if isinstance(expected, StatusCode):
+        with pytest.raises(MarkCorruptError) as caught:
+            parse_manifest_store(forged)
+        assert caught.value.code is expected
+        return
+
+    parsed = parse_manifest_store(forged)
     if expected is None:
-        parsed = parse_manifest_store(forged)
         assert label in parsed.assertion_bytes, "an assertion we do not decode is still hashable and linkable"
         assert label not in parsed.assertions
         return
 
-    with pytest.raises(MarkCorruptError) as caught:
-        parse_manifest_store(forged)
-    assert caught.value.code is expected
+    assert parsed.assertions[label] == expected
 
 
-def test_extract_refuses_multi_wrapper_text_as_verify_does(signer: Signer) -> None:
-    """``extract`` REFUSES multi-wrapper text rather than returning the first wrapper's manifest,
-    with no error and no signal. It now refuses, and the reversal is deliberate.
+def test_extract_refuses_plural_text_without_selecting_a_manifest(signer: Signer) -> None:
+    """Extraction has no signed exclusion context with which to select a wrapper.
 
-    THE DEVIATION ENTRY ARGUES AGAINST THE OLD BEHAVIOUR IN ITS OWN WORDS. Recording why
-    we reject plural wrappers where 15.12.1.3.1 would only reject those matching the
-    exclusions, it says the permissive reading "lets an attacker append a wrapper and
-    choose which one a given consumer reads, and 'different verifiers disagree about
-    which claim applies' is exactly the failure a provenance format cannot have". An
-    attacker appends the SECOND wrapper, so they choose what is FIRST by choosing what to
-    prepend -- and an integrator calling ``extract`` to render "who signed this" got
-    their manifest.
-
-    A caller inspecting a suspicious document is served by ``locate``, which returns a
-    SPAN rather than a manifest and documents its first-wrapper choice.
-
-    ``manifest.text.multipleWrappers`` rather than the carrier's corruption code: the
-    wrapper decoded perfectly and there are simply two of them, which is what that code
-    exists to say. It is the same code ``verify`` reports, so the two entry points now
-    agree about this input instead of disagreeing.
+    Verification applies 15.12.1.3.1 and may select one matching wrapper. Extraction
+    exposes an unverified manifest, so plural input is ambiguous and refused.
     """
     first = mark("Hello world.", signer)
     second = mark("A different document.", signer)
@@ -668,38 +845,32 @@ def test_extract_refuses_multi_wrapper_text_as_verify_does(signer: Signer) -> No
     assert caught.value.code is StatusCode.TEXT_MULTIPLE_WRAPPERS
 
 
-def test_a_metadata_assertion_carrying_both_box_types_reads_the_json_one() -> None:
-    """18.17.2: the metadata assertion "shall contain a single JSON content type box".
+@pytest.mark.parametrize(
+    "content",
+    [
+        ((b"cbor", _cbor.dumps({"dc:format": "from-cbor"})),),
+        (
+            (b"cbor", _cbor.dumps({"dc:format": "from-cbor"})),
+            (b"json", b'{"dc:format": "from-json"}'),
+        ),
+    ],
+    ids=["cbor-only", "json-and-cbor"],
+)
+def test_a_metadata_assertion_requires_exactly_one_json_box(
+    signer: Signer,
+    content: tuple[tuple[bytes, bytes], ...],
+) -> None:
+    """C2PA 18.17.2 defines one JSON box, not a preferred box among many."""
+    original = extract(mark("Hello world.", signer))
+    assert original is not None
+    forged = _replace_assertion_content(original.raw, ASSERTION_METADATA, content)
 
-    ``_parse_assertions`` tried ``cbor`` first for every assertion, so a
-    ``c2pa.metadata`` carrying BOTH a cbor and a json box decoded as CBOR -- while a
-    peer following 18.17.2 reads the JSON one. Identical bytes, different content, both
-    hash-matching, and no code raised by either side. That is the worst shape an
-    interoperability defect can take: two conforming readers disagreeing silently.
-
-    A conforming producer emits one box. This decides which one wins when a
-    non-conforming producer, or an attacker, emits two.
-    """
-    from c2patxt._extract import _parse_assertions
-    from c2patxt._jumbf import UUID_CBOR, DescriptionBox, JumbfBox, serialize_superbox
-    from c2patxt.manifest import LABEL_ASSERTION_STORE, UUID_ASSERTION_STORE
-
-    both = JumbfBox(
-        description=DescriptionBox(uuid=UUID_CBOR, label="c2pa.metadata", requestable=True),
-        content=((b"cbor", _cbor.dumps({"dc:format": "from-cbor"})), (b"json", b'{"dc:format": "from-json"}')),
-    )
-    store = JumbfBox(
-        description=DescriptionBox(uuid=UUID_ASSERTION_STORE, label=LABEL_ASSERTION_STORE),
-        content=((b"jumb", serialize_superbox(both)[8:]),),
-    )
-
-    assertions, _raw = _parse_assertions(store)
-    value = assertions["c2pa.metadata"]
-    assert isinstance(value, dict)
-    assert value["dc:format"] == "from-json", "18.17.2 makes the metadata assertion JSON-LD"
+    with pytest.raises(MarkCorruptError) as caught:
+        parse_manifest_store(forged)
+    assert caught.value.code is StatusCode.ASSERTION_JSON_INVALID
 
 
-def test_duplicate_content_boxes_are_rejected_like_duplicate_labels() -> None:
+def test_duplicate_content_boxes_are_rejected_like_duplicate_labels(signer: Signer) -> None:
     """``_children_with_bytes`` rejects two boxes under one LABEL, and says why:
     "a third-party JUMBF reader may take the FIRST box where we took the last, so two
     conforming implementations would authenticate different content from identical
@@ -710,12 +881,12 @@ def test_duplicate_content_boxes_are_rejected_like_duplicate_labels() -> None:
     a smaller scale, with the same consequence: the bytes hash identically and two
     readers extract different claims from them.
     """
-    from c2patxt._extract import _content
-    from c2patxt._jumbf import UUID_CBOR, DescriptionBox, JumbfBox
-
-    box = JumbfBox(
-        description=DescriptionBox(uuid=UUID_CBOR, label="c2pa.metadata", requestable=True),
-        content=((b"cbor", b"\x01"), (b"cbor", b"\x02")),
+    original = extract(mark("Hello world.", signer))
+    assert original is not None
+    forged = _replace_assertion_content(
+        original.raw,
+        ASSERTION_ACTIONS,
+        ((b"cbor", b"\x01"), (b"cbor", b"\x02")),
     )
     with pytest.raises(MarkCorruptError, match="more than one"):
-        _content(box, b"cbor")
+        parse_manifest_store(forged)

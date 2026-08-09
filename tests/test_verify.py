@@ -1,18 +1,10 @@
 # pyright: reportPrivateUsage=false
-# Reaches _verify._check_assertions directly where a case needs a store no producer can
-# emit. It does NOT hide which rejection path fired -- _assertion_failure returns exactly
-# one code, verify adds it verbatim, and all three phases run unconditionally and
-# accumulate, so codes() discriminates exactly as the helper's return value does. Six
-# codes were held only at this layer on that mistaken reasoning; see
-# test_a_wire_legal_manifest_reports_its_defect_through_verify.
+# Reaches _verify._check_assertions directly only for states no producer can emit.
+# Public signed-wire cases below hold every externally visible status mapping.
 """End-to-end tests for :func:`c2patxt.verify`.
 
-This is the first suite that exercises the whole stack -- selectors, JUMBF, CBOR,
-COSE, certificate profile, hash binding -- against text that genuinely satisfies the
-binding, rather than against hand-built fragments. Every attack here is one the
-threat model names, and each asserts the SPECIFIC status code, not merely that
-something failed: a test that only checks ``INVALID`` passes just as happily when the
-mark fails for the wrong reason.
+The suite exercises selectors, JUMBF, CBOR, COSE, certificate profiles and hash binding
+against signed text. Attack cases assert the exact status code, not merely ``INVALID``.
 """
 
 from __future__ import annotations
@@ -23,13 +15,21 @@ import hashlib
 import unicodedata
 import uuid
 from collections.abc import Callable
+from typing import TypeGuard
 
+import cbor2
 import pytest
 from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
+from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PrivateKey
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
+from cryptography.hazmat.primitives.hashes import SHA256
 from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-from c2patxt import _cbor, _fixpoint, _jumbf, _verify
+from c2patxt import _cbor, _cose, _fixpoint, _jumbf, _verify
 from c2patxt._jumbf import DescriptionBox, JumbfBox
 from c2patxt._selectors import build_wrapper
 from c2patxt.constants import MARKER
@@ -38,6 +38,8 @@ from c2patxt.manifest import (
     ASSERTION_ACTIONS_V1,
     ASSERTION_AI_DISCLOSURE,
     ASSERTION_HASH_DATA,
+    ASSERTION_METADATA,
+    ASSERTION_REPOSITORY_RECEIPT,
     DIGITAL_SOURCE_TYPE_TRAINED,
     LABEL_ASSERTION_STORE,
     LABEL_CLAIM,
@@ -51,13 +53,13 @@ from c2patxt.manifest import (
     Assertion,
     ManifestStore,
 )
-from c2patxt.signing import Signer
+from c2patxt.signing import C2PA_CLAIM_SIGNING_EKU, COSE_ALG_EDDSA, Signer
 from c2patxt.status import StatusCode
-from c2patxt.trust import TrustEvaluator
+from c2patxt.trust import ProfileError
 from c2patxt.verdict import Provenance, Verdict
-from tests.conftest import DISCLOSURE, build_certificate, mark
+from tests.conftest import DISCLOSURE, WHEN, FloatingTimezone, RecordingTrustEvaluator, build_certificate, mark
 
-from c2patxt import VerifyContext, embed, extract, locate, verify  # isort: skip
+from c2patxt import MarkCorruptError, VerifyContext, embed, extract, locate, verify  # isort: skip
 
 
 #: This suite exercises the WHOLE stack -- selectors, JUMBF, CBOR, COSE, certificate
@@ -70,16 +72,26 @@ def marked(signer: Signer) -> str:
     return mark("The quick brown fox jumps over the lazy dog.", signer)
 
 
-class _AcceptAnchoredEvaluator:
-    """Trusts a chain whose leaf appears verbatim among the anchors.
-
-    Not a certificate path validator and not offered as one -- it exists so the
-    TRUSTED state is reachable in a test. ``cryptography.x509.verification`` cannot
-    validate Ed25519 chains, which is exactly why trust is a caller-supplied seam.
-    """
-
-    def is_trusted(self, chain: list[x509.Certificate], anchors: list[x509.Certificate]) -> bool:
-        return bool(chain) and chain[0] in anchors
+def _test_wrapper(
+    boxes: tuple[JumbfBox, ...],
+    signature: bytes,
+    *,
+    manifest_label: str,
+) -> str:
+    """Assemble a hand-built test manifest around already chosen signed bytes."""
+    signature_box = JumbfBox(
+        description=DescriptionBox(uuid=UUID_CLAIM_SIGNATURE, label=LABEL_CLAIM_SIGNATURE),
+        content=((b"cbor", signature),),
+    )
+    manifest = JumbfBox(
+        description=DescriptionBox(uuid=UUID_MANIFEST, label=manifest_label),
+        content=tuple((b"jumb", _jumbf.serialize_superbox(box)[8:]) for box in (*boxes, signature_box)),
+    )
+    store = JumbfBox(
+        description=DescriptionBox(uuid=UUID_MANIFEST_STORE, label=LABEL_MANIFEST_STORE),
+        content=((b"jumb", _jumbf.serialize_superbox(manifest)[8:]),),
+    )
+    return build_wrapper(_jumbf.serialize_superbox(store))
 
 
 # --------------------------------------------------------------------------------
@@ -93,13 +105,11 @@ def test_untouched_text_verifies_as_valid(marked: str) -> None:
     VALID rather than TRUSTED, and that is the correct answer: the credential is
     self-signed and no anchors were supplied, so there is nothing to chain to.
 
-    THE ASSERTION IS ``at_least``, DELIBERATELY. This test file is where an
-    integrator learns the idiom, so it must teach the safe one. Checking
-    ``CLAIM_SIGNATURE_VALIDATED in verdict.codes()`` looks equivalent and is not:
+    ``at_least`` checks the aggregate verdict. Checking
+    ``CLAIM_SIGNATURE_VALIDATED in verdict.codes()`` is not equivalent:
     ``codes()`` flattens all three buckets, and that code is genuinely PRESENT on a
     document whose text was rewritten -- the claim signature really is intact, only
-    the binding broke. Copy that idiom into a service and attacker-edited text
-    passes. See the next test.
+    the binding broke. A service must therefore decide from the aggregate state.
     """
     verdict = verify(marked)
     assert verdict.at_least(Provenance.VALID)
@@ -119,6 +129,212 @@ def test_valid_carries_untrusted_and_that_is_not_an_error(marked: str) -> None:
     assert not verdict.at_least(Provenance.TRUSTED)
 
 
+@pytest.mark.parametrize(
+    "part",
+    ["claim-order", "assertion-order", "assertion-compound-key"],
+)
+def test_authenticated_manifest_cbor_outside_the_writer_subset_is_accepted(signer: Signer, part: str) -> None:
+    """15.6.2 and 15.10.3.1 reject non-well-formed CBOR, not our writer subset.
+
+    The generator rules in 10.1 and 18.1 still require deterministic bytes, and
+    ``test_manifest`` checks ours. A validator applies different clauses. Two rows
+    reverse a top-level map order. The third adds 18.3.3 custom assertion
+    metadata whose value has an array map key, valid CBOR that Python cannot place
+    directly in a dict. Every row recomputes each affected digest and signature.
+
+    Each row passes through public verification so both extraction boundaries use the
+    broader reader contract.
+    """
+    from c2patxt.manifest import (
+        ASSERTION_URI_PREFIX,
+        DEFAULT_HASH_ALGORITHM,
+        _prepare_manifest,
+        _serialize_prepared_manifest,
+        hashed_uri,
+    )
+
+    text = "Hello world."
+    normalized = unicodedata.normalize("NFC", text)
+    start = len(normalized.encode("utf-8"))
+    digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+    manifest_uuid = uuid.UUID("00000000-0000-4000-8000-000000000013")
+
+    def reversed_map(value: _cbor.CborValue) -> bytes:
+        assert isinstance(value, dict)
+        encoded = cbor2.dumps(dict(reversed(tuple(value.items()))))
+        assert _cbor.loads(encoded, deterministic=False) == value
+        with pytest.raises(_cbor.CborDecodeError, match="out-of-order"):
+            _cbor.loads(encoded)
+        return encoded
+
+    def prepare(exclusion_length: int) -> Callable[[int], str]:
+        prepared = _prepare_manifest(
+            disclosure=DISCLOSURE,
+            digest=digest,
+            exclusion_start=start,
+            exclusion_length=exclusion_length,
+            instance_id="xmp:iid:non-deterministic-reader",
+            when=WHEN,
+            generator_name="independent test producer",
+        )
+        claim = _cbor.loads(prepared.claim_bytes)
+        assert isinstance(claim, dict)
+        boxes = list(prepared.assertion_boxes)
+
+        if part == "claim-order":
+            claim_bytes = reversed_map(claim)
+        else:
+            target_label = ASSERTION_ACTIONS if part == "assertion-compound-key" else ASSERTION_HASH_DATA
+            assertion_url = f"{ASSERTION_URI_PREFIX}{target_label}"
+            changed = False
+            for index, box in enumerate(boxes):
+                if box.description.label != target_label:
+                    continue
+                assert len(box.content) == 1
+                tbox, payload = box.content[0]
+                assertion = _cbor.loads(payload)
+                if part == "assertion-order":
+                    assertion_bytes = reversed_map(assertion)
+                else:
+                    assert isinstance(assertion, dict)
+                    # The prepared actions map has one `actions` pair. Preserve its
+                    # exact tagged tdate bytes, widen the map to two pairs, and append
+                    # `metadata` (which sorts after `actions`) from a separate encoder.
+                    assert payload[:1] == b"\xa1"
+                    custom_metadata = cbor2.dumps({"com.example:x": {(): 0}})
+                    assertion_bytes = b"\xa2" + payload[1:] + _cbor.dumps("metadata") + custom_metadata
+                    decoded = _cbor.loads(assertion_bytes)
+                    assert isinstance(decoded, dict)
+                    metadata = decoded.get("metadata")
+                    assert isinstance(metadata, dict)
+                    custom = metadata.get("com.example:x")
+                    assert isinstance(custom, dict)
+                    compound = next(iter(custom))
+                    assert isinstance(compound, _cbor.MapKey)
+                    assert compound.value == []
+                replacement = dataclasses.replace(box, content=((tbox, assertion_bytes),))
+                boxes[index] = replacement
+
+                links = claim.get("created_assertions")
+                assert isinstance(links, list)
+                for link in links:
+                    assert isinstance(link, dict)
+                    if link.get("url") != assertion_url:
+                        continue
+                    new_digest = hashed_uri(replacement, assertion_url, DEFAULT_HASH_ALGORITHM)["hash"]
+                    assert isinstance(new_digest, bytes)
+                    link["hash"] = new_digest
+                    changed = True
+                    break
+                break
+            assert changed, "the target assertion and its claim link must both be replaced"
+            claim_bytes = _cbor.dumps(claim)
+
+        altered = dataclasses.replace(prepared, assertion_boxes=tuple(boxes), claim_bytes=claim_bytes)
+        signed = _cose._prepare_signed_claim(signer, claim_bytes)
+
+        def assemble(pad: int) -> str:
+            signature = _cose._serialize_signed_claim(signed, pad=pad)
+            raw = _serialize_prepared_manifest(altered, signature=signature, manifest_uuid=manifest_uuid)
+            return build_wrapper(raw)
+
+        return assemble
+
+    wrapper, _ = _fixpoint.solve(prepare)
+    verdict = verify(normalized + wrapper)
+
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+    assert StatusCode.DATA_HASH_MATCH in verdict.codes()
+
+
+def test_an_unprotected_x5chain_reaches_the_same_signature_checks(signer: Signer) -> None:
+    """14.5 requires validators to accept the legacy unprotected placement."""
+
+    def unprotected_chain(candidate: Signer, claim_bytes: bytes, pad: int) -> bytes:
+        protected = _cbor.dumps({_cose.COSE_HEADER_ALG: COSE_ALG_EDDSA})
+        signature = candidate.sign(_cose.sig_structure(protected, claim_bytes))
+        return _cbor.dumps(
+            _cbor.Tagged(
+                _cbor.TAG_COSE_SIGN1,
+                [
+                    protected,
+                    {_cose.COSE_HEADER_X5CHAIN: candidate.x5chain()[0], "pad": bytes(pad)},
+                    None,
+                    signature,
+                ],
+            )
+        )
+
+    verdict = verify(_resigned(signer, _unchanged, signature_serializer=unprotected_chain))
+
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID not in verdict.codes()
+
+
+def test_an_unknown_spki_is_an_invalid_credential_not_an_exception(signer: Signer) -> None:
+    """Exercise the real hostile-DER boundary, not a certificate-shaped proxy."""
+    der = signer.x5chain()[0]
+    ed25519_oid = b"\x06\x03\x2b\x65\x70"
+    positions = [index for index in range(len(der)) if der.startswith(ed25519_oid, index)]
+    assert len(positions) == 3, "TBS signature, subjectPublicKeyInfo, outer signature"
+    spki = positions[1]
+    unknown_spki = der[: spki + 4] + b"\x72" + der[spki + 5 :]
+
+    def hostile_certificate(candidate: Signer, claim_bytes: bytes, pad: int) -> bytes:
+        protected = _cbor.dumps({_cose.COSE_HEADER_ALG: COSE_ALG_EDDSA, _cose.COSE_HEADER_X5CHAIN: unknown_spki})
+        signature = candidate.sign(_cose.sig_structure(protected, claim_bytes))
+        return _cbor.dumps(
+            _cbor.Tagged(
+                _cbor.TAG_COSE_SIGN1,
+                [protected, {"pad": bytes(pad)}, None, signature],
+            )
+        )
+
+    verdict = verify(_resigned(signer, _unchanged, signature_serializer=hostile_certificate))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID in verdict.codes()
+    explanations = [status.explanation for status in verdict.failure if status.explanation]
+    assert any("x5chain[0] leaf" in text and "not a readable certificate" in text for text in explanations)
+
+
+@pytest.mark.parametrize("unreadable_index", [1, 2], ids=["intermediate", "third-slot"])
+def test_an_unreadable_carried_certificate_reports_its_x5chain_index(unreadable_index: int) -> None:
+    signer = _signer_with_carried_intermediate()
+    chain: list[_cbor.CborValue] = [certificate for certificate in signer.x5chain()]
+    if unreadable_index == len(chain):
+        chain.append(b"not a DER certificate")
+    else:
+        chain[unreadable_index] = b"not a DER certificate"
+
+    def unreadable_chain(candidate: Signer, claim_bytes: bytes, pad: int) -> bytes:
+        protected = _cbor.dumps({_cose.COSE_HEADER_ALG: COSE_ALG_EDDSA, _cose.COSE_HEADER_X5CHAIN: chain})
+        signature = candidate.sign(_cose.sig_structure(protected, claim_bytes))
+        return _cbor.dumps(
+            _cbor.Tagged(
+                _cbor.TAG_COSE_SIGN1,
+                [protected, {"pad": bytes(pad)}, None, signature],
+            )
+        )
+
+    evaluator = RecordingTrustEvaluator(trusted=True)
+    context = VerifyContext(
+        anchors_pem=signer.certificates[-1].public_bytes(Encoding.PEM),
+        trust_evaluator=evaluator,
+        now=datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc),
+    )
+
+    verdict = verify(_resigned(signer, _unchanged, signature_serializer=unreadable_chain), context=context)
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID in verdict.codes()
+    explanations = [status.explanation for status in verdict.failure if status.explanation]
+    assert any(f"x5chain[{unreadable_index}] carried CA" in text for text in explanations)
+    assert not evaluator.calls
+
+
 def test_unmarked_text_is_unmarked_not_invalid() -> None:
     """Absence of a mark is the absence of a finding, not a negative one."""
     verdict = verify("Just some ordinary prose with no mark at all.")
@@ -132,14 +348,18 @@ def test_empty_text_is_unmarked() -> None:
     assert verdict.state is Provenance.UNMARKED
 
 
-def test_the_span_locates_the_wrapper(marked: str) -> None:
-    """The reported span must name the wrapper exactly, so a caller can strip it."""
+def test_the_span_locates_the_wrapper_by_utf8_bytes(signer: Signer) -> None:
+    """A non-ASCII prefix separates byte offsets from Python character indexes."""
+    text = "café 漢字"
+    marked = mark(text, signer)
     verdict = verify(marked)
     span = verdict.span
     assert span is not None
     encoded = marked.encode("utf-8")
+    assert span.utf8_start == len(text.encode("utf-8"))
+    assert encoded[span.utf8_start : span.utf8_stop].decode("utf-8").startswith(MARKER)
     stripped = encoded[: span.utf8_start] + encoded[span.utf8_stop :]
-    assert stripped.decode("utf-8") == "The quick brown fox jumps over the lazy dog."
+    assert stripped.decode("utf-8") == text
 
 
 @pytest.mark.parametrize(
@@ -179,14 +399,13 @@ def test_altering_one_character_breaks_the_binding(signer: Signer) -> None:
 def test_appending_text_after_the_wrapper_breaks_the_binding(signer: Signer) -> None:
     """ATTACK: append after the mark, hoping the hash only covers the prefix.
 
-    Caught by the SUFFIX rule rather than by the hash: once bytes follow the wrapper
-    it is no longer trailing, and the exclusion no longer describes this document.
-    That is the more precise diagnosis -- "the assertion does not describe this text"
-    rather than "the text was edited somewhere" -- and it fires one step earlier.
+    The signed exclusion still names the wrapper exactly, so validation removes that
+    range and hashes every remaining byte. The appended text therefore produces the
+    ordinary data-hash mismatch required by 15.12.1.3.1.
     """
     verdict = verify(mark("Hello world.", signer) + " and some appended lies")
     assert verdict.state is Provenance.INVALID
-    assert StatusCode.DATA_HASH_MALFORMED in verdict.codes()
+    assert StatusCode.DATA_HASH_MISMATCH in verdict.codes()
 
 
 def test_replaying_a_wrapper_onto_same_length_text_fails(signer: Signer) -> None:
@@ -219,22 +438,273 @@ def test_replaying_a_wrapper_onto_shifted_text_fails(signer: Signer) -> None:
     assert StatusCode.DATA_HASH_MALFORMED in verdict.codes()
 
 
-def test_a_second_wrapper_invalidates(marked: str, signer: Signer) -> None:
-    """ATTACK: append a second wrapper so a consumer picks the wrong one.
+def test_an_appended_wrapper_is_covered_when_only_the_first_exclusion_matches(marked: str, signer: Signer) -> None:
+    """15.12.1.3.1 selects the wrapper whose exclusion matches its exact range.
 
-    A.8.2.1 gives quantity "Zero or one"; 15.5.2.1 treats plural manifest stores as
-    all invalid. A permissive reading would let an attacker choose which manifest a
-    given consumer reads.
+    The appended wrapper's own exclusion no longer names its shifted span, so the first
+    mark remains authoritative and its digest covers the appended bytes.
     """
     second = mark("Something else entirely.", signer)
     verdict = verify(marked + second[second.index(MARKER) :])
     assert verdict.state is Provenance.INVALID
-    assert StatusCode.TEXT_MULTIPLE_WRAPPERS in verdict.codes()
+    assert StatusCode.DATA_HASH_MISMATCH in verdict.codes()
 
 
 # --------------------------------------------------------------------------------
 # Tampering: the signature and the credential
 # --------------------------------------------------------------------------------
+
+
+def _signer_with_carried_intermediate(
+    *,
+    intermediate_key: Ed25519PrivateKey | ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey | None = None,
+    basic_constraints: bool = True,
+    basic_constraints_critical: bool = True,
+    ca: bool = True,
+    authority_key_identifier: bool = True,
+    authority_key_identifier_critical: bool = False,
+    subject_key_identifier: bool = True,
+    subject_key_identifier_critical: bool = False,
+    key_usage: bool = True,
+    key_usage_critical: bool = True,
+    key_cert_sign: bool = True,
+    ca_eku: bool = False,
+    intermediate_not_after: datetime.datetime | None = None,
+    allow_nonconformant: bool = False,
+) -> Signer:
+    """Build leaf -> carried intermediate -> omitted root test credentials."""
+    leaf_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
+    issuer_key = intermediate_key or Ed25519PrivateKey.from_private_bytes(bytes(range(64, 96)))
+    root_key = Ed25519PrivateKey.from_private_bytes(bytes(range(96, 128)))
+    leaf_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "c2patxt chain leaf")])
+    issuer_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "c2patxt carried intermediate")])
+    root_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "c2patxt omitted root")])
+    not_before = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    not_after = datetime.datetime(2046, 1, 1, tzinfo=datetime.timezone.utc)
+
+    issuer_builder = (
+        x509.CertificateBuilder()
+        .subject_name(issuer_name)
+        .issuer_name(root_name)
+        .public_key(issuer_key.public_key())
+        .serial_number(0xC2A7E47_CAFE)
+        .not_valid_before(not_before)
+        .not_valid_after(intermediate_not_after or not_after)
+    )
+    if basic_constraints:
+        issuer_builder = issuer_builder.add_extension(
+            x509.BasicConstraints(ca=ca, path_length=None),
+            critical=basic_constraints_critical,
+        )
+    if authority_key_identifier:
+        issuer_builder = issuer_builder.add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(root_key.public_key()),
+            critical=authority_key_identifier_critical,
+        )
+    if subject_key_identifier:
+        issuer_builder = issuer_builder.add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(issuer_key.public_key()),
+            critical=subject_key_identifier_critical,
+        )
+    if key_usage:
+        issuer_builder = issuer_builder.add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=key_cert_sign,
+                crl_sign=key_cert_sign,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=key_usage_critical,
+        )
+    if ca_eku:
+        # 14.5.1.1 says a CA's EKU does not take part in certificate acceptance.
+        issuer_builder = issuer_builder.add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.TIME_STAMPING]),
+            critical=False,
+        )
+    issuer = issuer_builder.sign(root_key, None)
+
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(leaf_name)
+        .issuer_name(issuer_name)
+        .public_key(leaf_key.public_key())
+        .serial_number(0xC2A7E47_BEEF)
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.ExtendedKeyUsage([C2PA_CLAIM_SIGNING_EKU]), critical=False)
+        .sign(issuer_key, None if isinstance(issuer_key, Ed25519PrivateKey) else SHA256())
+    )
+    return Signer(
+        private_key=leaf_key,
+        certificates=(leaf, issuer),
+        allow_nonconformant=allow_nonconformant,
+    )
+
+
+def test_a_conforming_carried_intermediate_with_an_eku_is_accepted() -> None:
+    """A CA's EKU is ignored; applying the leaf rules to it would reject this chain."""
+    verdict = verify(mark("Hello world.", _signer_with_carried_intermediate(ca_eku=True)))
+
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID not in verdict.codes()
+
+
+def test_signer_refuses_an_unrelated_carried_certificate() -> None:
+    first = _signer_with_carried_intermediate()
+    second = _signer_with_carried_intermediate(
+        intermediate_key=Ed25519PrivateKey.from_private_bytes(bytes(reversed(range(64, 96))))
+    )
+
+    with pytest.raises(ValueError, match=r"x5chain\[0\].*not directly issued by x5chain\[1\]"):
+        Signer(
+            private_key=first.private_key,
+            certificates=(first.certificates[0], second.certificates[1]),
+        )
+
+
+def test_a_noncritical_carried_ca_key_usage_is_accepted() -> None:
+    """RFC 5280 recommends, but does not require, critical Key Usage."""
+    verdict = verify(mark("Hello world.", _signer_with_carried_intermediate(key_usage_critical=False)))
+
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID not in verdict.codes()
+
+
+@pytest.mark.parametrize(
+    "intermediate_key",
+    [
+        rsa.generate_private_key(public_exponent=65537, key_size=2048),
+        ec.derive_private_key(1, ec.SECP256R1()),
+        ec.derive_private_key(1, ec.SECP384R1()),
+        ec.derive_private_key(1, ec.SECP521R1()),
+    ],
+    ids=["rsa-2048", "p-256", "p-384", "p-521"],
+)
+def test_permitted_carried_ca_subject_keys_are_accepted(
+    intermediate_key: rsa.RSAPrivateKey | ec.EllipticCurvePrivateKey,
+) -> None:
+    verdict = verify(mark("Hello world.", _signer_with_carried_intermediate(intermediate_key=intermediate_key)))
+
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID not in verdict.codes()
+
+
+def test_signer_refuses_a_nonconforming_carried_intermediate() -> None:
+    with pytest.raises(ProfileError, match=r"x5chain\[1\].*Subject Key Identifier"):
+        _signer_with_carried_intermediate(subject_key_identifier=False)
+
+
+def test_profile_validation_reaches_the_third_carried_certificate() -> None:
+    base = _signer_with_carried_intermediate()
+    root_key = Ed25519PrivateKey.from_private_bytes(bytes(range(96, 128)))
+    not_a_ca = build_certificate(root_key, common_name="c2patxt omitted root")
+    certificates = (*base.certificates, not_a_ca)
+
+    with pytest.raises(ProfileError, match=r"x5chain\[2\].*carried CA"):
+        Signer(private_key=base.private_key, certificates=certificates)
+
+    wire_signer = Signer(
+        private_key=base.private_key,
+        certificates=certificates,
+        allow_nonconformant=True,
+    )
+    verdict = verify(mark("Hello world.", wire_signer))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID in verdict.codes()
+    explanations = [status.explanation for status in verdict.failure if status.explanation]
+    assert any("x5chain[2]" in text for text in explanations)
+
+
+_INTERMEDIATE_PROFILE_VIOLATIONS: list[tuple[str, dict[str, bool]]] = [
+    ("basic-constraints-absent", {"basic_constraints": False}),
+    ("basic-constraints-not-critical", {"basic_constraints_critical": False}),
+    ("ca-false", {"ca": False}),
+    ("authority-key-identifier-absent", {"authority_key_identifier": False}),
+    ("authority-key-identifier-critical", {"authority_key_identifier_critical": True}),
+    ("subject-key-identifier-absent", {"subject_key_identifier": False}),
+    ("subject-key-identifier-critical", {"subject_key_identifier_critical": True}),
+    ("key-usage-absent", {"key_usage": False}),
+    ("key-cert-sign-false", {"key_cert_sign": False}),
+]
+
+
+@pytest.mark.parametrize(
+    ("label", "keywords"),
+    _INTERMEDIATE_PROFILE_VIOLATIONS,
+    ids=[case[0] for case in _INTERMEDIATE_PROFILE_VIOLATIONS],
+)
+def test_a_carried_intermediate_profile_violation_is_invalid(
+    label: str,
+    keywords: dict[str, bool],
+) -> None:
+    signer = _signer_with_carried_intermediate(
+        **keywords,  # pyright: ignore[reportArgumentType] -- one bool-valued profile switch per row
+        allow_nonconformant=True,
+    )
+
+    evaluator = RecordingTrustEvaluator(trusted=True)
+    context = VerifyContext(
+        anchors_pem=signer.certificates[-1].public_bytes(Encoding.PEM),
+        trust_evaluator=evaluator,
+    )
+    verdict = verify(mark("Hello world.", signer), context=context)
+
+    assert verdict.state is Provenance.INVALID, label
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID in verdict.codes(), label
+    assert not evaluator.calls, f"{label} reached the trust backend before its profile was accepted"
+    explanations = [status.explanation for status in verdict.failure if status.explanation]
+    assert any("x5chain[1]" in text for text in explanations), label
+
+
+@pytest.mark.parametrize(
+    "intermediate_key",
+    [
+        rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=1024,  # noqa: S505 -- hostile fixture below the profile floor
+        ),
+        ec.derive_private_key(1, ec.SECP256K1()),
+    ],
+    ids=["rsa-1024", "secp256k1"],
+)
+def test_a_carried_intermediate_with_a_disallowed_subject_key_is_invalid(
+    intermediate_key: rsa.RSAPrivateKey | ec.EllipticCurvePrivateKey,
+) -> None:
+    signer = _signer_with_carried_intermediate(
+        intermediate_key=intermediate_key,
+        allow_nonconformant=True,
+    )
+
+    verdict = verify(mark("Hello world.", signer))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID in verdict.codes()
 
 
 def test_signer_refuses_a_key_that_does_not_match_the_certificate(
@@ -298,13 +768,16 @@ def test_a_supplied_anchor_and_evaluator_reach_trusted(marked: str, signing_cert
 
     Proves the four-state model is not a three-state model with a decorative top.
     """
+    evaluator = RecordingTrustEvaluator(trusted=True)
     context = VerifyContext(
         anchors_pem=signing_certificate.public_bytes(Encoding.PEM),
-        trust_evaluator=_AcceptAnchoredEvaluator(),
+        trust_evaluator=evaluator,
     )
     verdict = verify(marked, context=context)
     assert verdict.state is Provenance.TRUSTED
     assert StatusCode.SIGNING_CREDENTIAL_TRUSTED in verdict.codes()
+    certificate_der = signing_certificate.public_bytes(Encoding.DER)
+    assert evaluator.calls == [((certificate_der,), (certificate_der,))]
 
 
 def test_an_anchor_without_an_evaluator_stays_valid(marked: str, signing_certificate: x509.Certificate) -> None:
@@ -319,13 +792,10 @@ def test_an_anchor_without_an_evaluator_stays_valid(marked: str, signing_certifi
 
 def test_an_evaluator_without_anchors_stays_valid(marked: str) -> None:
     """With no anchors there is nothing to chain to, so the evaluator is not asked."""
-    context = VerifyContext(trust_evaluator=_AcceptAnchoredEvaluator())
+    evaluator = RecordingTrustEvaluator(trusted=True)
+    context = VerifyContext(trust_evaluator=evaluator)
     assert verify(marked, context=context).state is Provenance.VALID
-
-
-def test_the_default_evaluator_satisfies_the_protocol() -> None:
-    """The seam is a Protocol, so a caller's own evaluator needs no base class."""
-    assert isinstance(_AcceptAnchoredEvaluator(), TrustEvaluator)
+    assert not evaluator.calls
 
 
 # --------------------------------------------------------------------------------
@@ -386,59 +856,26 @@ def test_a_profile_violation_explains_which_rule_failed() -> None:
     assert any("EKU" in text or "cA" in text or "keyCertSign" in text for text in explanations)
 
 
-#: One ``build_certificate`` keyword per 14.5.1.1 rule that a certificate can actually
-#: carry onto the wire. The version, uniqueID and signatureAlgorithm rules are absent
-#: because ``cryptography`` will not emit a certificate that breaks them; they are held
-#: by ``test_trust.py`` against hand-built DER.
-_PROFILE_VIOLATIONS: list[tuple[str, dict[str, object]]] = [
-    ("key-usage-absent", {"key_usage": False}),
-    ("no-digital-signature", {"digital_signature": False}),
-    ("key-cert-sign", {"key_cert_sign": True}),
-    ("unreadable-empty-eku", {"extended_key_usage": ()}),
-    ("timestamping-too", {"extra_ekus": ("1.3.6.1.5.5.7.3.8",)}),
-    ("ocsp-signing-too", {"extra_ekus": ("1.3.6.1.5.5.7.3.9",)}),
-    ("any-extended-key-usage", {"extra_ekus": ("2.5.29.37.0",)}),
-    ("not-self-issued-without-aki", {"issuer_name": "another issuer"}),
-]
+def test_an_unreadable_extension_set_becomes_a_public_status() -> None:
+    """Lazy certificate parsing is contained at the public hostile-DER boundary.
 
-
-@pytest.mark.parametrize(("label", "keywords"), _PROFILE_VIOLATIONS, ids=[case[0] for case in _PROFILE_VIOLATIONS])
-def test_every_buildable_profile_violation_reaches_verify(label: str, keywords: dict[str, object]) -> None:
-    """The profile is wired to the verdict for every rule, not for one shape of leaf.
-
-    ``check_claim_signing_profile`` is called directly all over ``test_trust.py``, and
-    those tests pass whatever ``_accept_credential`` does with it -- including nothing.
-    Only two marks in this file carry a non-conformant leaf and both use the same one:
-    cA asserted, no EKU. Eight rules were proved at the unit and one on the wire.
-
-    Each row here signs a real document with a leaf breaking exactly one rule and
-    requires ``signingCredential.invalid`` in the verdict, with the diagnosis carried
-    through rather than flattened to a bare code.
-
-    SEVEN OF THE EIGHT FAIL WHEN THE PROFILE CALL IS REMOVED FROM ``_accept_credential``
-    while ``test_trust.py`` stays green -- that asymmetry is the point, since a unit
-    test on the checker cannot see whether anything calls it. ``unreadable-empty-eku``
-    is the exception: an EKU that will not parse is stopped by ``_load_chain``'s
-    hostile-parse boundary first, so that row holds the boundary rather than the
-    wiring. It stays because both must produce the same code from the same document.
+    ``test_trust.py`` owns the full 14.5.1.1 rule matrix. This one distinct wire case
+    proves that an extension which loads but fails when read becomes
+    ``signingCredential.invalid`` rather than escaping ``verify``.
     """
     key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
     signer = Signer(
         private_key=key,
-        # The producer applies the same profile, so every one of these is refused at
-        # construction; the hatch is what lets the VERIFIER be tested against them.
-        certificates=(build_certificate(key, **keywords),),  # pyright: ignore[reportArgumentType] -- one keyword per row, typed by build_certificate
+        certificates=(build_certificate(key, extended_key_usage=()),),
         allow_nonconformant=True,
     )
 
     verdict = verify(mark("Hello world.", signer))
 
-    assert verdict.state is Provenance.INVALID, label
-    assert StatusCode.SIGNING_CREDENTIAL_INVALID in verdict.codes(), label
-    assert StatusCode.SIGNING_CREDENTIAL_UNTRUSTED not in verdict.codes(), label
-    assert [status.explanation for status in verdict.failure if status.explanation], (
-        f"{label}: signingCredential.invalid arrived with no explanation"
-    )
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID in verdict.codes()
+    assert StatusCode.SIGNING_CREDENTIAL_UNTRUSTED not in verdict.codes()
+    assert [status.explanation for status in verdict.failure if status.explanation]
 
 
 def test_the_manifest_is_returned_even_when_validation_fails(signer: Signer) -> None:
@@ -466,7 +903,7 @@ def test_the_verdict_refuses_to_be_a_boolean(marked: str) -> None:
 
 
 def _forge_assertion_swap(victim: str, attacker_text: str) -> str:
-    """Keep the victim's claim bytes AND signature verbatim; swap the assertion store.
+    """Keep the victim's signed claim fields verbatim; swap the assertion store.
 
     THE ATTACK THIS DEFENDS AGAINST. The COSE signature covers only the CLAIM. The
     claim commits to each assertion by a hashed-uri-map. If verify() does not
@@ -474,9 +911,10 @@ def _forge_assertion_swap(victim: str, attacker_text: str) -> str:
     sample of marked text is enough to mint arbitrary text under the victim's
     credential -- escalating to TRUSTED wherever that credential chains to an anchor.
 
-    Note what is NOT rebuilt: ``claim_bytes`` and ``signature`` are copied byte for
-    byte out of the victim's manifest. A forge that rebuilt the claim would fail on
-    the signature and prove nothing about the assertion check.
+    Note what is NOT rebuilt: ``claim_bytes``, the protected header and the signature
+    are copied byte for byte out of the victim's manifest. Only the unsigned COSE pad
+    changes to satisfy the A.8 length equation. A forge that rebuilt the claim would
+    fail on the signature and prove nothing about the assertion check.
     """
     victim_store = extract(victim)
     assert victim_store is not None
@@ -484,15 +922,20 @@ def _forge_assertion_swap(victim: str, attacker_text: str) -> str:
     normalized = unicodedata.normalize("NFC", attacker_text)
     start = len(normalized.encode("utf-8"))
     digest = hashlib.sha256(normalized.encode("utf-8")).digest()
+    parsed_signature = _cose.parse(victim_store.signature)
+    signed = _cose._SignedClaim(
+        protected=parsed_signature.protected,
+        signature=parsed_signature.signature,
+    )
 
-    def build(exclusion_length: int, pad: bytes) -> str:
+    def prepare(exclusion_length: int) -> Callable[[int], str]:
         forged = Assertion(
             label=ASSERTION_HASH_DATA,
             payload={
                 "exclusions": [{"start": start, "length": exclusion_length}],
                 "alg": "sha256",
                 "hash": digest,
-                "pad": pad,
+                "pad": b"",
             },
         )
         # Every OTHER assertion is copied byte for byte from the victim, so its
@@ -510,23 +953,19 @@ def _forge_assertion_swap(victim: str, attacker_text: str) -> str:
             description=DescriptionBox(uuid=UUID_CLAIM, label=LABEL_CLAIM),
             content=((b"cbor", victim_store.claim_bytes),),
         )
-        signature_box = JumbfBox(
-            description=DescriptionBox(uuid=UUID_CLAIM_SIGNATURE, label=LABEL_CLAIM_SIGNATURE),
-            content=((b"cbor", victim_store.signature),),
-        )
-        manifest = JumbfBox(
-            description=DescriptionBox(uuid=UUID_MANIFEST, label=victim_store.manifest_label),
-            content=tuple(
-                (b"jumb", _jumbf.serialize_superbox(box)[8:]) for box in (assertion_store, claim_box, signature_box)
-            ),
-        )
-        store = JumbfBox(
-            description=DescriptionBox(uuid=UUID_MANIFEST_STORE, label=LABEL_MANIFEST_STORE),
-            content=((b"jumb", _jumbf.serialize_superbox(manifest)[8:]),),
-        )
-        return build_wrapper(_jumbf.serialize_superbox(store))
+        boxes = (assertion_store, claim_box)
 
-    wrapper, _ = _fixpoint.solve(build)
+        def assemble(pad: int) -> str:
+            signature = _cose._serialize_signed_claim(signed, pad=pad)
+            return _test_wrapper(
+                boxes,
+                signature,
+                manifest_label=victim_store.manifest_label,
+            )
+
+        return assemble
+
+    wrapper, _ = _fixpoint.solve(prepare)
     return normalized + wrapper
 
 
@@ -559,20 +998,12 @@ def test_an_honest_mark_reports_its_assertions_as_linked(signer: Signer) -> None
     assert StatusCode.ASSERTION_HASHED_URI_MATCH in verdict.codes()
 
 
-def test_a_wrapper_that_is_not_a_suffix_is_rejected(signer: Signer) -> None:
-    """ATTACK: slide the wrapper into the middle of the text via canonical equivalence.
+def test_a_wrapper_that_is_not_a_suffix_is_validated_by_its_exact_range(signer: Signer) -> None:
+    """A.8.4.1 makes suffix placement a producer SHOULD, not a validator condition.
 
-    The exact-span check alone does not stop this. Because the binding removes the
-    wrapper BEFORE normalizing, composition runs across the removed gap, so a
-    canonically-equivalent re-spelling whose prefix has the same byte length at a
-    code-point boundary produces a mid-text wrapper that still matches the declared
-    exclusion, and still hashes to the same bytes.
-
-    Canonical equivalence bounds the visible damage, so this is not content forgery.
-    What it breaks is the invariant the whole design rests on: with the wrapper as a
-    suffix, the 15.12.1.3.1 and A.8.7.3 hash orderings agree BY CONSTRUCTION. Mid-text
-    they do not, so an attacker could mint text this library calls VALID and a
-    conforming peer calls INVALID.
+    This mark keeps the signed UTF-8 range exact and hashes the text left after that
+    range is removed, as 15.12.1.3.1 specifies. The public producer still emits only a
+    suffix.
     """
     marked = embed("éé", signer, DISCLOSURE)
     assert verify(marked).state is Provenance.VALID
@@ -585,22 +1016,22 @@ def test_a_wrapper_that_is_not_a_suffix_is_rejected(signer: Signer) -> None:
     assert len("ée".encode()) == len("éé".encode())
 
     verdict = verify(slid)
-    assert verdict.state is Provenance.INVALID
-    assert StatusCode.DATA_HASH_MALFORMED in verdict.codes()
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.DATA_HASH_MATCH in verdict.codes()
 
 
 def test_a_hostile_trust_anchors_variable_does_not_affect_verify(marked: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    """verify() consults NO ambient configuration, asserted end to end.
-
-    The missing test that let a C2PATXT_TRUST_ANCHORS fallback survive: the old
-    test only proved that IMPORTING the package ignored the variable, never that
-    verify() did. Because the read sat on the signature-valid path, a bad value
-    raised FileNotFoundError or a PEM ValueError for VALID text only -- fine in
-    staging on unmarked inputs, fatal in production on the happy path.
-    """
+    """Public verification reads no ambient trust-anchor configuration."""
     for value in ("/nonexistent/missing.pem", "", "not-a-path"):
         monkeypatch.setenv("C2PATXT_TRUST_ANCHORS", value)
         assert verify(marked).state is Provenance.VALID
+
+
+def test_a_validation_time_with_tzinfo_but_no_offset_is_refused_at_construction() -> None:
+    """A non-``None`` tzinfo does not make a datetime aware by itself."""
+    floating = datetime.datetime(2026, 8, 5, tzinfo=FloatingTimezone())
+    with pytest.raises(ValueError, match="timezone-aware"):
+        VerifyContext(now=floating)
 
 
 @pytest.mark.parametrize(
@@ -628,15 +1059,7 @@ def test_validity_is_judged_at_validation_time(
         Manifest shall be rejected with a failure code of
         claimSignature.outsideValidity."
 
-    The first implementation compared against the time the CLAIM asserted it was
-    signed, reasoning that a mark signed while the credential was live should stay
-    valid after expiry. That reasoning is appealing and is not what the specification
-    says -- provenance across expiry is what sigTst2 time-stamping is for, and we do
-    not implement it. Worse, the asserted time is attacker-supplied, so it made the
-    check self-certifying: the holder of an expired key simply wrote a `when` inside
-    the old window.
-
-    Validation time is injected through VerifyContext so this stays deterministic.
+    ``VerifyContext.now`` supplies the validation instant for deterministic checks.
     """
     context = VerifyContext(now=datetime.datetime(2026, 8, 5, tzinfo=datetime.timezone.utc))
     certificate = build_certificate(
@@ -645,7 +1068,7 @@ def test_validity_is_judged_at_validation_time(
         not_after=datetime.datetime(*not_after, tzinfo=datetime.timezone.utc),
     )
     signer = Signer(private_key=signing_key, certificates=(certificate,))
-    verdict = verify(mark("Hello world.", signer), context=context)
+    verdict = verify(mark("Hello world.", signer, when=certificate.not_valid_before_utc), context=context)
 
     if expected_valid:
         assert verdict.state is Provenance.VALID
@@ -659,15 +1082,9 @@ def test_validity_is_judged_at_validation_time(
 def test_an_expired_credential_cannot_hide_by_omitting_the_actions_assertion(
     signing_key: Ed25519PrivateKey,
 ) -> None:
-    """ATTACK: make the validity check read its reference time out of the manifest.
+    """Certificate validity uses the verifier clock, not an action's claimed time.
 
-    c2pa.actions is attacker-supplied, and when it (or its `when`) was absent the
-    check was SKIPPED -- while still filing claimSignature.insideValidity as a
-    SUCCESS code, affirmatively asserting a validity it had never checked. A
-    certificate expired in 2002 verified VALID in 2026.
-
-    Now the reference time comes from the verifier, so there is nothing in the
-    document for an attacker to set.
+    Omitting the actions assertion cannot skip or backdate the validity check.
     """
     expired = build_certificate(
         signing_key,
@@ -677,7 +1094,8 @@ def test_an_expired_credential_cannot_hide_by_omitting_the_actions_assertion(
     signer = Signer(private_key=signing_key, certificates=(expired,))
     context = VerifyContext(now=datetime.datetime(2026, 8, 5, tzinfo=datetime.timezone.utc))
 
-    verdict = verify(mark("Hello world.", signer), context=context)
+    creation_time = datetime.datetime(2001, 1, 1, tzinfo=datetime.timezone.utc)
+    verdict = verify(mark("Hello world.", signer, when=creation_time), context=context)
     assert verdict.state is Provenance.INVALID
     assert StatusCode.CLAIM_SIGNATURE_OUTSIDE_VALIDITY in verdict.codes()
 
@@ -687,28 +1105,10 @@ def test_an_expired_credential_cannot_hide_by_omitting_the_actions_assertion(
     [b"not a pem at all", b"-----BEGIN CERTIFICATE-----\ntruncated", b"\x00\xff\x00\xff"],
     ids=["garbage", "truncated-pem", "binary"],
 )
-def test_a_malformed_anchor_bundle_fails_the_same_way_for_every_verdict(marked: str, anchors: bytes) -> None:
-    """A malformed bundle must not be a bomb that fires only on the happy path.
-
-    load_anchors is reached only AFTER claimSignature.validated, so an unparseable
-    bundle raised for VALID text while unmarked and invalid text sailed through. That
-    asymmetry is the worst shape a failure can take: it survives every staging test
-    that uses unmarked input and detonates in production on the first good document.
-
-    trust.py's own docstring cites this exact bug as the reason the environment-
-    variable fallback was removed -- the fuse simply moved to anchors_pem.
-
-    Whatever the behaviour is, it must be the SAME for all three states.
-    """
-    outcomes: list[tuple[str, str]] = []
-    for text in (marked, "no mark here", marked.replace("quick", "slow", 1)):
-        try:
-            outcomes.append(("verdict", str(verify(text, context=VerifyContext(anchors_pem=anchors)).state)))
-        except ValueError as exc:  # noqa: PERF203 - the asymmetry IS the thing under test
-            outcomes.append(("raised", type(exc).__name__))
-
-    kinds = {kind for kind, _ in outcomes}
-    assert len(kinds) == 1, f"malformed anchors behaved differently per verdict: {outcomes}"
+def test_a_malformed_anchor_bundle_is_rejected_when_the_context_is_built(anchors: bytes) -> None:
+    """The context validates caller-owned trust material before any document is read."""
+    with pytest.raises(ValueError):
+        VerifyContext(anchors_pem=anchors)
 
 
 @pytest.mark.parametrize("declared", [False, True], ids=["unlinked", "linked"])
@@ -784,107 +1184,16 @@ def test_an_unlinked_assertion_is_rejected_whatever_its_content_type(
         assert StatusCode.ASSERTION_UNDECLARED in verdict.codes()
 
 
-def test_a_claim_that_does_not_link_the_ai_disclosure_is_rejected(signer: Signer) -> None:
-    """THE SINGLE FACT THIS ARTEFACT EXISTS TO CARRY, and nothing tested it.
-
-    A mutation audit replaced ``if any(label not in seen for label in
-    _REQUIRED_ASSERTIONS)`` with ``if False`` and the whole suite stayed green.
-    c2pa.hash.data is caught separately by ``_check_binding``, so the only thing that
-    line actually guards is c2pa.ai-disclosure -- and an EU AI Act Article 50(2) mark
-    whose disclosure is absent has disclosed nothing while still reading as VALID.
-
-    Built by re-signing a claim that links ONLY the hash assertion, so the signature
-    is genuine and the sole defect is the missing commitment.
-    """
-    import hashlib
-    import unicodedata
-
-    from c2patxt import _cose, _fixpoint
-    from c2patxt._selectors import build_wrapper
-    from c2patxt.manifest import (
-        DEFAULT_HASH_ALGORITHM,
-        Assertion,
-        Claim,
-        DescriptionBox,
-        JumbfBox,
-        hashed_uri,
-    )
-
-    text = "Hello world."
-    normalized = unicodedata.normalize("NFC", text)
-    start = len(normalized.encode("utf-8"))
-    digest = hashlib.sha256(normalized.encode("utf-8")).digest()
-
-    def build(exclusion_length: int, pad: bytes) -> str:
-        hash_data = Assertion(
-            label=ASSERTION_HASH_DATA,
-            payload={
-                "exclusions": [{"start": start, "length": exclusion_length}],
-                "alg": DEFAULT_HASH_ALGORITHM,
-                "hash": digest,
-                "pad": pad,
-            },
-        )
-        # ONE created_assertion. No c2pa.ai-disclosure anywhere.
-        claim = Claim(
-            instance_id="xmp:iid:1",
-            claim_generator_name="c2patxt",
-            claim_generator_version=None,
-            created_assertions=(hashed_uri(hash_data.to_box(), f"self#jumbf=c2pa.assertions/{ASSERTION_HASH_DATA}"),),
-            signature_url="self#jumbf=c2pa.signature",
-        )
-        claim_bytes = _cbor.dumps(claim.to_payload())
-
-        assertion_store = JumbfBox(
-            description=DescriptionBox(uuid=UUID_ASSERTION_STORE, label=LABEL_ASSERTION_STORE),
-            content=((b"jumb", _jumbf.serialize_superbox(hash_data.to_box())[8:]),),
-        )
-        claim_box = JumbfBox(
-            description=DescriptionBox(uuid=UUID_CLAIM, label=LABEL_CLAIM),
-            content=((b"cbor", claim_bytes),),
-        )
-        signature_box = JumbfBox(
-            description=DescriptionBox(uuid=UUID_CLAIM_SIGNATURE, label=LABEL_CLAIM_SIGNATURE),
-            content=((b"cbor", _cose.sign_claim(signer, claim_bytes)),),
-        )
-        manifest = JumbfBox(
-            description=DescriptionBox(uuid=UUID_MANIFEST, label="urn:c2pa:" + str(uuid.UUID(int=7))),
-            content=tuple(
-                (b"jumb", _jumbf.serialize_superbox(box)[8:]) for box in (assertion_store, claim_box, signature_box)
-            ),
-        )
-        store = JumbfBox(
-            description=DescriptionBox(uuid=UUID_MANIFEST_STORE, label=LABEL_MANIFEST_STORE),
-            content=((b"jumb", _jumbf.serialize_superbox(manifest)[8:]),),
-        )
-        return build_wrapper(_jumbf.serialize_superbox(store))
-
-    wrapper, _ = _fixpoint.solve(build)
-    verdict = verify(normalized + wrapper)
-
-    assert verdict.state is Provenance.INVALID
-    assert StatusCode.ASSERTION_MISSING in verdict.codes()
-
-
 def test_the_exclusion_must_name_a_located_wrapper_not_merely_be_trailing(signer: Signer) -> None:
-    """The membership test is NOT subsumed by the suffix rule. I claimed it was.
+    """A trailing exclusion must also equal one exact located-wrapper span.
 
-    docs/mutation-audit.md recorded ``(start, length) not in spans`` as an equivalent
-    mutant -- "writing a test for it would mean writing a test that cannot fail" --
-    and an audit disproved it in three lines. Slide the wrapper one WHOLE CODE POINT
-    (3 bytes) earlier and pad the tail by 3: the signed ``start + length ==
-    len(encoded)`` still holds, so the suffix rule passes, while the declared range no
-    longer coincides with any located wrapper.
+    Aligning the shift to a code-point boundary makes the test reach the intended
+    distinction: with the exact-span check, ``assertion.dataHash.malformed``; without
+    it, the input reaches the hash and reports ``assertion.dataHash.mismatch``. A
+    one-byte shift is rejected by the same exact-span check before hashing.
 
-    A one-BYTE shift really is indistinguishable -- it splits U+FEFF, and
-    ``_compare_digest`` catches the resulting UnicodeDecodeError and also returns
-    ``malformed``. Aligning the shift to a code-point boundary is what separates them:
-    with the check, ``assertion.dataHash.malformed``; without it, the input reaches
-    the hash and reports ``assertion.dataHash.mismatch``.
-
-    Both are failures, so this is not a forgery -- but this package treats status codes
-    as load-bearing (vector rule 4: a validator "shall report exactly that code"), and
-    a wrong code sends an investigator looking for a text edit that never happened.
+    Both outcomes are invalid, but the exact-span failure has the clause-specific
+    malformed status rather than a digest mismatch.
     """
     marked = mark("Hello world.", signer)
     encoded = marked.encode("utf-8")
@@ -918,7 +1227,6 @@ def test_a_manifest_that_inherits_its_algorithm_from_the_claim_verifies(signer: 
     import hashlib
 
     from c2patxt import _cose, _fixpoint
-    from c2patxt._selectors import build_wrapper
     from c2patxt.manifest import (
         DEFAULT_HASH_ALGORITHM,
         Assertion,
@@ -933,11 +1241,11 @@ def test_a_manifest_that_inherits_its_algorithm_from_the_claim_verifies(signer: 
     start = len(normalized.encode("utf-8"))
     digest = hashlib.sha256(normalized.encode("utf-8")).digest()
 
-    def build(exclusion_length: int, pad: bytes) -> str:
+    def prepare(exclusion_length: int) -> Callable[[int], str]:
         payload: dict[str, object] = {
             "exclusions": [{"start": start, "length": exclusion_length}],
             "hash": digest,
-            "pad": pad,
+            "pad": b"",
         }
         if omit not in {"hash-data", "both"}:
             payload["alg"] = DEFAULT_HASH_ALGORITHM
@@ -965,22 +1273,19 @@ def test_a_manifest_that_inherits_its_algorithm_from_the_claim_verifies(signer: 
                 description=DescriptionBox(uuid=UUID_CLAIM, label=LABEL_CLAIM),
                 content=((b"cbor", claim_bytes),),
             ),
-            JumbfBox(
-                description=DescriptionBox(uuid=UUID_CLAIM_SIGNATURE, label=LABEL_CLAIM_SIGNATURE),
-                content=((b"cbor", _cose.sign_claim(signer, claim_bytes)),),
-            ),
         )
-        manifest = JumbfBox(
-            description=DescriptionBox(uuid=UUID_MANIFEST, label="urn:c2pa:" + str(uuid.UUID(int=7))),
-            content=tuple((b"jumb", _jumbf.serialize_superbox(box)[8:]) for box in boxes),
-        )
-        store = JumbfBox(
-            description=DescriptionBox(uuid=UUID_MANIFEST_STORE, label=LABEL_MANIFEST_STORE),
-            content=((b"jumb", _jumbf.serialize_superbox(manifest)[8:]),),
-        )
-        return build_wrapper(_jumbf.serialize_superbox(store))
+        signed = _cose._prepare_signed_claim(signer, claim_bytes)
 
-    wrapper, _ = _fixpoint.solve(build)
+        def assemble(pad: int) -> str:
+            return _test_wrapper(
+                boxes,
+                _cose._serialize_signed_claim(signed, pad=pad),
+                manifest_label="urn:c2pa:00000000-0000-4000-8000-000000000007",
+            )
+
+        return assemble
+
+    wrapper, _ = _fixpoint.solve(prepare)
     verdict = verify(normalized + wrapper)
 
     # THE ASSERTION IS THE ABSENCE of algorithm.unsupported, plus a matching binding.
@@ -991,8 +1296,7 @@ def test_a_manifest_that_inherits_its_algorithm_from_the_claim_verifies(signer: 
     assert StatusCode.DATA_HASH_MATCH in verdict.codes()
 
     # This hand-built manifest carries only the hard binding, so it is INVALID for a
-    # different and correct reason: _REQUIRED_ASSERTIONS also demands the AI
-    # disclosure. Asserted so the test cannot quietly start passing for that reason.
+    # different and correct reason: the required actions assertion is absent.
     assert StatusCode.ASSERTION_MISSING in verdict.codes()
 
 
@@ -1029,17 +1333,9 @@ def test_the_claims_signature_uri_is_resolved_not_assumed(
     Manifest box (as the claim), then the claim shall be rejected with a failure code
     of `claimSignature.missing`."
 
-    We resolved nothing. The parse found the signature box BY LABEL and verification
-    used whatever it found, so the claim's own field was read once for presence
-    (15.6.2) and never again. A claim naming an https URL verified happily against the
-    box we happened to be holding.
-
-    THE PRODUCER IS WHAT THIS PATCHES, deliberately. The URI lives inside the signed
-    claim bytes, so the threat is not an outsider rewriting the field -- it is a
-    producer, possibly a future version of us, emitting a claim that points somewhere
-    else while a validator never checks. Patching the constant and re-running the real
-    ``mark`` pipeline means the fixpoint re-solves the exclusion for each URL length
-    and every other property of the mark stays genuine.
+    The test changes the producer's signed URI and reruns the full mark pipeline. A URI
+    that does not resolve to the carried signature box must yield
+    ``claimSignature.missing``.
 
     THE TWO TRUSTED ROWS ARE THE CONTROL, and they are why this test can fail in both
     directions: 8.4.2.1 allows the store-relative form for this field exactly as it
@@ -1052,13 +1348,17 @@ def test_the_claims_signature_uri_is_resolved_not_assumed(
     # conftest's producer pins the manifest UUID, which is what lets the
     # store-relative row name the manifest it belongs to. Every other row ignores it.
     monkeypatch.setattr(
-        manifest_module, "CLAIM_SIGNATURE_URI", url.format(label=f"urn:c2pa:{uuid.UUID(int=7)}"), raising=True
+        manifest_module,
+        "CLAIM_SIGNATURE_URI",
+        url.format(label="urn:c2pa:00000000-0000-4000-8000-000000000007"),
+        raising=True,
     )
     marked = mark("Hello world.", signer)
 
+    evaluator = RecordingTrustEvaluator(trusted=True)
     context = VerifyContext(
         anchors_pem=signing_certificate.public_bytes(Encoding.PEM),
-        trust_evaluator=_AcceptAnchoredEvaluator(),
+        trust_evaluator=evaluator,
     )
     verdict = verify(marked, context=context)
 
@@ -1073,17 +1373,8 @@ def test_an_undeclared_assertion_gets_its_own_code(signer: Signer) -> None:
     arrays in the claim (or the assertions array in the v1 claim), the claim shall be
     rejected with a failure code of `assertion.undeclared`."
 
-    We rejected it -- ``test_an_unlinked_assertion_is_rejected_whatever_its_content_type``
-    proves that, and it is the guard that closed a total break -- but we reported
-    ``assertion.missing``, which is the code for the OPPOSITE condition: the claim
-    names an assertion the store does not hold. Here the store holds one the claim
-    never named.
-
-    The distinction is diagnostic, and this package treats status codes as
-    load-bearing (vector rule 4: a validator "shall report exactly that code"). Told
-    ``assertion.missing``, an operator looks for a truncated store and finds nothing
-    wrong with it. Told ``assertion.undeclared``, they look for the extra box -- which
-    is the one an attacker put there.
+    ``assertion.missing`` is the opposite condition: the claim names an assertion the
+    store lacks. Here the store holds an assertion the claim never names.
     """
     from c2patxt import _jumbf
     from c2patxt._extract import _reparse, parse_manifest_store
@@ -1183,9 +1474,16 @@ def store(signer: Signer) -> ManifestStore:
     return parsed
 
 
-#: A CBOR map as the decoder produces one. CBOR admits integer and byte-string keys,
-#: so this is wider than ``dict[str, ...]`` and is what a ``CborValue`` slot accepts.
-CborMap = dict[int | str | bytes, _cbor.CborValue]
+#: A CBOR map as the decoder produces one. Every CBOR item may be a key; ``MapKey``
+#: preserves those Python cannot use directly in a dict.
+CborMap = dict[_cbor.CborKey, _cbor.CborValue]
+
+
+def _copy_cbor_map(
+    mapping: dict[int | str | bytes, _cbor.CborValue] | dict[_cbor.CborKey, _cbor.CborValue],
+) -> CborMap:
+    """Copy either decoded-map branch into the generic key type."""
+    return {key: value for key, value in mapping.items()}
 
 
 def _widen(mapping: dict[str, _cbor.CborValue]) -> CborMap:
@@ -1198,9 +1496,20 @@ def _widen(mapping: dict[str, _cbor.CborValue]) -> CborMap:
     return {key: value for key, value in mapping.items()}
 
 
+def _is_string_cbor_map(value: object) -> TypeGuard[dict[str, _cbor.CborValue]]:
+    """Recognize the string-keyed, writer-supported CBOR maps these mutators edit."""
+    try:
+        decoded = _cbor.loads(_cbor.dumps(value))
+    except (TypeError, ValueError):
+        return False
+    return isinstance(decoded, dict) and all(isinstance(key, str) for key in decoded)
+
+
 #: 8.4.2.1's store-relative form, naming THIS manifest: the shape of the spec's
-#: own Example 1, which conftest pins to uuid.UUID(int=7).
-_STORE_RELATIVE = f"self#jumbf=/c2pa/urn:c2pa:{uuid.UUID(int=7)}/c2pa.assertions/{ASSERTION_AI_DISCLOSURE}"
+#: own Example 1, naming the version-4 UUID pinned by conftest.
+_STORE_RELATIVE = (
+    f"self#jumbf=/c2pa/urn:c2pa:00000000-0000-4000-8000-000000000007/c2pa.assertions/{ASSERTION_AI_DISCLOSURE}"
+)
 
 
 def _icon(
@@ -1288,38 +1597,56 @@ def test_a_hashed_uri_reference_follows_the_15_10_3_3_procedure(
 
     External references are passed over rather than failed: the clause scopes external
     validation to a resource "the validator chooses to retrieve", and this package
-    retrieves none. An external reference is recognised by having a URI SCHEME, matched
-    against RFC 3986's production -- three mutations of which survived the whole suite:
-    ``.match`` to ``.search``, ``[A-Za-z]`` to ``[A-Za-z0-9]``, and dropping ``+.-``
-    from the trailing class. The rows pin the production, not the four strings the
-    branch was originally written for.
+    retrieves none. An external reference is recognised by an RFC 3986 URI scheme;
+    the rows cover its initial-letter and ``+.-`` rules.
 
-    ``store-relative-resolves`` is 8.4.2.1's second URI shape, the specification's own
-    Example 1; with only the negative row, sending every store-relative URL down the
-    external branch survived. ``alg-inherited-from-the-claim`` is the 15.4.2 control.
+    ``store-relative-resolves`` is 8.4.2.1's second URI shape, from the specification's
+    Example 1. ``alg-inherited-from-the-claim`` is the 15.4.2 control.
     """
     reference = _icon(store, drop=drop, **overrides)
 
     assert _verify._reference_status(reference, store, {}) is expected
 
 
-def test_the_claim_generators_icon_is_actually_validated(store: ManifestStore) -> None:
-    """The wiring, not the procedure: 15.6.2 routes ``claim_generator_info.icon``
-    through 15.10.3.3, and a procedure nothing calls validates nothing.
+def _embedded_icon_box() -> JumbfBox:
+    """A C2PA 18.12 embedded-data assertion carrying one SVG icon.
 
-    The claim is rebuilt with an icon whose hash is wrong and the store re-checked.
-    We do not EMIT an icon, so this is read-side only -- but a third party's claim may
-    carry one, and a manifest we call VALID must not contain an unverified reference.
+    ISO/IEC 19566-5 Annex B defines the ``bfdb`` payload as an eight-bit toggle
+    followed by a NUL-terminated media type and an optional NUL-terminated file name.
+    Zero means embedded, with no file name. ``bidb`` carries the file bytes.
     """
-    generator = store.claim["claim_generator_info"]
-    assert isinstance(generator, dict)
-    poisoned: CborMap = {**generator, "icon": _widen(_icon(store, hash=b"\x00" * 32))}
-    broken = {**store.claim, "claim_generator_info": poisoned}
+    return JumbfBox(
+        description=DescriptionBox(
+            uuid=bytes.fromhex("40CB0C32BB8A489DA70B2AD6F47F4369"),
+            label="c2pa.icon",
+            requestable=True,
+        ),
+        content=((b"bfdb", b"\x00image/svg+xml\x00"), (b"bidb", b"<svg/>")),
+    )
 
-    verdict, ok = _verify._check_assertions(dataclasses.replace(store, claim=broken), Verdict(state=Provenance.INVALID))
 
-    assert not ok
-    assert StatusCode.HASHED_URI_MISMATCH in verdict.codes()
+@pytest.mark.parametrize("matches", [True, False], ids=["matching", "mismatching"])
+def test_the_claim_generators_embedded_icon_is_validated_on_signed_wire(signer: Signer, matches: bool) -> None:
+    """C2PA 15.6.2 routes a present generator icon through reference validation."""
+    icon_box = _embedded_icon_box()
+    digest = hashlib.sha256(_jumbf.serialize_superbox(icon_box)[8:]).digest()
+
+    def add_icon(_items: list[Assertion], claim: dict[str, object]) -> None:
+        generator = claim["claim_generator_info"]
+        assert isinstance(generator, dict)
+        claim["claim_generator_info"] = {
+            **generator,
+            "icon": _icon_reference(
+                "self#jumbf=c2pa.assertions/c2pa.icon",
+                digest if matches else b"\x00" * 32,
+            ),
+        }
+
+    verdict = verify(_resigned(signer, add_icon, extra_assertions=(icon_box,)))
+
+    assert verdict.state is (Provenance.VALID if matches else Provenance.INVALID)
+    assert (StatusCode.HASHED_URI_MISMATCH in verdict.codes()) is not matches
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
 
 
 @pytest.mark.parametrize("poisoned", [0, 1], ids=["first", "second"])
@@ -1328,7 +1655,7 @@ def test_the_claim_generators_icon_is_actually_validated(store: ManifestStore) -
     ["softwareAgent", "softwareAgents", "templates"],
     ids=["softwareAgent", "softwareAgents", "templates"],
 )
-def test_an_actions_assertion_icon_is_validated_too(store: ManifestStore, site: str, poisoned: int) -> None:
+def test_an_actions_assertion_icon_is_validated_too(signer: Signer, site: str, poisoned: int) -> None:
     """C2PA 15.10.3.2.3 routes three more icons through the same 15.10.3.3 procedure:
 
     > "If there is a `softwareAgent` field in the action-common-map-v2 or one or more
@@ -1344,17 +1671,16 @@ def test_an_actions_assertion_icon_is_validated_too(store: ManifestStore, site: 
     singular field on one ACTION: different fields at different depths, which is why a
     single collector has to walk both.
 
-    THE SECOND ELEMENT IS THE POINT OF THE ``poisoned`` PARAMETER. Every earlier version
-    of this test used single-element lists, so each of the three loops ran exactly one
-    iteration -- and truncating ``_as_list`` to ``value[:1]``, which would leave a
-    poisoned icon anywhere past the first entry inside a manifest we call VALID, left
-    the whole suite green. A loop exercised once is not a loop under test.
+    The second element is the discriminating input: every list member must be checked,
+    not only the first.
 
     The actions assertion is otherwise conforming, ``digitalSourceType`` included, so
     the icon is the only defect and the test keeps discriminating as other rules tighten.
     """
-    good = _widen(_icon(store))
-    bad = _widen(_icon(store, hash=b"\x00" * 32))
+    icon_box = _embedded_icon_box()
+    digest = hashlib.sha256(_jumbf.serialize_superbox(icon_box)[8:]).digest()
+    good = _icon_reference("self#jumbf=c2pa.assertions/c2pa.icon", digest)
+    bad = _icon_reference("self#jumbf=c2pa.assertions/c2pa.icon", b"\x00" * 32)
     icons = [good, good]
     icons[poisoned] = bad
 
@@ -1371,11 +1697,12 @@ def test_an_actions_assertion_icon_is_validated_too(store: ManifestStore, site: 
     if site == "templates":
         payload["templates"] = [{"action": "*", "icon": icons[0]}, {"action": "c2pa.edited", "icon": icons[1]}]
 
-    verdict, ok = _verify._check_assertions(
-        _with_assertion(store, ASSERTION_ACTIONS, payload), Verdict(state=Provenance.INVALID)
-    )
+    def add_actions(items: list[Assertion], _claim: dict[str, object]) -> None:
+        items[0] = Assertion(label=ASSERTION_ACTIONS, payload=payload)
 
-    assert not ok, f"a poisoned icon at index {poisoned} of {site} was accepted"
+    verdict = verify(_resigned(signer, add_actions, extra_assertions=(icon_box,)))
+
+    assert verdict.state is Provenance.INVALID, f"a poisoned icon at index {poisoned} of {site} was accepted"
     assert StatusCode.HASHED_URI_MISMATCH in verdict.codes()
 
 
@@ -1471,12 +1798,6 @@ def test_an_assertion_declared_in_gathered_assertions_is_declared(
     And the rule #82 quotes: an assertion is undeclared only if it is "not referenced by
     an element of **either** the created_assertions **or** gathered_assertions arrays".
 
-    WE READ ONLY created_assertions, so a conforming manifest whose extra assertion was
-    gathered rather than created was REJECTED. #82 made that worse rather than better:
-    the same manifest previously failed as ``assertion.missing`` and now failed as
-    ``assertion.undeclared`` — a code positively asserting the claim never named the
-    box, when the claim named it in the other array. A more confident wrong answer.
-
     ``claim-map-v2`` declares the field ``? "gathered_assertions": [1* $hashed-uri-map]``
     — optional, and non-empty **if present**, which is why ``empty-list`` is
     ``claim.malformed`` rather than simply ignored. ``wrong-hash`` is the control that
@@ -1517,92 +1838,44 @@ def test_an_assertion_declared_in_gathered_assertions_is_declared(
         assert expected in verdict.codes()
 
 
-def test_the_required_assertions_must_be_created_not_merely_gathered(store: ManifestStore) -> None:
-    """18.15.2: "There shall be at least one actions assertion present in the
-    **created_assertions** array", and the 2.4 change log: "Required that the mandatory
-    actions assertion appear only in created_assertions (not gathered_assertions)."
+def test_each_matched_claim_link_records_its_original_url_in_order(store: ManifestStore) -> None:
+    """15.10.3.1 records one success per created or gathered hashed URI."""
+    created = store.claim["created_assertions"]
+    assert isinstance(created, list)
+    duplicate = next(
+        link
+        for link in created
+        if isinstance(link, dict) and str(link.get("url", "")).endswith(ASSERTION_AI_DISCLOSURE)
+    )
+    claim = {
+        **store.claim,
+        "created_assertions": [*created, duplicate],
+        "gathered_assertions": [duplicate],
+    }
 
-    THE REASON GENERALISES TO ALL THREE REQUIRED ASSERTIONS. An AI disclosure a producer
-    merely GATHERED from somewhere else is not that producer disclosing anything — it is
-    them repeating someone else's disclosure — and an EU AI Act Article 50(2) mark that
-    accepted a second-hand disclosure would attest to the wrong party. The same holds
-    for the hard binding: a gathered binding binds another asset.
+    verdict, ok = _verify._check_assertions(dataclasses.replace(store, claim=claim), Verdict(state=Provenance.INVALID))
 
-    So widening the undeclared check to gathered assertions must not widen the REQUIRED
-    check with it, and this is the test that keeps the two apart.
-    """
-    links = store.claim["created_assertions"]
-    assert isinstance(links, list)
+    assert ok
+    expected = [link["url"] for link in [*created, duplicate, duplicate] if isinstance(link, dict)]
+    actual = [status.url for status in verdict.success if status.code is StatusCode.ASSERTION_HASHED_URI_MATCH]
+    assert actual == expected
 
-    def names_the_disclosure(link: _cbor.CborValue) -> bool:
-        return isinstance(link, dict) and ASSERTION_AI_DISCLOSURE in str(link.get("url", ""))
 
-    moved = [link for link in links if not names_the_disclosure(link)]
-    kept = [link for link in links if names_the_disclosure(link)]
+def test_hash_matches_before_a_later_link_failure_are_not_discarded(store: ManifestStore) -> None:
+    """A later mismatch invalidates the claim but not the matches already established."""
+    created = store.claim["created_assertions"]
+    assert isinstance(created, list)
+    good: list[CborMap] = [_copy_cbor_map(link) for link in created if isinstance(link, dict)]
+    assert len(good) == len(created)
+    damaged = {**good[-1], "hash": b"\x00" * 32}
+    claim = {**store.claim, "created_assertions": [*good[:-1], damaged]}
 
-    claim = {**store.claim, "created_assertions": moved, "gathered_assertions": kept}
     verdict, ok = _verify._check_assertions(dataclasses.replace(store, claim=claim), Verdict(state=Provenance.INVALID))
 
     assert not ok
-    assert StatusCode.ASSERTION_MISSING in verdict.codes()
-
-
-def test_a_generator_icon_can_now_actually_resolve(store: ManifestStore) -> None:
-    """The match path of 15.10.3.3, which was unreachable when it was written.
-
-    An icon is "a hashed URI ... to an embedded data assertion whose label is
-    `c2pa.icon`" (10.2.3.2), and an embedded data assertion carries `bfdb`/`bidb`
-    content boxes rather than `cbor`. Until the parse accepted those, every real icon
-    resolved to ``hashedURI.missing`` and the success branch could not be reached by any
-    input at all -- a check that only ever fails is not a check.
-
-    THE FIXTURE IS A GENUINE `bfdb`/`bidb` SUPERBOX, serialized the way the assertion
-    store carries one. A loose byte string leaves this green under a parse that rejects
-    non-`cbor` assertions -- it would assert the match path over an input the parse can
-    never deliver.
-
-    Both directions are asserted from the same fixture: the right digest resolves, the
-    wrong one is a mismatch. That is what makes this a test of the match path rather
-    than of the parse.
-    """
-    from c2patxt import _jumbf
-    from c2patxt._extract import parse_manifest_store
-
-    # A REAL EMBEDDED-DATA ASSERTION, not loose bytes. assertion_bytes values are
-    # serialized superbox payloads -- a jumd description box followed by content boxes --
-    # so a raw blob here would be a value no parse can produce, and this test would be
-    # proving the match path reachable using an input that cannot reach it.
-    label = "c2pa.icon"
-    icon_box = JumbfBox(
-        description=DescriptionBox(uuid=_jumbf.UUID_CBOR, label=label, requestable=True),
-        content=((b"bfdb", b"image/svg+xml\x00"), (b"bidb", b"<svg/>")),
-    )
-    digest = hashlib.sha256(_jumbf.serialize_superbox(icon_box)[8:]).digest()
-    generator = store.claim["claim_generator_info"]
-    links = store.claim["created_assertions"]
-    assert isinstance(generator, dict)
-    assert isinstance(links, list)
-
-    # PARSED FROM REAL BYTES, so the icon assertion has to survive _parse_assertions --
-    # which is the change under test. Restoring the pre-#89 rejection of non-cbor
-    # assertions now makes this raise during the parse rather than leaving the test green.
-    parsed = parse_manifest_store(_store_with_box(store, icon_box))
-
-    def build(icon_hash: bytes) -> ManifestStore:
-        icon: CborMap = {"url": f"self#jumbf=c2pa.assertions/{label}", "hash": icon_hash, "alg": "sha256"}
-        claim = {
-            **parsed.claim,
-            "claim_generator_info": {**generator, "icon": icon},
-            "created_assertions": [*links, {"url": f"self#jumbf=c2pa.assertions/{label}", "hash": digest}],
-        }
-        return dataclasses.replace(parsed, claim=claim)
-
-    _, resolved = _verify._check_assertions(build(digest), Verdict(state=Provenance.INVALID))
-    verdict, rejected = _verify._check_assertions(build(b"\x00" * 32), Verdict(state=Provenance.INVALID))
-
-    assert resolved, "an icon whose digest matches must verify"
-    assert not rejected
-    assert StatusCode.HASHED_URI_MISMATCH in verdict.codes()
+    actual = [status.url for status in verdict.success if status.code is StatusCode.ASSERTION_HASHED_URI_MATCH]
+    assert actual == [link["url"] for link in good[:-1]]
+    assert StatusCode.ASSERTION_HASHED_URI_MISMATCH in verdict.codes()
 
 
 @pytest.mark.parametrize(
@@ -1614,60 +1887,21 @@ def test_a_generator_icon_can_now_actually_resolve(store: ManifestStore) -> None
     ids=["the-first-instant", "one-microsecond-before"],
 )
 def test_the_validity_window_includes_its_own_endpoints(
-    signing_certificate: x509.Certificate, offset: datetime.timedelta, inside: bool
+    signing_key: Ed25519PrivateKey,
+    signing_certificate: x509.Certificate,
+    offset: datetime.timedelta,
+    inside: bool,
 ) -> None:
-    """Both comparisons in ``_chain_inside_validity`` are ``<=``, and no test used
-    either endpoint EXACTLY -- so ``<=`` → ``<`` on the lower bound survived the whole
-    suite.
-
-    A certificate is valid at the first instant of its window and at the last. Judging
-    the first as outside would reject a freshly issued credential during the second it
-    becomes usable, which is a real operational failure and an invisible one: it would
-    look like a clock problem.
-
-    Both endpoints are checked, one microsecond either side, against the certificate's
-    own ``not_valid_before_utc`` and ``not_valid_after_utc`` rather than against a
-    literal, so the test follows the fixture if its dates ever move.
-    """
-    from c2patxt import _verify as verify_module
-
-    chain = [signing_certificate]
+    """C2PA 15.8.2 includes both certificate-validity endpoints."""
     lower = signing_certificate.not_valid_before_utc
     upper = signing_certificate.not_valid_after_utc
+    signer = Signer(private_key=signing_key, certificates=(signing_certificate,))
+    marked = mark("Hello world.", signer, when=WHEN)
 
-    assert verify_module._chain_inside_validity(chain, lower + offset) is inside
-    assert verify_module._chain_inside_validity(chain, upper - offset) is inside
-
-
-@pytest.mark.parametrize("expired", ["leaf", "issuer"], ids=["leaf", "issuer"])
-def test_the_whole_chain_must_be_inside_its_validity_period(
-    signing_key: Ed25519PrivateKey, signing_certificate: x509.Certificate, expired: str
-) -> None:
-    """C2PA 15.8.2: "the C2PA Manifest is valid if the current time at validation is
-    within the validity period of the signer's certificate **and all CA certificates up
-    to the trust anchor**."
-
-    WE CHECKED THE LEAF ONLY, and the docstring quoting this clause stopped at exactly
-    the words it omitted -- a quotation that ends where it becomes inconvenient is worse
-    than no quotation, because it reads as evidence.
-
-    An expired intermediate is the realistic case, not a contrived one: leaves are
-    short-lived and rotated, CAs are long-lived and forgotten. A chain whose CA lapsed
-    is one nobody is maintaining, and RFC 5280 §6 path validation would reject it -- so
-    accepting it here means we are more permissive than the chain builder we tell
-    integrators to plug in.
-    """
-    from c2patxt import _verify as verify_module
-
-    lapsed = datetime.datetime(2026, 2, 1, tzinfo=datetime.timezone.utc)
-    stale = build_certificate(signing_key, common_name="c2patxt test ca", not_after=lapsed)
-    chain = [stale if expired == "leaf" else signing_certificate, stale]
-
-    after = datetime.datetime(2026, 3, 1, tzinfo=datetime.timezone.utc)
-    inside = datetime.datetime(2026, 1, 15, tzinfo=datetime.timezone.utc)
-
-    assert not verify_module._chain_inside_validity(chain, after)
-    assert verify_module._chain_inside_validity(chain, inside), "the control: both are valid before the CA lapses"
+    for instant in (lower + offset, upper - offset):
+        verdict = verify(marked, context=VerifyContext(now=instant))
+        assert (verdict.state is Provenance.VALID) is inside
+        assert (StatusCode.CLAIM_SIGNATURE_OUTSIDE_VALIDITY in verdict.codes()) is not inside
 
 
 def test_an_icon_in_a_second_actions_assertion_is_checked_too(store: ManifestStore) -> None:
@@ -1707,61 +1941,6 @@ def test_an_icon_in_a_second_actions_assertion_is_checked_too(store: ManifestSto
     assert StatusCode.HASHED_URI_MISMATCH in verdict.codes()
 
 
-@pytest.mark.parametrize(
-    ("payload", "ok"),
-    [
-        ({"modelType": "c2pa.types.model"}, True),
-        ({"modelType": "c2pa.types.model.pytorch", "modelName": "m"}, True),
-        ({"modelType": "c2pa.types.model.openvino.topology"}, True),
-        ({}, False),
-        ({"modelType": ""}, False),
-        ({"modelType": "c2pa.types.model.generative"}, True),
-        ({"modelType": "ai.duale.types.model.generative"}, True),
-        ({"modelType": "com.example.model"}, True),
-        ({"modelType": 7}, False),
-        ({"modelType": None}, False),
-        ({"junk": 1}, False),
-        (["not a map"], False),
-        ("not a map either", False),
-        (None, False),
-    ],
-    ids=[
-        "generic",
-        "a-real-framework",
-        "a-value-we-never-emit",
-        "no-modelType",
-        "empty-modelType",
-        "the-string-we-used-to-emit",
-        "entity-namespaced",
-        "a-vendor-value",
-        "modelType-not-a-string",
-        "modelType-null",
-        "some-other-field",
-        "an-array",
-        "a-string",
-        "absent-from-the-store",
-    ],
-)
-def test_the_disclosure_must_actually_disclose(store: ManifestStore, payload: _cbor.CborValue, ok: bool) -> None:
-    """C2PA 18.28.2: `modelType` "shall be present" in the ai-model-disclosure-map.
-
-    WE CHECKED THE LABEL AND NEVER READ THE PAYLOAD. `_store_shape_status` required
-    `c2pa.ai-disclosure` to appear in the claim's links and stopped, so a disclosure of
-    `{}` -- or `{"junk": 1}`, or a CBOR array -- was linked, hash-matched and VALID.
-    This artefact exists under EU AI Act Article 50(2) to carry one fact, and a mark
-    carrying none of it was indistinguishable from one that did.
-
-    Third occurrence of this shape: a required assertion whose PRESENCE was checked and
-    whose CONTENT was not.
-    """
-    tampered = dataclasses.replace(store, assertions={**store.assertions, ASSERTION_AI_DISCLOSURE: payload})
-    verdict, accepted = _verify._check_assertions(tampered, Verdict(state=Provenance.INVALID))
-
-    assert accepted is ok
-    if not ok:
-        assert StatusCode.GENERAL_ERROR in verdict.codes()
-
-
 def _restore_manifest(original: ManifestStore, rebuild: Callable[[JumbfBox], tuple[tuple[bytes, bytes], ...]]) -> str:
     """Re-wrap a manifest store whose boxes have been rebuilt by ``rebuild``.
 
@@ -1799,29 +1978,29 @@ def _restore_manifest(original: ManifestStore, rebuild: Callable[[JumbfBox], tup
         ("claim-without-cbor", StatusCode.CLAIM_MISSING),
         ("assertion-cbor", StatusCode.ASSERTION_CBOR_INVALID),
         ("metadata-json", StatusCode.ASSERTION_JSON_INVALID),
-        ("duplicate-label", StatusCode.CLAIM_MULTIPLE),
+        ("duplicate-label", StatusCode.ASSERTION_MISSING),
+        ("duplicate-claim", StatusCode.CLAIM_MULTIPLE),
     ],
-    ids=["claim-cbor", "no-claim-box", "claim-without-cbor", "assertion-cbor", "metadata-json", "duplicate-label"],
+    ids=[
+        "claim-cbor",
+        "no-claim-box",
+        "claim-without-cbor",
+        "assertion-cbor",
+        "metadata-json",
+        "duplicate-label",
+        "duplicate-claim",
+    ],
 )
-def test_verify_reports_the_parse_code_a_third_party_would_see(
-    signer: Signer, damage: str, expected: StatusCode
-) -> None:
-    """Every parse failure carries a specific code, and NOTHING checked that ``verify``
-    passes it on.
+def test_verify_reports_the_specific_parse_code(signer: Signer, damage: str, expected: StatusCode) -> None:
+    """Every parse failure reaches public ``verify`` with its specific code.
 
-    Replacing ``verify``'s ``return verdict._add(exc.code)`` with a fixed
-    ``manifest.text.corruptedWrapper`` leaves the whole suite green. So the entire
-    ``MarkCorruptError.code`` mechanism -- which ``exceptions.py`` justifies at length,
-    and which two of today's tasks extended with four new codes -- was asserted only as
-    an exception attribute, never as something a caller of ``verify`` receives.
-
-    THE DISTINCTION IS THE WHOLE POINT OF THOSE CODES. ``manifest.text.corruptedWrapper``
+    ``manifest.text.corruptedWrapper``
     is 15.12.1.3.2's code for a wrapper with an "invalid version, algorithm, or manifest
     length" -- damage to the selector run. Every case here is an intact wrapper around a
     manifest that is wrong INSIDE, and reporting the carrier's code sends an investigator
     hunting text corruption that is not there.
 
-    Driven through the PUBLIC entry point on purpose. The parse-level tests in
+    Driven through the public entry point. The parse-level tests in
     ``test_extract.py`` assert ``MarkCorruptError.code`` and are right to; this asserts
     the one thing they cannot, which is that the code survives the trip into a
     ``Verdict``.
@@ -1847,13 +2026,22 @@ def test_verify_reports_the_parse_code_a_third_party_would_see(
             if damage in {"assertion-cbor", "metadata-json", "duplicate-label"} and label == LABEL_ASSERTION_STORE:
                 child = _damage_store(child, damage, ASSERTION_METADATA)
             out.append((tbox, _jumbf.serialize_superbox(child)[8:]))
+            if damage == "duplicate-claim" and label == LABEL_CLAIM:
+                out.append((tbox, _jumbf.serialize_superbox(child)[8:]))
         return tuple(out)
 
-    verdict = verify(_restore_manifest(original, rebuild))
+    damaged = _restore_manifest(original, rebuild)
+    with pytest.raises(MarkCorruptError) as caught:
+        extract(damaged)
+    assert caught.value.code is expected
+
+    verdict = verify(damaged)
 
     assert verdict.state is Provenance.INVALID
     assert expected in verdict.codes()
     assert StatusCode.TEXT_CORRUPTED_WRAPPER not in verdict.codes(), "the carrier is intact; only the manifest is not"
+    if expected is StatusCode.CLAIM_MULTIPLE:
+        assert StatusCode.GENERAL_ERROR not in verdict.codes()
 
 
 def _damage_store(store: JumbfBox, damage: str, metadata_label: str) -> JumbfBox:
@@ -1878,28 +2066,9 @@ def test_a_second_hard_binding_is_rejected_by_the_store_check(store: ManifestSto
     """C2PA 15.10.1.2: "If there is more than one such assertion, the manifest shall be
     rejected with a failure code of `assertion.multipleHardBindings`."
 
-    ``StatusCode.ASSERTION_MULTIPLE_HARD_BINDINGS`` APPEARED IN NO TEST FILE AT ALL. The
-    only coverage was ``test_hard_bindings_are_counted_across_the_instance_convention``,
-    which asserts the COUNTER returns 2 and 3 for a hand-built dict of labels. Nothing
-    ever drove a two-binding store through ``_check_assertions``, so the rule was proved
-    only about arithmetic -- and both ``> 1`` → ``if False`` and ``> 1`` → ``> 2``
-    survived the whole suite.
-
-    WHAT THE RULE IS FOR, from ``_count_hard_bindings``' own docstring:
-    ``ManifestStore.hash_data`` looks up the EXACT label, so a second binding under
-    ``__N`` was invisible -- the verifier bound against the first and ignored the rest,
-    "the 'different consumers read different claims' failure refused elsewhere in this
-    package". That refusal is what had no test.
-
-    THE SECOND BOX IS A REAL ONE, relabelled and re-serialized, not the first one's bytes
-    under a second key. Two labels mapping to byte-identical payloads is a state the
-    parser refuses outright -- both would decode to the same label and
-    ``_children_with_bytes`` rejects duplicates -- so a fixture built that way would be
-    testing a shape no input can reach.
-
-    The manifest is otherwise COMPLETE. A minimal store reports ``assertion.missing``
-    instead, because the required-assertion check runs first, so completeness is what
-    makes the assertion about this rule rather than that one.
+    The second box is relabelled and re-serialized so the parsed store contains two
+    reachable hard bindings. The otherwise complete manifest isolates this rule from
+    the earlier required-assertion check.
     """
     from c2patxt import _jumbf
     from c2patxt._extract import _reparse
@@ -1961,82 +2130,95 @@ def test_a_second_hard_binding_is_rejected_by_the_store_check(store: ManifestSto
     ids=["before-the-ca-lapses", "after-the-ca-lapses"],
 )
 def test_an_expired_intermediate_invalidates_the_mark(
-    signing_key: Ed25519PrivateKey, signing_certificate: x509.Certificate, when: datetime.datetime, state: Provenance
+    when: datetime.datetime,
+    state: Provenance,
 ) -> None:
     """C2PA 15.8.2: "the C2PA Manifest is valid if the current time at validation is
     within the validity period of the signer's certificate **and all CA certificates up
     to the trust anchor**."
 
-    NOTHING PROVES THE CHAIN CHECK IS WIRED THROUGH TO A VERDICT. Changing
-    ``_chain_inside_validity(chain, ...)`` to ``(chain[:1], ...)`` -- undoing the whole
-    change -- left the suite green, because the only test hand-built a two-certificate
-    list and asserted a BOOL from the helper. It never touched ``Verdict.state`` and
-    never called ``verify``.
-
-    THE REASON IT WENT UNNOTICED WAS VISIBLE IN THE FIXTURES: until this test, every
-    ``Signer`` that produced a MARK was built with exactly one certificate, so no test
-    had ever verified text whose ``x5chain`` carried a CA at all. (``test_cose.py`` built
-    a two-certificate ``Signer`` to check x5chain serialization, and never verified with
-    it.) The sentence is past tense because the fixture below falsifies it. A rule about "all CA certificates" cannot be
-    exercised by a corpus with no CAs in it.
-
-    The expired intermediate is the realistic case rather than a contrived one: leaves
-    are short-lived and rotated, CAs are long-lived and forgotten. RFC 5280 §6 path
-    validation rejects such a chain, so checking the leaf alone made us more permissive
-    than the chain builder we tell integrators to supply.
-
-    ``before-the-ca-lapses`` is the control, and it is what makes this fail in both
-    directions: the same two-certificate mark must still reach VALID while the CA is
-    live, so the test cannot be satisfied by a verifier that rejects every chain.
+    The same two-certificate mark is valid while both carried certificates are inside
+    their windows and invalid after the intermediate expires. This drives the public
+    verdict rather than only the validity helper.
     """
-    lapsed = build_certificate(
-        signing_key,
-        common_name="c2patxt test ca",
-        not_after=datetime.datetime(2026, 2, 1, tzinfo=datetime.timezone.utc),
+    signer = _signer_with_carried_intermediate(
+        intermediate_not_after=datetime.datetime(2026, 2, 1, tzinfo=datetime.timezone.utc)
     )
-    signer = Signer(private_key=signing_key, certificates=(signing_certificate, lapsed))
+    root_key = Ed25519PrivateKey.from_private_bytes(bytes(range(96, 128)))
+    omitted_root = build_certificate(root_key, common_name="c2patxt omitted root", conformant=False)
+    signer.certificates[-1].verify_directly_issued_by(omitted_root)
+    assert omitted_root not in signer.certificates, "the external anchor must not be carried in x5chain"
+    evaluator = RecordingTrustEvaluator(trusted=False)
+    anchor_der = omitted_root.public_bytes(Encoding.DER)
+    context = VerifyContext(
+        now=when,
+        anchors_pem=omitted_root.public_bytes(Encoding.PEM),
+        trust_evaluator=evaluator,
+    )
 
-    verdict = verify(mark("Hello world.", signer), context=VerifyContext(now=when))
+    creation_time = datetime.datetime(2026, 1, 15, tzinfo=datetime.timezone.utc)
+    verdict = verify(mark("Hello world.", signer, when=creation_time), context=context)
 
     assert verdict.state is state
     assert (StatusCode.CLAIM_SIGNATURE_OUTSIDE_VALIDITY in verdict.codes()) is (state is Provenance.INVALID)
+    if state is Provenance.INVALID:
+        assert not evaluator.calls, "the expired chain reached the trust backend"
+        status = next(item for item in verdict.failure if item.code is StatusCode.CLAIM_SIGNATURE_OUTSIDE_VALIDITY)
+        assert status.explanation is not None
+        assert "x5chain[1] carried CA" in status.explanation
+    else:
+        chain_der = tuple(certificate.public_bytes(Encoding.DER) for certificate in signer.certificates)
+        assert evaluator.calls == [(chain_der, (anchor_der,))]
 
 
-def test_the_digest_cache_is_keyed_by_algorithm_as_well_as_label(store: ManifestStore) -> None:
-    """The memoization added to stop pre-authentication hash amplification caches by
-    ``(label, algorithm)``. Nothing checked the second element.
+def test_one_assertion_can_be_authenticated_under_two_hash_algorithms(signer: Signer) -> None:
+    """C2PA 15.4.2 permits each hashed-URI map to select its hash algorithm."""
+    from c2patxt.manifest import hashed_uri
 
-    Changing the key to ``(label, label)`` left the whole suite green. The existing
-    counting test kills a mutation that DISABLES the cache, so it proves the cache is
-    USED -- not that it is keyed correctly. Under the mutant, two references to one
-    assertion under different algorithms both receive the FIRST algorithm's digest, so a
-    sha384 reference is compared against a sha256 hash and either falsely matches or, as
-    here, falsely fails.
+    url = f"self#jumbf=c2pa.assertions/{ASSERTION_AI_DISCLOSURE}"
 
-    ``_assertion_digest``'s docstring rests the whole change on one claim -- that caching
-    "accepts and rejects exactly what it did before". This is that claim's assertion.
+    def add_sha384_link(items: list[Assertion], links: list[dict[str, object]]) -> None:
+        assertion = next(item for item in items if item.label == ASSERTION_AI_DISCLOSURE)
+        links.append(hashed_uri(assertion.to_box(), url, "sha384"))
 
-    15.4.2 lets a hashed-uri-map carry its own ``alg``, so a manifest referencing one
-    assertion under two algorithms is one a conforming producer can emit. Both digests
-    are computed with ``hashlib`` directly rather than through ``HASH_ALGORITHMS``, so
-    the expected values do not come from the mapping under test.
-    """
-    label = ASSERTION_AI_DISCLOSURE
-    raw = store.assertion_bytes[label]
-    url = f"self#jumbf=c2pa.assertions/{label}"
-    cache: dict[tuple[str, str], bytes] = {}
+    verdict = verify(_resigned(signer, _unchanged, mutate_links=add_sha384_link))
 
-    for algorithm, digest in (("sha256", hashlib.sha256(raw).digest()), ("sha384", hashlib.sha384(raw).digest())):
-        code, resolved = _verify._link_status({"url": url, "hash": digest, "alg": algorithm}, store, cache)
-        assert resolved == label, f"the {algorithm} reference did not resolve"
-        assert code is StatusCode.ASSERTION_HASHED_URI_MATCH
+    assert verdict.state is Provenance.VALID
+    matches = [
+        status
+        for status in verdict.success
+        if status.code is StatusCode.ASSERTION_HASHED_URI_MATCH and status.url == url
+    ]
+    assert len(matches) == 2
 
-    assert len(cache) == 2, "one entry per (label, algorithm), not one per label"
+
+def test_an_external_claim_link_reports_outside_manifest_through_public_verify(signer: Signer) -> None:
+    """The 15.10.3.1 status survives serialized claim parsing and verdict assembly."""
+
+    def point_outside(_items: list[Assertion], links: list[dict[str, object]]) -> None:
+        links[0] = {**links[0], "url": "https://elsewhere.invalid/assertion"}
+
+    verdict = verify(_resigned(signer, _unchanged, mutate_links=point_outside))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.ASSERTION_OUTSIDE_MANIFEST in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
 
 
 @pytest.mark.parametrize(
-    "drop",
-    ["instanceID", "signature", "created_assertions", "claim_generator_info", "name", "array"],
+    "damage",
+    [
+        "instanceID",
+        "signature",
+        "created_assertions",
+        "claim_generator_info",
+        "name",
+        "array",
+        "created-not-array",
+        "created-empty",
+        "created-item-not-map",
+        "gathered-not-array",
+    ],
     ids=[
         "instanceID",
         "signature",
@@ -2044,26 +2226,20 @@ def test_the_digest_cache_is_keyed_by_algorithm_as_well_as_label(store: Manifest
         "claim_generator_info",
         "generator-without-a-name",
         "generator-as-an-array",
+        "created-not-an-array",
+        "created-empty",
+        "created-item-not-a-map",
+        "gathered-not-an-array",
     ],
 )
-def test_a_claim_missing_a_required_field_is_malformed(signer: Signer, drop: str) -> None:
+def test_a_claim_with_a_missing_or_malformed_required_field_is_rejected(signer: Signer, damage: str) -> None:
     """C2PA 15.6.2 names four fields -- ``instanceID``, ``signature``,
     ``created_assertions``, ``claim_generator_info`` -- and says "If any are absent, then
     the claim shall be rejected with a failure code of `claim.malformed`". It adds: "If
     the `claim_generator_info` field does not contain a `name` field, the claim shall be
     rejected with a failure code of `claim.malformed`."
 
-    THE GUARD COULD BE DISCONNECTED TODAY AND NOTHING WOULD SAY SO. Changing
-    ``if _claim_malformed(manifest.claim):`` to ``if False and ...`` left the whole suite
-    green. ``_claim_malformed`` was tested only on hand-built dicts, and the one place
-    ``claim.malformed`` reached a verdict came through a DIFFERENT branch.
-
-    That is the same shape as the defect this check was added to fix. ``manifest.py``'s
-    ``Claim`` docstring had always SAID these fields are "enforced on read by 15.6.2"
-    while nothing enforced them, so "a claim with no instanceID verified happily". A fix
-    whose only guard is a unit test on the helper can be undone by deleting one line.
-
-    THE CLAIM IS RE-SIGNED for each case rather than mutated after parsing, so
+    The claim is re-signed for each case rather than mutated after parsing, so
     ``claim_bytes`` and the decoded claim agree and the signature is genuine. A claim
     whose bytes and dict disagree is a state no producer can emit, and testing against
     one would prove the rule about an input the parser cannot deliver.
@@ -2074,7 +2250,6 @@ def test_a_claim_missing_a_required_field_is_malformed(signer: Signer, drop: str
     and it is exactly what a producer written against the older schema would send.
     """
     from c2patxt import _cose, _fixpoint
-    from c2patxt._selectors import build_wrapper
     from c2patxt.manifest import DEFAULT_HASH_ALGORITHM, hashed_uri
 
     text = "Hello world."
@@ -2082,14 +2257,14 @@ def test_a_claim_missing_a_required_field_is_malformed(signer: Signer, drop: str
     start = len(normalized.encode("utf-8"))
     digest = hashlib.sha256(normalized.encode("utf-8")).digest()
 
-    def build(exclusion_length: int, pad: bytes) -> str:
+    def prepare(exclusion_length: int) -> Callable[[int], str]:
         hash_data = Assertion(
             label=ASSERTION_HASH_DATA,
             payload={
                 "exclusions": [{"start": start, "length": exclusion_length}],
                 "alg": DEFAULT_HASH_ALGORITHM,
                 "hash": digest,
-                "pad": pad,
+                "pad": b"",
             },
         )
         payload: dict[str, object] = {
@@ -2099,12 +2274,20 @@ def test_a_claim_missing_a_required_field_is_malformed(signer: Signer, drop: str
             "signature": "self#jumbf=c2pa.signature",
             "alg": DEFAULT_HASH_ALGORITHM,
         }
-        if drop == "name":
+        if damage == "name":
             payload["claim_generator_info"] = {"version": "1.0"}
-        elif drop == "array":
+        elif damage == "array":
             payload["claim_generator_info"] = [{"name": "c2patxt"}]
+        elif damage == "created-not-array":
+            payload["created_assertions"] = "not an array"
+        elif damage == "created-empty":
+            payload["created_assertions"] = []
+        elif damage == "created-item-not-map":
+            payload["created_assertions"] = [42]
+        elif damage == "gathered-not-array":
+            payload["gathered_assertions"] = "not an array"
         else:
-            del payload[drop]
+            del payload[damage]
 
         claim_bytes = _cbor.dumps(payload)
         boxes = (
@@ -2116,22 +2299,19 @@ def test_a_claim_missing_a_required_field_is_malformed(signer: Signer, drop: str
                 description=DescriptionBox(uuid=UUID_CLAIM, label=LABEL_CLAIM),
                 content=((b"cbor", claim_bytes),),
             ),
-            JumbfBox(
-                description=DescriptionBox(uuid=UUID_CLAIM_SIGNATURE, label=LABEL_CLAIM_SIGNATURE),
-                content=((b"cbor", _cose.sign_claim(signer, claim_bytes)),),
-            ),
         )
-        manifest = JumbfBox(
-            description=DescriptionBox(uuid=UUID_MANIFEST, label="urn:c2pa:" + str(uuid.UUID(int=7))),
-            content=tuple((b"jumb", _jumbf.serialize_superbox(box)[8:]) for box in boxes),
-        )
-        store = JumbfBox(
-            description=DescriptionBox(uuid=UUID_MANIFEST_STORE, label=LABEL_MANIFEST_STORE),
-            content=((b"jumb", _jumbf.serialize_superbox(manifest)[8:]),),
-        )
-        return build_wrapper(_jumbf.serialize_superbox(store))
+        signed = _cose._prepare_signed_claim(signer, claim_bytes)
 
-    wrapper, _ = _fixpoint.solve(build)
+        def assemble(pad: int) -> str:
+            return _test_wrapper(
+                boxes,
+                _cose._serialize_signed_claim(signed, pad=pad),
+                manifest_label="urn:c2pa:00000000-0000-4000-8000-000000000007",
+            )
+
+        return assemble
+
+    wrapper, _ = _fixpoint.solve(prepare)
     verdict = verify(normalized + wrapper)
 
     assert verdict.state is Provenance.INVALID
@@ -2144,18 +2324,7 @@ def test_a_claim_missing_a_required_field_is_malformed(signer: Signer, drop: str
     ids=["declared-as-gathered", "declared-nowhere"],
 )
 def test_a_gathered_assertion_survives_the_wire(signer: Signer, declare: str, state: Provenance) -> None:
-    """``gathered_assertions`` had never been on the wire in any test.
-
-    The four tests that established the rule inject the field into an ALREADY-PARSED
-    store, so they exercise ``_assertion_links`` and nothing between the wire and it.
-    Adding ``and key != "gathered_assertions"`` to the claim narrowing in ``_extract``
-    -- a parse that silently deletes the field from every claim it reads -- left the
-    whole suite green.
-
-    OUR PRODUCER CANNOT EMIT THE FIELD, which is why the gap existed and why closing it
-    means building the manifest by hand and re-signing. That is also what makes the test
-    meaningful: 15.10.3.1 covers gathered assertions precisely because they come from
-    somewhere else, so the only realistic manifest carrying one is a third party's.
+    """A signed gathered-assertion link survives parsing and validation.
 
     Both rows use the SAME assertion in the SAME store. Only the claim differs -- one
     declares it in ``gathered_assertions``, the other declares it nowhere. So the test
@@ -2164,7 +2333,6 @@ def test_a_gathered_assertion_survives_the_wire(signer: Signer, declare: str, st
     """
     from c2patxt import _cose, _fixpoint
     from c2patxt import manifest as manifest_module
-    from c2patxt._selectors import build_wrapper
     from c2patxt.manifest import DEFAULT_HASH_ALGORITHM, hashed_uri
     from tests.conftest import WHEN
 
@@ -2174,12 +2342,18 @@ def test_a_gathered_assertion_survives_the_wire(signer: Signer, declare: str, st
     digest = hashlib.sha256(normalized.encode("utf-8")).digest()
     extra = Assertion(label="c2patxt.gathered", payload={"note": "from an ingredient"})
 
-    def build(exclusion_length: int, pad: bytes) -> str:
+    def prepare(exclusion_length: int) -> Callable[[int], str]:
         required = [
             manifest_module._actions_assertion(WHEN),
             manifest_module._ai_disclosure_assertion(DISCLOSURE),
             manifest_module._metadata_assertion(DISCLOSURE),
-            manifest_module._hash_data_assertion(digest, start, exclusion_length, DEFAULT_HASH_ALGORITHM, pad),
+            manifest_module._hash_data_assertion(
+                digest,
+                start,
+                exclusion_length,
+                algorithm=DEFAULT_HASH_ALGORITHM,
+                pad=b"",
+            ),
         ]
         flat = [*required, extra]
         created = [hashed_uri(item.to_box(), f"self#jumbf=c2pa.assertions/{item.label}") for item in required]
@@ -2203,36 +2377,42 @@ def test_a_gathered_assertion_survives_the_wire(signer: Signer, declare: str, st
                 description=DescriptionBox(uuid=UUID_CLAIM, label=LABEL_CLAIM),
                 content=((b"cbor", claim_bytes),),
             ),
-            JumbfBox(
-                description=DescriptionBox(uuid=UUID_CLAIM_SIGNATURE, label=LABEL_CLAIM_SIGNATURE),
-                content=((b"cbor", _cose.sign_claim(signer, claim_bytes)),),
-            ),
         )
-        manifest = JumbfBox(
-            description=DescriptionBox(uuid=UUID_MANIFEST, label="urn:c2pa:" + str(uuid.UUID(int=7))),
-            content=tuple((b"jumb", _jumbf.serialize_superbox(box)[8:]) for box in boxes),
-        )
-        store = JumbfBox(
-            description=DescriptionBox(uuid=UUID_MANIFEST_STORE, label=LABEL_MANIFEST_STORE),
-            content=((b"jumb", _jumbf.serialize_superbox(manifest)[8:]),),
-        )
-        return build_wrapper(_jumbf.serialize_superbox(store))
+        signed = _cose._prepare_signed_claim(signer, claim_bytes)
 
-    wrapper, _ = _fixpoint.solve(build)
+        def assemble(pad: int) -> str:
+            return _test_wrapper(
+                boxes,
+                _cose._serialize_signed_claim(signed, pad=pad),
+                manifest_label="urn:c2pa:00000000-0000-4000-8000-000000000007",
+            )
+
+        return assemble
+
+    wrapper, _ = _fixpoint.solve(prepare)
     verdict = verify(normalized + wrapper)
 
     assert verdict.state is state
     assert (StatusCode.ASSERTION_UNDECLARED in verdict.codes()) is (state is Provenance.INVALID)
 
 
-#: The six status codes that reached no verdict in any test until 2026-08-06. Each is
-#: produced here by re-signing a wire-legal manifest whose ONLY defect is the rule under
-#: test -- binding matched, signature valid, certificate inside its window -- which is
-#: the shape an attacker actually sends.
+#: Each case re-signs a wire-legal manifest whose sole defect is the named rule; the
+#: binding, signature and certificate-validity checks otherwise succeed.
 _WIRE_DEFECTS = "wire defects"
 
 
-def _resigned(signer: Signer, mutate: Callable[[list[Assertion], dict[str, object]], None]) -> str:
+def _resigned(
+    signer: Signer,
+    mutate: Callable[[list[Assertion], dict[str, object]], None],
+    *,
+    prefix: str = "Hello world.",
+    suffix: str = "",
+    excluded_prefix_ranges: tuple[tuple[int, int], ...] = (),
+    gathered_labels: tuple[str, ...] = (),
+    extra_assertions: tuple[JumbfBox, ...] = (),
+    mutate_links: Callable[[list[Assertion], list[dict[str, object]]], None] | None = None,
+    signature_serializer: Callable[[Signer, bytes, int], bytes] | None = None,
+) -> str:
     """Marked text whose manifest is rebuilt, mutated and re-signed.
 
     ``mutate`` receives the assertion list and the claim payload BEFORE the claim is
@@ -2245,23 +2425,54 @@ def _resigned(signer: Signer, mutate: Callable[[list[Assertion], dict[str, objec
     """
     import hashlib
     import unicodedata
-    import uuid as uuid_module
 
     from c2patxt import _cose
     from c2patxt import manifest as manifest_module
     from c2patxt.manifest import DEFAULT_HASH_ALGORITHM, hashed_uri
     from tests.conftest import WHEN
 
-    normalized = unicodedata.normalize("NFC", "Hello world.")
-    start = len(normalized.encode("utf-8"))
+    prefix_bytes = prefix.encode("utf-8")
+    cursor = 0
+    covered: list[bytes] = []
+    for extra_start, extra_length in excluded_prefix_ranges:
+        assert cursor <= extra_start <= extra_start + extra_length <= len(prefix_bytes)
+        covered.append(prefix_bytes[cursor:extra_start])
+        cursor = extra_start + extra_length
+    covered.extend((prefix_bytes[cursor:], suffix.encode("utf-8")))
+    normalized = unicodedata.normalize("NFC", b"".join(covered).decode("utf-8"))
+    start = len(prefix_bytes)
     digest = hashlib.sha256(normalized.encode("utf-8")).digest()
 
-    def build(exclusion_length: int, pad: bytes) -> str:
+    def prepare(exclusion_length: int) -> Callable[[int], str]:
+        binding = manifest_module._hash_data_assertion(
+            digest,
+            start,
+            exclusion_length,
+            algorithm=DEFAULT_HASH_ALGORITHM,
+            pad=b"",
+        )
+        if excluded_prefix_ranges:
+            binding = Assertion(
+                label=binding.label,
+                payload={
+                    "alg": DEFAULT_HASH_ALGORITHM,
+                    "hash": digest,
+                    "exclusions": [
+                        *(
+                            {"start": extra_start, "length": extra_length}
+                            for extra_start, extra_length in excluded_prefix_ranges
+                        ),
+                        {"start": start, "length": exclusion_length},
+                    ],
+                    "pad": b"",
+                },
+            )
+
         items = [
             manifest_module._actions_assertion(WHEN),
             manifest_module._ai_disclosure_assertion(DISCLOSURE),
             manifest_module._metadata_assertion(DISCLOSURE),
-            manifest_module._hash_data_assertion(digest, start, exclusion_length, DEFAULT_HASH_ALGORITHM, pad),
+            binding,
         ]
         payload: dict[str, object] = {
             "instanceID": "xmp:iid:1",
@@ -2270,45 +2481,779 @@ def _resigned(signer: Signer, mutate: Callable[[list[Assertion], dict[str, objec
             "alg": DEFAULT_HASH_ALGORITHM,
         }
         mutate(items, payload)
-        payload["created_assertions"] = [
-            hashed_uri(item.to_box(), f"self#jumbf=c2pa.assertions/{item.label}") for item in items
+        assertion_boxes = [item.to_box() for item in items]
+        assertion_boxes.extend(extra_assertions)
+        labels = [item.label for item in items]
+        for box in extra_assertions:
+            label = box.description.label
+            assert label is not None, "a referenced assertion needs a JUMBF label"
+            labels.append(label)
+        links = [
+            hashed_uri(box, f"self#jumbf=c2pa.assertions/{label}")
+            for label, box in zip(labels, assertion_boxes, strict=True)
         ]
+        if mutate_links is not None:
+            mutate_links(items, links)
+        assertion_links = links[: len(labels)]
+        gathered = [link for label, link in zip(labels, assertion_links, strict=True) if label in gathered_labels]
+        created = [link for label, link in zip(labels, assertion_links, strict=True) if label not in gathered_labels]
+        created.extend(links[len(labels) :])
+        payload["created_assertions"] = created
+        if gathered:
+            payload["gathered_assertions"] = gathered
 
         claim_bytes = _cbor.dumps(payload)  # pyright: ignore[reportArgumentType] -- hand-built claim, as the sibling e2e test
         boxes = (
             JumbfBox(
                 description=DescriptionBox(uuid=UUID_ASSERTION_STORE, label=LABEL_ASSERTION_STORE),
-                content=tuple((b"jumb", _jumbf.serialize_superbox(item.to_box())[8:]) for item in items),
+                content=tuple((b"jumb", _jumbf.serialize_superbox(box)[8:]) for box in assertion_boxes),
             ),
             JumbfBox(
                 description=DescriptionBox(uuid=UUID_CLAIM, label=LABEL_CLAIM),
                 content=((b"cbor", claim_bytes),),
             ),
-            JumbfBox(
-                description=DescriptionBox(uuid=UUID_CLAIM_SIGNATURE, label=LABEL_CLAIM_SIGNATURE),
-                content=((b"cbor", _cose.sign_claim(signer, claim_bytes)),),
-            ),
         )
-        manifest = JumbfBox(
-            description=DescriptionBox(uuid=UUID_MANIFEST, label="urn:c2pa:" + str(uuid_module.UUID(int=7))),
-            content=tuple((b"jumb", _jumbf.serialize_superbox(box)[8:]) for box in boxes),
-        )
-        store = JumbfBox(
-            description=DescriptionBox(uuid=UUID_MANIFEST_STORE, label=LABEL_MANIFEST_STORE),
-            content=((b"jumb", _jumbf.serialize_superbox(manifest)[8:]),),
-        )
-        return build_wrapper(_jumbf.serialize_superbox(store))
+        signed = _cose._prepare_signed_claim(signer, claim_bytes) if signature_serializer is None else None
 
-    wrapper, _ = _fixpoint.solve(build)
-    return normalized + wrapper
+        def assemble(pad: int) -> str:
+            if signature_serializer is not None:
+                signature = signature_serializer(signer, claim_bytes, pad)
+            else:
+                assert signed is not None
+                signature = _cose._serialize_signed_claim(signed, pad=pad)
+            return _test_wrapper(
+                boxes,
+                signature,
+                manifest_label="urn:c2pa:00000000-0000-4000-8000-000000000007",
+            )
+
+        return assemble
+
+    wrapper, _ = _fixpoint.solve(prepare)
+    return prefix + wrapper + suffix
 
 
-def _blank_disclosure(items: list[Assertion], _claim: dict[str, object]) -> None:
-    items[1] = Assertion(label=items[1].label, payload={})
+def _unchanged(_items: list[Assertion], _claim: dict[str, object]) -> None:
+    """Leave a hand-built signed manifest conforming."""
 
 
-def _actions_without_source_type(items: list[Assertion], _claim: dict[str, object]) -> None:
+def _without_ai_disclosure(items: list[Assertion], _claim: dict[str, object]) -> None:
+    items[:] = [item for item in items if item.label != ASSERTION_AI_DISCLOSURE]
+
+
+def _created_without_source_type(items: list[Assertion], _claim: dict[str, object]) -> None:
     items[0] = Assertion(label=items[0].label, payload={"actions": [{"action": "c2pa.created"}]})
+
+
+def _assertion_link(assertion: Assertion) -> dict[str, object]:
+    from c2patxt.manifest import hashed_uri
+
+    return hashed_uri(assertion.to_box(), f"self#jumbf=c2pa.assertions/{assertion.label}")
+
+
+def _set_actions(items: list[Assertion], actions: list[dict[str, object]]) -> None:
+    items[0] = Assertion(label=ASSERTION_ACTIONS, payload={"actions": actions})
+
+
+def _ingredient(label: str, relationship: str) -> Assertion:
+    return Assertion(label=label, payload={"relationship": relationship})
+
+
+def _append_assertion(items: list[Assertion], label: str, payload: dict[str, object]) -> None:
+    items.append(Assertion(label=label, payload=payload))
+
+
+def _cloud_data_missing_size(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _append_assertion(
+        items,
+        "c2pa.cloud-data",
+        {"label": "c2patxt.remote", "location": {"url": "https://example.invalid/a", "alg": "sha256", "hash": b"x"}},
+    )
+
+
+def _cloud_data_names_hard_binding(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _append_assertion(
+        items,
+        "c2pa.cloud-data",
+        {
+            "label": "c2pa.hash.data",
+            "size": 1,
+            "location": {"url": "https://example.invalid/a", "alg": "sha256", "hash": b"x"},
+        },
+    )
+
+
+def _valid_cloud_data(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _append_assertion(
+        items,
+        "c2pa.cloud-data",
+        {
+            "label": "c2patxt.remote",
+            "size": 1,
+            "location": {"url": "https://example.invalid/a", "alg": "sha256", "hash": b"x"},
+        },
+    )
+
+
+def _external_reference_half_hash(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _append_assertion(
+        items,
+        "c2pa.external-reference",
+        {"location": {"url": "https://example.invalid/a", "alg": "sha256"}},
+    )
+
+
+def _external_reference_names_hard_binding(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _append_assertion(
+        items,
+        "c2pa.external-reference",
+        {"label": "c2pa.hash.data", "location": {"url": "https://example.invalid/a"}},
+    )
+
+
+def _valid_external_reference(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _append_assertion(
+        items,
+        "c2pa.external-reference",
+        {"location": {"url": "https://example.invalid/a"}},
+    )
+
+
+def _empty_time_stamp(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _append_assertion(items, "c2pa.time-stamp", {})
+
+
+def _unvalidated_time_stamp(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _append_assertion(items, "c2pa.time-stamp", {"tstToken": b"not an RFC 3161 token"})
+
+
+def _session_keys(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _append_assertion(items, "c2pa.session-keys", {"keys": []})
+
+
+def _alternative_content(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _append_assertion(items, "c2pa.alternative-content-representation", {"type": "exif.originalPreservationImage"})
+
+
+def _opened_without_ingredient(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _set_actions(items, [{"action": "c2pa.opened"}])
+
+
+def _opened_with_parent(items: list[Assertion], _claim: dict[str, object]) -> None:
+    parent = _ingredient("c2pa.ingredient.v3", "parentOf")
+    items.append(parent)
+    _set_actions(
+        items,
+        [{"action": "c2pa.opened", "parameters": {"ingredients": [_assertion_link(parent)]}}],
+    )
+
+
+def _opened_with_component(items: list[Assertion], _claim: dict[str, object]) -> None:
+    component = _ingredient("c2pa.ingredient.v3", "componentOf")
+    items.append(component)
+    _set_actions(
+        items,
+        [{"action": "c2pa.opened", "parameters": {"ingredients": [_assertion_link(component)]}}],
+    )
+
+
+def _placed_with_component(items: list[Assertion], _claim: dict[str, object]) -> None:
+    component = _ingredient("c2pa.ingredient.v3", "componentOf")
+    items.append(component)
+    _set_actions(
+        items,
+        [
+            {"action": "c2pa.created", "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED},
+            {"action": "c2pa.placed", "parameters": {"ingredients": [_assertion_link(component)]}},
+        ],
+    )
+
+
+def _v1_placed_with_singular_component(items: list[Assertion], _claim: dict[str, object]) -> None:
+    component = _ingredient("c2pa.ingredient.v3", "componentOf")
+    items.append(component)
+    items[0] = Assertion(
+        label=ASSERTION_ACTIONS_V1,
+        payload={
+            "actions": [
+                {"action": "c2pa.created", "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED},
+                {"action": "c2pa.placed", "parameters": {"ingredient": _assertion_link(component)}},
+            ]
+        },
+    )
+
+
+def _v1_placed_with_plural_component(items: list[Assertion], claim: dict[str, object]) -> None:
+    _placed_with_component(items, claim)
+    actions = items[0]
+    items[0] = Assertion(label=ASSERTION_ACTIONS_V1, payload=actions.payload)
+
+
+def _placed_without_ingredient(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _set_actions(
+        items,
+        [
+            {"action": "c2pa.created", "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED},
+            {"action": "c2pa.placed"},
+        ],
+    )
+
+
+def _derived_with_relationship(items: list[Assertion], action: str, relationship: str) -> None:
+    ingredient = _ingredient("c2pa.ingredient.v3", relationship)
+    items.append(ingredient)
+    _set_actions(
+        items,
+        [
+            {"action": "c2pa.created", "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED},
+            {"action": action, "parameters": {"ingredients": [_assertion_link(ingredient)]}},
+        ],
+    )
+
+
+def _transcoded_with_parent(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _derived_with_relationship(items, "c2pa.transcoded", "parentOf")
+
+
+def _transcoded_with_component(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _derived_with_relationship(items, "c2pa.transcoded", "componentOf")
+
+
+def _repackaged_with_parent(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _derived_with_relationship(items, "c2pa.repackaged", "parentOf")
+
+
+def _repackaged_with_component(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _derived_with_relationship(items, "c2pa.repackaged", "componentOf")
+
+
+def _removed_with_current_component(items: list[Assertion], _claim: dict[str, object]) -> None:
+    component = _ingredient("c2pa.ingredient.v3", "componentOf")
+    items.append(component)
+    _set_actions(
+        items,
+        [
+            {"action": "c2pa.created", "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED},
+            {"action": "c2pa.removed", "parameters": {"ingredients": [_assertion_link(component)]}},
+        ],
+    )
+
+
+def _redacted_without_target(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _set_actions(
+        items,
+        [
+            {"action": "c2pa.created", "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED},
+            {"action": "c2pa.redacted", "parameters": {}},
+        ],
+    )
+
+
+def _redacted_with_target(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _set_actions(
+        items,
+        [
+            {"action": "c2pa.created", "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED},
+            {
+                "action": "c2pa.redacted",
+                "parameters": {"redacted": f"self#jumbf=c2pa.assertions/{items[2].label}"},
+            },
+        ],
+    )
+
+
+def _watermarked_without_soft_binding(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _set_actions(
+        items,
+        [
+            {"action": "c2pa.created", "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED},
+            {"action": "c2pa.watermarked.bound"},
+        ],
+    )
+
+
+def _watermarked_with_soft_binding(items: list[Assertion], _claim: dict[str, object]) -> None:
+    payload: dict[str, _cbor.CborValue] = {
+        "alg": "com.example.test-watermark",
+        "blocks": [{"scope": {}, "value": b"test"}],
+    }
+    items.append(
+        Assertion(
+            label="c2pa.soft-binding",
+            payload=payload,
+        )
+    )
+    _set_actions(
+        items,
+        [
+            {"action": "c2pa.created", "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED},
+            {"action": "c2pa.watermarked"},
+        ],
+    )
+
+
+def _related_assertion_is_an_action(items: list[Assertion], _claim: dict[str, object]) -> None:
+    related = Assertion(label=f"{ASSERTION_ACTIONS}__1", payload={"actions": [{"action": "c2pa.edited"}]})
+    items.append(related)
+    _set_actions(
+        items,
+        [
+            {
+                "action": "c2pa.created",
+                "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED,
+                "parameters": {"relatedAssertions": [_assertion_link(related)]},
+            }
+        ],
+    )
+
+
+def _related_assertion_is_metadata(items: list[Assertion], _claim: dict[str, object]) -> None:
+    _set_actions(
+        items,
+        [
+            {
+                "action": "c2pa.created",
+                "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED,
+                "parameters": {"relatedAssertions": [_assertion_link(items[2])]},
+            }
+        ],
+    )
+
+
+def _two_parent_ingredients(items: list[Assertion], _claim: dict[str, object]) -> None:
+    first = _ingredient("c2pa.ingredient.v3", "parentOf")
+    second = _ingredient("c2pa.ingredient.v3__1", "parentOf")
+    items.extend((first, second))
+    _set_actions(
+        items,
+        [{"action": "c2pa.opened", "parameters": {"ingredients": [_assertion_link(first)]}}],
+    )
+
+
+def _self_redacted(items: list[Assertion], claim: dict[str, object]) -> None:
+    claim["redacted_assertions"] = [f"self#jumbf=c2pa.assertions/{items[1].label}"]
+
+
+def _gathered_second_inception(items: list[Assertion], _claim: dict[str, object]) -> None:
+    items.append(
+        Assertion(
+            label=f"{ASSERTION_ACTIONS}__1",
+            payload={"actions": [{"action": "c2pa.created", "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED}]},
+        )
+    )
+
+
+def _gathered_placed_without_ingredient(items: list[Assertion], _claim: dict[str, object]) -> None:
+    items.append(
+        Assertion(
+            label=f"{ASSERTION_ACTIONS}__1",
+            payload={"actions": [{"action": "c2pa.placed"}]},
+        )
+    )
+
+
+def _metadata_is_a_json_array(items: list[Assertion], _claim: dict[str, object]) -> None:
+    items[2] = Assertion(
+        label=ASSERTION_METADATA,
+        payload={},
+        json_ld=b'[{"@context":{"dc":"http://purl.org/dc/elements/1.1/"},"dc:format":"text/plain"}]',
+    )
+
+
+def _repository_receipt(items: list[Assertion], _claim: dict[str, object], *, malformed: bool) -> None:
+    payload = (
+        b"{not json"
+        if malformed
+        else b'{"@context":{},"@type":"org.c2pa.repository-receipt",'
+        b'"repository":{"uri":"https://example.com","manifestId":"urn:example:1"},'
+        b'"anchor":{"uri":"https://example.com/proof","proof":{}}}'
+    )
+    items.append(Assertion(label=ASSERTION_REPOSITORY_RECEIPT, payload={}, json_ld=payload))
+
+
+def _malformed_repository_receipt(items: list[Assertion], claim: dict[str, object]) -> None:
+    _repository_receipt(items, claim, malformed=True)
+
+
+def _valid_repository_receipt(items: list[Assertion], claim: dict[str, object]) -> None:
+    _repository_receipt(items, claim, malformed=False)
+
+
+def test_generic_validation_does_not_require_an_ai_disclosure(signer: Signer) -> None:
+    """18.28.2 constrains claim generators; 15.10.3 defines no matching validator failure."""
+    verdict = verify(_resigned(signer, _without_ai_disclosure))
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.GENERAL_ERROR not in verdict.codes()
+    assert StatusCode.ASSERTION_MISSING not in verdict.codes()
+
+
+def test_generic_validation_does_not_require_digital_source_type(signer: Signer) -> None:
+    """18.15.2's producer field is not added to 15.10.3.2.3's validator conditions."""
+    verdict = verify(_resigned(signer, _created_without_source_type))
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.ASSERTION_ACTION_MALFORMED not in verdict.codes()
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (_opened_without_ingredient, StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH),
+        (_opened_with_component, StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH),
+        (_placed_without_ingredient, StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH),
+        (_transcoded_with_component, StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH),
+        (_repackaged_with_component, StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH),
+        (_removed_with_current_component, StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH),
+        (_redacted_without_target, StatusCode.ASSERTION_ACTION_REDACTION_MISMATCH),
+        (_watermarked_without_soft_binding, StatusCode.ASSERTION_ACTION_SOFT_BINDING_MISSING),
+        (_related_assertion_is_an_action, StatusCode.ASSERTION_ACTION_MALFORMED),
+        (_two_parent_ingredients, StatusCode.MANIFEST_MULTIPLE_PARENTS),
+        (_self_redacted, StatusCode.ASSERTION_SELF_REDACTED),
+    ],
+    ids=[
+        "opened-needs-an-ingredient",
+        "opened-needs-parentOf",
+        "placed-needs-an-ingredient",
+        "transcoded-ingredient-needs-parentOf",
+        "repackaged-ingredient-needs-parentOf",
+        "removed-needs-another-manifest",
+        "redacted-needs-a-target",
+        "watermarked-needs-a-soft-binding",
+        "relatedAssertions-cannot-name-actions",
+        "one-parentOf-at-most",
+        "a-claim-cannot-redact-itself",
+    ],
+)
+def test_signed_wire_enforces_action_and_manifest_relationship_rules(
+    signer: Signer,
+    mutate: Callable[[list[Assertion], dict[str, object]], None],
+    expected: StatusCode,
+) -> None:
+    verdict = verify(_resigned(signer, mutate))
+
+    assert verdict.state is Provenance.INVALID
+    assert expected in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        _redacted_with_target,
+        _watermarked_with_soft_binding,
+        _related_assertion_is_metadata,
+    ],
+    ids=[
+        "redacted-target",
+        "watermarked-soft-binding",
+        "related-metadata",
+    ],
+)
+def test_signed_wire_accepts_actions_whose_required_relationships_are_present(
+    signer: Signer, mutate: Callable[[list[Assertion], dict[str, object]], None]
+) -> None:
+    verdict = verify(_resigned(signer, mutate))
+
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+
+
+def test_repeated_links_to_one_actions_assertion_preserve_each_hash_result(signer: Signer) -> None:
+    """Repeated hashed URIs authenticate repeatedly but name one actions assertion."""
+
+    def repeat_actions(items: list[Assertion], links: list[dict[str, object]]) -> None:
+        action_index = next(index for index, item in enumerate(items) if item.label == ASSERTION_ACTIONS)
+        links.extend((links[action_index], links[action_index]))
+
+    verdict = verify(_resigned(signer, _unchanged, mutate_links=repeat_actions))
+
+    assert verdict.state is Provenance.VALID
+    assert verdict.codes().count(StatusCode.ASSERTION_HASHED_URI_MATCH) == 6
+    assert StatusCode.ASSERTION_ACTION_MALFORMED not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+
+
+def test_repeated_links_to_one_parent_do_not_create_multiple_parents(signer: Signer) -> None:
+    """15.10.1.2 counts parent assertions, not duplicate URIs to one assertion."""
+
+    def repeat_parent(items: list[Assertion], links: list[dict[str, object]]) -> None:
+        parent_index = next(index for index, item in enumerate(items) if item.label == "c2pa.ingredient.v3")
+        links.extend((links[parent_index], links[parent_index]))
+
+    verdict = verify(
+        _resigned(
+            signer,
+            _opened_with_parent,
+            mutate_links=repeat_parent,
+        )
+    )
+
+    assert verdict.state is Provenance.INVALID
+    assert verdict.codes().count(StatusCode.ASSERTION_HASHED_URI_MATCH) == 7
+    assert StatusCode.MANIFEST_MULTIPLE_PARENTS not in verdict.codes()
+    assert StatusCode.GENERAL_ERROR in verdict.codes(), "full ingredient-chain validation remains unsupported"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [_opened_with_parent, _placed_with_component, _transcoded_with_parent, _repackaged_with_parent],
+    ids=["opened-parent", "placed-component", "transcoded-parent", "repackaged-parent"],
+)
+def test_an_ingredient_never_produces_valid_without_full_15_11_validation(
+    signer: Signer,
+    mutate: Callable[[list[Assertion], dict[str, object]], None],
+) -> None:
+    verdict = verify(_resigned(signer, mutate))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.GENERAL_ERROR in verdict.codes()
+    assert StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH not in verdict.codes()
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (_cloud_data_missing_size, StatusCode.ASSERTION_CLOUD_DATA_MALFORMED),
+        (_cloud_data_names_hard_binding, StatusCode.ASSERTION_CLOUD_DATA_HARD_BINDING),
+        (_external_reference_half_hash, StatusCode.ASSERTION_EXTERNAL_REFERENCE_MALFORMED),
+        (_external_reference_names_hard_binding, StatusCode.ASSERTION_EXTERNAL_REFERENCE_MALFORMED),
+        (_empty_time_stamp, StatusCode.ASSERTION_TIMESTAMP_MALFORMED),
+        (_unvalidated_time_stamp, StatusCode.GENERAL_ERROR),
+        (_session_keys, StatusCode.GENERAL_ERROR),
+        (_alternative_content, StatusCode.GENERAL_ERROR),
+    ],
+    ids=[
+        "cloud-missing-field",
+        "cloud-hard-binding",
+        "external-half-hash",
+        "external-forbidden-label",
+        "empty-time-stamp",
+        "unvalidated-time-stamp",
+        "session-key-binding",
+        "alternative-content",
+    ],
+)
+def test_signed_wire_runs_every_mandatory_type_specific_validation(
+    signer: Signer,
+    mutate: Callable[[list[Assertion], dict[str, object]], None],
+    expected: StatusCode,
+) -> None:
+    verdict = verify(_resigned(signer, mutate))
+
+    assert verdict.state is Provenance.INVALID
+    assert expected in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+
+
+@pytest.mark.parametrize("mutate", [_valid_cloud_data, _valid_external_reference], ids=["cloud", "external"])
+def test_optional_remote_assertions_validate_without_network_retrieval(
+    signer: Signer,
+    mutate: Callable[[list[Assertion], dict[str, object]], None],
+) -> None:
+    verdict = verify(_resigned(signer, mutate))
+
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+
+
+def test_related_assertions_can_name_a_hash_valid_opaque_assertion(signer: Signer) -> None:
+    """15.10.3.2.3 resolves an assertion, not only a decoded CBOR or JSON value."""
+    from c2patxt.manifest import hashed_uri
+
+    label = "c2patxt.related"
+    opaque = JumbfBox(
+        description=DescriptionBox(uuid=_jumbf.content_type_uuid(b"uuid"), label=label),
+        content=((b"uuid", bytes(16)),),
+    )
+
+    def relate(items: list[Assertion], _claim: dict[str, object]) -> None:
+        reference = hashed_uri(opaque, f"self#jumbf=c2pa.assertions/{label}")
+        _set_actions(
+            items,
+            [
+                {
+                    "action": "c2pa.created",
+                    "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED,
+                    "parameters": {"relatedAssertions": [reference]},
+                }
+            ],
+        )
+
+    verdict = verify(_resigned(signer, relate, extra_assertions=(opaque,)))
+
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.HASHED_URI_MISSING not in verdict.codes()
+    assert StatusCode.ASSERTION_ACTION_MALFORMED not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+
+
+def test_gathered_actions_participate_in_the_full_inception_count(signer: Signer) -> None:
+    gathered = f"{ASSERTION_ACTIONS}__1"
+    verdict = verify(_resigned(signer, _gathered_second_inception, gathered_labels=(gathered,)))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.ASSERTION_ACTION_MALFORMED in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+
+
+def test_gathered_actions_receive_the_same_per_action_validation(signer: Signer) -> None:
+    gathered = f"{ASSERTION_ACTIONS}__1"
+    verdict = verify(_resigned(signer, _gathered_placed_without_ingredient, gathered_labels=(gathered,)))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+
+
+def test_a_json_ld_array_is_valid_json_on_the_signed_wire(signer: Signer) -> None:
+    verdict = verify(_resigned(signer, _metadata_is_a_json_array))
+
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.ASSERTION_JSON_INVALID not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+
+
+@pytest.mark.parametrize("payload", [b"NaN", b"Infinity", b"-Infinity"])
+def test_non_finite_json_numbers_are_invalid_on_the_signed_wire(signer: Signer, payload: bytes) -> None:
+    """RFC 8259 excludes non-finite numbers even though Python's decoder accepts them."""
+
+    def metadata_constant(items: list[Assertion], _claim: dict[str, object]) -> None:
+        items[2] = Assertion(label=ASSERTION_METADATA, payload={}, json_ld=payload)
+
+    verdict = verify(_resigned(signer, metadata_constant))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.ASSERTION_JSON_INVALID in verdict.codes()
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (_malformed_repository_receipt, StatusCode.ASSERTION_JSON_INVALID),
+        (_valid_repository_receipt, StatusCode.GENERAL_ERROR),
+    ],
+    ids=["malformed-json", "forbidden-in-a-standard-manifest"],
+)
+def test_repository_receipts_use_json_and_only_belong_to_update_manifests(
+    signer: Signer,
+    mutate: Callable[[list[Assertion], dict[str, object]], None],
+    expected: StatusCode,
+) -> None:
+    verdict = verify(_resigned(signer, mutate))
+
+    assert verdict.state is Provenance.INVALID
+    assert expected in verdict.codes()
+
+
+def test_plural_wrappers_use_the_one_whose_exclusion_matches(signer: Signer) -> None:
+    """15.12.1.3.1 selects by an exact wrapper/exclusion-range match."""
+    decoy_mark = mark("D", signer)
+    decoy = decoy_mark[decoy_mark.index(MARKER) :]
+    text = _resigned(signer, _unchanged, prefix="Visible" + decoy)
+
+    assert text.count(MARKER) == 2
+    verdict = verify(text)
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.DATA_HASH_MATCH in verdict.codes()
+    assert StatusCode.TEXT_MULTIPLE_WRAPPERS not in verdict.codes()
+
+
+def test_two_manifests_whose_own_wrapper_ranges_match_are_ambiguous(signer: Signer) -> None:
+    """15.12.1.3.1 rejects before choosing between two matching candidates."""
+    visible = "Visible"
+    first = _resigned(signer, _unchanged, prefix=visible)
+    text = _resigned(signer, _unchanged, prefix=first)
+
+    encoded = text.encode("utf-8")
+    first_span = (len(visible.encode("utf-8")), len(first.encode("utf-8")))
+    second_span = (first_span[1], len(encoded))
+    assert text.count(MARKER) == 2
+    for start, stop in (first_span, second_span):
+        assert encoded[start:stop].decode("utf-8").startswith(MARKER)
+
+    verdict = verify(text)
+
+    assert verdict.state is Provenance.INVALID
+    assert verdict.manifest is None
+    assert StatusCode.TEXT_MULTIPLE_WRAPPERS in verdict.codes()
+    assert StatusCode.GENERAL_ERROR not in verdict.codes()
+
+
+def test_two_wrapper_ranges_named_by_the_binding_are_reported_as_multiple(signer: Signer) -> None:
+    """15.12.1.3.1 rejects only when more than one wrapper matches an exclusion."""
+    visible = "Visible"
+    decoy_mark = mark("D", signer)
+    decoy = decoy_mark[decoy_mark.index(MARKER) :]
+    decoy_start = len(visible.encode("utf-8"))
+    text = _resigned(
+        signer,
+        _unchanged,
+        prefix=visible + decoy,
+        excluded_prefix_ranges=((decoy_start, len(decoy.encode("utf-8"))),),
+    )
+
+    assert text.count(MARKER) == 2
+    verdict = verify(text)
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.TEXT_MULTIPLE_WRAPPERS in verdict.codes()
+
+
+def test_an_additional_exclusion_is_informational_and_is_applied(signer: Signer) -> None:
+    """15.12.1.1 records extra ranges without turning a matching digest into failure."""
+    text = _resigned(signer, _unchanged, prefix="XVisible", excluded_prefix_ranges=((0, 1),))
+
+    verdict = verify(text)
+    assert verdict.state is Provenance.VALID
+    assert [status.code for status in verdict.informational] == [StatusCode.DATA_HASH_ADDITIONAL_EXCLUSIONS]
+    assert StatusCode.DATA_HASH_MATCH in verdict.codes()
+
+
+def _binding_without_hash(items: list[Assertion], _claim: dict[str, object]) -> None:
+    binding = items[3]
+    assert binding.label == ASSERTION_HASH_DATA
+    payload = binding.payload
+    assert _is_string_cbor_map(payload)
+    items[3] = Assertion(
+        label=binding.label,
+        payload={key: value for key, value in payload.items() if key != "hash"},
+    )
+
+
+def test_a_signed_data_hash_without_hash_reports_mismatch(signer: Signer) -> None:
+    """15.12.1.1 gives an absent hash the mismatch code, not malformed."""
+    verdict = verify(_resigned(signer, _binding_without_hash))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.DATA_HASH_MISMATCH in verdict.codes()
+    assert StatusCode.DATA_HASH_MALFORMED not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+
+
+def _binding_with_exclusion_past_eof(items: list[Assertion], _claim: dict[str, object]) -> None:
+    binding = items[3]
+    assert binding.label == ASSERTION_HASH_DATA
+    payload = binding.payload
+    assert _is_string_cbor_map(payload)
+    exclusions = payload["exclusions"]
+    assert isinstance(exclusions, list)
+    overrun = _widen({"start": 10_000_000, "length": 1})
+    items[3] = Assertion(
+        label=binding.label,
+        payload={
+            **payload,
+            "exclusions": [*exclusions, overrun],
+        },
+    )
+
+
+def test_an_additional_exclusion_past_eof_reports_mismatch(signer: Signer) -> None:
+    """The exact wrapper range matches before the later impossible range is checked."""
+    verdict = verify(_resigned(signer, _binding_with_exclusion_past_eof))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.DATA_HASH_MISMATCH in verdict.codes()
+    assert StatusCode.DATA_HASH_MALFORMED not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
 
 
 def _second_hard_binding(items: list[Assertion], _claim: dict[str, object]) -> None:
@@ -2328,15 +3273,6 @@ def _icon_reference(url: str, digest: bytes) -> CborMap:
     return {"url": url, "hash": digest, "alg": "sha256"}
 
 
-def _icon_digest_wrong(items: list[Assertion], claim: dict[str, object]) -> None:
-    generator = claim["claim_generator_info"]
-    assert isinstance(generator, dict)
-    claim["claim_generator_info"] = {
-        **generator,
-        "icon": _icon_reference(f"self#jumbf=c2pa.assertions/{items[2].label}", b"\x00" * 32),
-    }
-
-
 def _icon_destination_absent(items: list[Assertion], claim: dict[str, object]) -> None:
     generator = claim["claim_generator_info"]
     assert isinstance(generator, dict)
@@ -2346,109 +3282,41 @@ def _icon_destination_absent(items: list[Assertion], claim: dict[str, object]) -
     }
 
 
+def _icon_is_not_a_reference(_items: list[Assertion], claim: dict[str, object]) -> None:
+    generator = claim["claim_generator_info"]
+    assert isinstance(generator, dict)
+    claim["claim_generator_info"] = {**generator, "icon": "not a hashed URI"}
+
+
 @pytest.mark.parametrize(
     ("mutate", "expected"),
     [
-        (_blank_disclosure, StatusCode.GENERAL_ERROR),
-        (_actions_without_source_type, StatusCode.ASSERTION_ACTION_MALFORMED),
         (_second_hard_binding, StatusCode.ASSERTION_MULTIPLE_HARD_BINDINGS),
         (_unsupported_binding_algorithm, StatusCode.ALGORITHM_UNSUPPORTED),
-        (_icon_digest_wrong, StatusCode.HASHED_URI_MISMATCH),
         (_icon_destination_absent, StatusCode.HASHED_URI_MISSING),
+        (_icon_is_not_a_reference, StatusCode.HASHED_URI_MISSING),
     ],
     ids=[
-        "general.error",
-        "assertion.action.malformed",
         "assertion.multipleHardBindings",
         "algorithm.unsupported",
-        "hashedURI.mismatch",
         "hashedURI.missing",
+        "malformed-icon",
     ],
 )
 def test_a_wire_legal_manifest_reports_its_defect_through_verify(
     signer: Signer, mutate: Callable[[list[Assertion], dict[str, object]], None], expected: StatusCode
 ) -> None:
-    """SIX CODES AN INTEGRATOR CAN RECEIVE, DRIVEN FROM BYTES.
-
-    Each was produced only by a direct call to ``_check_assertions``, ``_binding_status``
-    or ``_reference_status``, so the path from a wire document to a ``Verdict`` carrying
-    the code was unexercised -- including ``general.error``, which ``status.py`` calls the
-    Article 50(2) code, and ``assertion.action.malformed``, which fires when
-    ``digitalSourceType`` is missing.
-
-    DRIVING THEM THROUGH ``verify()`` DOES NOT BLUR THEM, which was the stated reason for
-    stopping at the helper. ``_assertion_failure`` returns exactly one code and ``verify``
-    adds it verbatim, and all three phases run unconditionally and accumulate -- so
-    ``codes()`` discriminates exactly as the helper's return value does. The assertion
-    below on ``dataHash.match`` is what proves it: the document is otherwise perfect.
-    """
+    """Public verification reports each signed-wire defect through its exact code."""
     verdict = verify(_resigned(signer, mutate))
 
     assert verdict.state is Provenance.INVALID
     assert expected in verdict.codes(), [code.value for code in verdict.codes()]
-    # THE REST OF THE MARK IS SOUND. Without this the test would pass on a document that
-    # failed for some unrelated reason -- a broken binding, an unparseable claim -- and
-    # the code under test would be incidental.
+    # The valid signature distinguishes the intended defect from unrelated wire damage.
     assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
 
 
-def _poisoned_generator(store: ManifestStore, generator: CborMap) -> CborMap:
-    """A generator-info-map whose icon points at a real assertion with the wrong digest."""
-    icon: CborMap = _widen(_icon(store, hash=b"\x00" * 32))
-    return {**generator, "icon": icon}
-
-
-def _store_with_box(store: ManifestStore, box: JumbfBox) -> bytes:
-    """Serialized store bytes with ``box`` added to the assertion store.
-
-    Returns BYTES rather than a ``ManifestStore``, so the caller has to parse them --
-    which is the point wherever the property under test is about what the parse accepts.
-    """
-    from c2patxt import _jumbf
-    from c2patxt._extract import _reparse
-    from c2patxt._jumbf import parse_superbox
-    from c2patxt.manifest import LABEL_ASSERTION_STORE
-
-    original, _ = parse_superbox(store.raw)
-    manifest, _ = _reparse(original.content[0][1])
-    rebuilt: list[tuple[bytes, bytes]] = []
-    for tbox, payload in manifest.content:
-        child, _ = _reparse(payload)
-        if child.description.label == LABEL_ASSERTION_STORE:
-            child = JumbfBox(
-                description=child.description,
-                content=(*child.content, (_jumbf.TBOX_SUPERBOX, _jumbf.serialize_superbox(box)[8:])),
-            )
-        rebuilt.append((tbox, _jumbf.serialize_superbox(child)[8:]))
-    return _jumbf.serialize_superbox(
-        JumbfBox(
-            description=original.description,
-            content=(
-                (
-                    _jumbf.TBOX_SUPERBOX,
-                    _jumbf.serialize_superbox(JumbfBox(description=manifest.description, content=tuple(rebuilt)))[8:],
-                ),
-            ),
-        )
-    )
-
-
 def test_supplying_anchors_directly_is_refused_rather_than_ignored() -> None:
-    """``VerifyContext(anchors=...)`` accepted the argument and threw it away.
-
-    ``anchors`` is DERIVED from ``anchors_pem`` -- ``__post_init__`` overwrites it
-    unconditionally -- so a caller who passed parsed certificates got a context with
-    ``anchors == ()``, no error, and every mark reported ``signingCredential.untrusted``
-    forever. Silent, and indistinguishable from having supplied nothing.
-
-    THE README TOLD PEOPLE TO DO IT. "Supply anchors via ``VerifyContext(anchors=...)``
-    and it becomes TRUSTED" shipped in the same document that states the correct form
-    fifty lines later. A field that ignores its own keyword is a trap whether or not
-    anything points at it, but a documented trap is one somebody will walk into.
-
-    ``init=False`` is the fix and the refusal is the point: TypeError at the call site
-    names the wrong keyword, where a silently empty tuple names nothing.
-    """
+    """Parsed anchors are derived state; callers supply ``anchors_pem`` instead."""
     with pytest.raises(TypeError, match="anchors"):
         VerifyContext(anchors=())  # pyright: ignore[reportCallIssue] -- that it is a call error IS the property
 
@@ -2474,8 +3342,8 @@ def _with_assertion(store: ManifestStore, label: str, payload: _cbor.CborValue) 
     ``assertion_bytes`` and ``manifest_label`` and nothing else. It is NOT safe for
     ``verify()`` or ``_check_signature``, which read ``claim_bytes`` -- a store built here
     and routed through either would silently be checked against the original claim, and
-    would pass. Use :func:`_store_with_box` and a real parse when the property under test
-    involves the signature or the wire.
+    would pass. Use :func:`_resigned` when the property under test involves the
+    signature or the wire.
     """
     from c2patxt import _jumbf
     from c2patxt.manifest import Assertion
@@ -2499,138 +3367,22 @@ def _with_assertion(store: ManifestStore, label: str, payload: _cbor.CborValue) 
     )
 
 
-@pytest.mark.parametrize(
-    ("payload", "ok"),
-    [
-        ({"actions": [{"action": "c2pa.created"}], "templates": [{"action": "*", "digitalSourceType": _SRC}]}, True),
-        (
-            {
-                "actions": [{"action": "c2pa.created"}],
-                "templates": [{"action": "c2pa.created", "digitalSourceType": _SRC}],
-            },
-            True,
-        ),
-        (
-            {
-                "actions": [{"action": "c2pa.created"}],
-                "templates": [{"action": "c2pa.edited", "digitalSourceType": _SRC}],
-            },
-            False,
-        ),
-        ({"actions": [{"action": "c2pa.created"}], "templates": "not a list"}, False),
-        ({"actions": [{"action": "c2pa.created", "digitalSourceType": _SRC}], "templates": [{"action": "*"}]}, True),
-        # A NON-MAP TEMPLATE, ahead of a good one. `_overlaid_action` skips it with a
-        # `continue`, and that line was reached only by a direct call to that helper --
-        # so nothing checked that the skip survives the rules built on top of it. This
-        # row drives it through `_check_assertions`, which is a layer up rather than the
-        # public `verify()`: it is where the actions rules are decided, and it is the
-        # layer the rest of this file uses. It must be skipped rather than raise, AND
-        # it must not stop the template behind it applying, which is why the good one is
-        # second and the row is expected to PASS.
-        (
-            {
-                "actions": [{"action": "c2pa.created"}],
-                "templates": [42, "not a map", {"action": "*", "digitalSourceType": _SRC}],
-            },
-            True,
-        ),
-    ],
-    ids=[
-        "star-template",
-        "named-template",
-        "template-for-another-action",
-        "templates-not-a-list",
-        "action-wins",
-        "non-map-template-is-skipped",
-    ],
-)
-def test_a_template_may_supply_the_digital_source_type(store: ManifestStore, payload: CborMap, ok: bool) -> None:
-    """C2PA 18.15.6.1: "These values are combined by a C2PA Manifest Consumer with actions
-    of the same name, or with all actions (if the value of the action field is the `*`
-    special value), to get a full picture of an action... A C2PA Manifest Consumer
-    **shall** take the values from the template and overlay the values from the action
-    itself."
-
-    WE REJECTED THE SPECIFICATION'S OWN EXAMPLE. Example 9 is, near verbatim, the first
-    row here: actions carrying no ``digitalSourceType`` and a `*` template supplying it.
-    Requiring the field on the action alone made a conforming manifest
-    ``assertion.action.malformed`` -- and ``_action_references`` in the same module was
-    already walking ``templates`` for icons, so the array was known about and not read.
-
-    ``template-for-another-action`` is the control that keeps the overlay honest: a
-    template naming ``c2pa.edited`` must NOT supply anything to ``c2pa.created``, or the
-    rule degrades into "the field appears somewhere in the assertion".
-
-    ``action-wins`` pins the direction of the overlay -- the template supplies defaults
-    and the action overrides -- which is what "overlay the values from the action itself"
-    means and is the opposite of what a naive ``dict.update`` order would produce.
-    """
-    tampered = _with_assertion(store, ASSERTION_ACTIONS, payload)
-    verdict, accepted = _verify._check_assertions(tampered, Verdict(state=Provenance.INVALID))
-
-    assert accepted is ok
-    if not ok:
-        assert StatusCode.ASSERTION_ACTION_MALFORMED in verdict.codes()
+def _without_hard_binding(items: list[Assertion], _claim: dict[str, object]) -> None:
+    items[:] = [item for item in items if item.label != ASSERTION_HASH_DATA]
 
 
-def test_a_claim_that_never_links_its_hard_binding_says_the_assertion_is_missing(store: ManifestStore) -> None:
-    """The one ``_REQUIRED_ASSERTIONS`` entry that had nothing of its own holding it.
+def test_a_claim_with_no_hard_binding_uses_the_dedicated_claim_status(signer: Signer) -> None:
+    """15.10.1.2 assigns absence to claim.hardBindings.missing, not assertion.missing."""
+    verdict = verify(_resigned(signer, _without_hard_binding))
 
-    Dropping ``frozenset({ASSERTION_HASH_DATA})`` from the tuple left the whole suite
-    green, because a store with no binding is INVALID anyway -- ``_binding_status``
-    reports ``claim.hardBindings.missing`` from a different branch, and every existing
-    test was satisfied by the state. Only the CODE changed, and the code is the entire
-    output an integrator reads.
-
-    THE TWO ARE NOT THE SAME FINDING. ``claim.hardBindings.missing`` says the claim
-    carries no binding to evaluate; ``assertion.missing`` says the claim did not commit
-    to one of the three assertions that make a mark mean anything. Kept as a distinct
-    entry so a claim missing its binding is reported alongside a claim missing its
-    disclosure, in the same words, rather than only through the binding evaluator.
-
-    Driven through ``_check_assertions`` alone so the binding evaluator cannot supply
-    the verdict: whatever fails here is this entry's doing.
-    """
-    url = f"self#jumbf=c2pa.assertions/{ASSERTION_HASH_DATA}"
-    links = store.claim["created_assertions"]
-    assert isinstance(links, list)
-    kept = [link for link in links if not (isinstance(link, dict) and link.get("url") == url)]
-    assert len(kept) == len(links) - 1, "the fixture must have linked its binding"
-
-    unbound = dataclasses.replace(
-        store,
-        claim={**store.claim, "created_assertions": kept},
-        assertions={k: v for k, v in store.assertions.items() if k != ASSERTION_HASH_DATA},
-        assertion_bytes={k: v for k, v in store.assertion_bytes.items() if k != ASSERTION_HASH_DATA},
-    )
-
-    verdict, accepted = _verify._check_assertions(unbound, Verdict(state=Provenance.INVALID))
-    assert not accepted
-    assert StatusCode.ASSERTION_MISSING in verdict.codes()
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.CLAIM_HARD_BINDINGS_MISSING in verdict.codes()
+    assert StatusCode.ASSERTION_MISSING not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
 
 
-@pytest.mark.parametrize(
-    ("url", "ok"),
-    [
-        ("self#jumbf=c2pa.databoxes/c2pa.icon", True),
-        ("self#jumbf=c2pa.databoxes/", False),
-    ],
-    ids=["real-destination", "empty-tail"],
-)
-def test_a_data_box_icon_is_passed_over_only_when_it_names_something(store: ManifestStore, url: str, ok: bool) -> None:
-    """The pass-over decided through a verdict rather than through the private helper.
-
-    ``_reference_status``'s two branches are already tabulated in ``test_negative.py``
-    against a direct call. What that cannot say is that the answer survives the trip:
-    ``None`` has to mean the reference walk finds no failure and ``_check_assertions``
-    accepts, and ``HASHED_URI_MISSING`` has to become a code on the verdict rather than
-    being swallowed by the ``next(...)`` that consumes the walk.
-
-    ``c2pa.databoxes/`` with nothing after it names no destination, so it is not a
-    reference we DECLINED to resolve -- it is one that resolves to nothing, which is
-    what hashedURI.missing is for. Passing it over would let any unresolvable icon be
-    laundered through a trailing slash.
-    """
+@pytest.mark.parametrize("url", ["self#jumbf=c2pa.databoxes/c2pa.icon", "self#jumbf=c2pa.databoxes/"])
+def test_an_unresolved_data_box_icon_is_missing(store: ManifestStore, url: str) -> None:
     icon: CborMap = {"url": url, "hash": b"\x00" * 32, "alg": "sha256"}
     payload: CborMap = {
         "actions": [
@@ -2642,26 +3394,17 @@ def test_a_data_box_icon_is_passed_over_only_when_it_names_something(store: Mani
         _with_assertion(store, ASSERTION_ACTIONS, payload), Verdict(state=Provenance.INVALID)
     )
 
-    assert accepted is ok
-    if not ok:
-        assert StatusCode.HASHED_URI_MISSING in verdict.codes()
+    assert not accepted
+    assert StatusCode.HASHED_URI_MISSING in verdict.codes()
 
 
-def test_a_second_actions_assertion_may_not_smuggle_a_malformed_inception(store: ManifestStore) -> None:
+def test_a_second_actions_assertion_may_not_smuggle_another_inception(store: ManifestStore) -> None:
     """18.15.2: "The full set of actions assertions in a C2PA Manifest shall contain no
     more than one action whose type is either `c2pa.created` or `c2pa.opened`."
 
-    AN UNDER-REJECT, in the rule written to prevent exactly this. ``_actions_status``
-    asked ``_has_single_inception_action`` of every assertion and read ``False`` as
-    "carries no inception" -- but that function returns ``False`` for a dozen unrelated
-    reasons. A second assertion holding a BARE ``c2pa.created``, with no
-    ``digitalSourceType``, was malformed as an inception assertion and therefore counted
-    as holding none, so two inception actions across two assertions verified clean.
-
-    The fix is two predicates rather than one: ``_contains_inception`` asks only whether
-    an inception action appears anywhere, and is what the positional sweep uses;
-    ``_has_single_inception_action`` keeps answering the well-formedness question, and is
-    asked only of the first.
+    The later assertion carries a second ``c2pa.created``. Its optional metadata does
+    not change the rule: the full set of actions assertions may contain only one
+    inception action.
     """
     good: CborMap = {"actions": [{"action": "c2pa.created", "digitalSourceType": _SRC}]}
     bare: CborMap = {"actions": [{"action": "c2pa.created"}]}
@@ -2671,86 +3414,6 @@ def test_a_second_actions_assertion_may_not_smuggle_a_malformed_inception(store:
 
     assert not accepted
     assert StatusCode.ASSERTION_ACTION_MALFORMED in verdict.codes()
-
-
-@pytest.mark.parametrize(
-    ("payload", "ok"),
-    [({"modelType": "c2pa.types.model"}, True), ({}, False), ({"modelType": ""}, False)],
-    ids=["conforming", "empty", "empty-modelType"],
-)
-def test_every_disclosure_instance_is_read_not_just_the_first(store: ManifestStore, payload: CborMap, ok: bool) -> None:
-    """C2PA 6.4 lets a manifest carry ``c2pa.ai-disclosure`` and
-    ``c2pa.ai-disclosure__1``. We read the base label only, so a SECOND disclosure
-    asserting nothing was linked, hash-matched and never looked at -- verifying VALID.
-
-    This is the un-swept remainder of a class already caught once: ``_count_hard_bindings``,
-    ``_actions_labels`` and ``_action_references`` all honour ``__N``, and the disclosure
-    did not. For a package whose stated purpose is carrying one disclosure fact, a
-    second disclosure asserting nothing reaching VALID is that defect again, in the one
-    assertion it matters most for.
-
-    The ``__N`` grammar now lives in ONE helper rather than three copies, which is what
-    stops the fourth site from being written wrong.
-    """
-    tampered = _with_assertion(store, f"{ASSERTION_AI_DISCLOSURE}__1", payload)
-    verdict, accepted = _verify._check_assertions(tampered, Verdict(state=Provenance.INVALID))
-
-    assert accepted is ok
-    if not ok:
-        assert StatusCode.GENERAL_ERROR in verdict.codes()
-
-
-def test_the_store_shape_is_reported_before_a_bad_reference(store: ManifestStore) -> None:
-    """``_assertion_failure``'s docstring calls its check order "the contract... so a
-    manifest missing its disclosure is reported as missing its disclosure rather than as
-    having a bad generator icon". Swapping the two halves of that ``or`` survived the
-    whole suite, because no test made both fail at once.
-
-    An ordering claim needs an input where the two answers differ; with only one defect
-    present, every order gives the same code. This is the third time a prose-only
-    ordering claim has been found unheld in this file, which is why the two below it
-    exist as well.
-
-    The manifest here is broken twice over -- the disclosure link removed AND the
-    generator icon poisoned -- and must report the missing disclosure, because that is
-    what an operator has to fix first.
-    """
-    links = store.claim["created_assertions"]
-    assert isinstance(links, list)
-
-    def names_disclosure(link: _cbor.CborValue) -> bool:
-        return isinstance(link, dict) and ASSERTION_AI_DISCLOSURE in str(link.get("url", ""))
-
-    generator = store.claim["claim_generator_info"]
-    assert isinstance(generator, dict)
-    broken = {
-        **store.claim,
-        "created_assertions": [link for link in links if not names_disclosure(link)],
-        "claim_generator_info": _poisoned_generator(store, generator),
-    }
-
-    verdict, ok = _verify._check_assertions(dataclasses.replace(store, claim=broken), Verdict(state=Provenance.INVALID))
-
-    assert not ok
-    assert StatusCode.ASSERTION_MISSING in verdict.codes()
-    assert StatusCode.HASHED_URI_MISMATCH not in verdict.codes()
-
-
-def test_a_malformed_actions_assertion_is_reported_before_an_empty_disclosure(store: ManifestStore) -> None:
-    """The same class, one level down: ``_store_shape_status`` runs ``_actions_status``
-    before the disclosure loop, and hoisting the disclosure above it survived.
-
-    Both assertions are broken here -- the actions assertion carries no inception and the
-    disclosure is empty -- so the two orders give different codes and the test can tell
-    them apart.
-    """
-    tampered = _with_assertion(_with_assertion(store, ASSERTION_ACTIONS, _ACTIONS_EDITED), ASSERTION_AI_DISCLOSURE, {})
-
-    verdict, ok = _verify._check_assertions(tampered, Verdict(state=Provenance.INVALID))
-
-    assert not ok
-    assert StatusCode.ASSERTION_ACTION_MALFORMED in verdict.codes()
-    assert StatusCode.GENERAL_ERROR not in verdict.codes()
 
 
 def test_a_claim_missing_a_required_field_says_which_check_found_it(store: ManifestStore) -> None:
@@ -2785,11 +3448,8 @@ def test_a_trust_evaluator_that_raises_yields_untrusted_not_a_crash(
 ) -> None:
     """``verify`` promises: "Never raises for absent, corrupt or invalid marks."
 
-    THE TRUST EVALUATOR IS CALLER-SUPPLIED, AND THE RECOMMENDED ONE RAISES. `pyproject`
-    ships `pyhanko-certvalidator` as the ``[trust]`` extra, and its path validation
-    signals an unreachable anchor with ``PathBuildingError`` / ``PathValidationError`` --
-    which is the single most likely outcome of asking it about a chain. So the natural
-    implementation of the documented seam broke the package's central promise.
+    A trust evaluator is caller-supplied and may wrap a backend that raises. The seam
+    must not break the package's central promise when that happens.
 
     IT FIRED ONLY ON THE SIGNATURE-VALID PATH WITH ANCHORS SUPPLIED, which is the exact
     asymmetry ``VerifyContext.anchors_pem`` was rewritten to remove -- "a bomb that fires
@@ -2820,64 +3480,86 @@ def test_a_trust_evaluator_that_raises_yields_untrusted_not_a_crash(
     assert type(failure).__name__ in explanations, "the evaluator's failure must be visible, not swallowed"
 
 
-def test_a_store_labelled_c2pa_actions_v1_is_accepted(store: ManifestStore) -> None:
-    """The v1 actions label reported ``assertion.missing`` -- naming a condition that
-    was not the one that failed, for a store that plainly HAD an actions assertion and
-    linked it.
-
-    Every clause names both labels. 15.10.3.2.3 opens "If the assertion's label is
+def test_a_serialized_store_labelled_c2pa_actions_v1_is_accepted(signer: Signer) -> None:
+    """Every clause names both action labels. 15.10.3.2.3 opens "If the assertion's label is
     c2pa.actions or c2pa.actions.v2"; Table 7 lists them as one row; 5.1 says a
     deprecated construct "can be read, but never written", and we still emit v2 only.
 
-    DRIVEN THROUGH A RELABELLED STORE, not through the pure label function. The
-    behaviour was correct when this was written and NOTHING HELD IT: reverting
-    ``_REQUIRED_ASSERTIONS`` to v2-only left the entire suite green, so the false
-    reject this fixes had no guard at all. Relabelling the assertion, its raw bytes and
-    the claim's link together is what makes the store a genuine v1 manifest rather than
-    a v2 one with a renamed key.
+    The fixture is serialized and signed before public extraction and verification, so
+    the parser cannot silently drop the deprecated label while private verifier tests
+    remain green.
     """
-    v1 = ASSERTION_ACTIONS_V1
-    original = store.claim["created_assertions"]
-    assert isinstance(original, list)
 
-    links: list[_cbor.CborValue] = []
-    for link in original:
-        if isinstance(link, dict):
-            url = link.get("url")
-            if isinstance(url, str) and ASSERTION_ACTIONS in url:
-                links.append({**link, "url": url.replace(ASSERTION_ACTIONS, v1)})
-                continue
-        links.append(link)
-    relabelled = dataclasses.replace(
-        store,
-        claim={**store.claim, "created_assertions": links},
-        assertions={
-            (v1 if label == ASSERTION_ACTIONS else label): payload for label, payload in store.assertions.items()
-        },
-        assertion_bytes={
-            (v1 if label == ASSERTION_ACTIONS else label): raw for label, raw in store.assertion_bytes.items()
-        },
-    )
+    def relabel_actions(items: list[Assertion], _claim: dict[str, object]) -> None:
+        actions = items[0]
+        assert actions.label == ASSERTION_ACTIONS
+        items[0] = Assertion(label=ASSERTION_ACTIONS_V1, payload=actions.payload)
 
-    verdict, accepted = _verify._check_assertions(relabelled, Verdict(state=Provenance.INVALID))
+    marked = _resigned(signer, relabel_actions)
+    store = extract(marked)
+    assert store is not None
+    assert ASSERTION_ACTIONS_V1 in store.assertions
+    assert ASSERTION_ACTIONS not in store.assertions
 
-    assert accepted, f"a v1 actions assertion was rejected: {verdict.failure}"
+    verdict = verify(marked)
+
+    assert verdict.state is Provenance.VALID
     assert StatusCode.ASSERTION_MISSING not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+    assert StatusCode.SIGNING_CREDENTIAL_UNTRUSTED in verdict.codes()
+
+
+def test_actions_v1_resolves_its_singular_ingredient_field(signer: Signer) -> None:
+    """The deprecated v1 shape uses ``ingredient``, not v2's ``ingredients`` array."""
+    marked = _resigned(signer, _v1_placed_with_singular_component)
+    store = extract(marked)
+    assert store is not None
+    actions = store.assertion(ASSERTION_ACTIONS_V1)
+    assert isinstance(actions, dict)
+    entries = actions["actions"]
+    assert isinstance(entries, list)
+    placed = entries[1]
+    assert isinstance(placed, dict)
+    parameters = placed["parameters"]
+    assert isinstance(parameters, dict)
+    assert "ingredient" in parameters
+    assert "ingredients" not in parameters
+
+    verdict = verify(marked)
+
+    assert StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+    assert StatusCode.GENERAL_ERROR in verdict.codes(), "full ingredient-manifest validation remains unsupported"
+
+
+def test_actions_v1_rejects_the_v2_plural_ingredient_field(signer: Signer) -> None:
+    """A valid component link under the wrong field proves the v1 check actually ran."""
+    marked = _resigned(signer, _v1_placed_with_plural_component)
+    store = extract(marked)
+    assert store is not None
+    actions = store.assertion(ASSERTION_ACTIONS_V1)
+    assert isinstance(actions, dict)
+    entries = actions["actions"]
+    assert isinstance(entries, list)
+    placed = entries[1]
+    assert isinstance(placed, dict)
+    parameters = placed["parameters"]
+    assert isinstance(parameters, dict)
+    assert "ingredient" not in parameters
+    assert "ingredients" in parameters
+
+    verdict = verify(marked)
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
 
 
 def test_an_unlinked_second_hard_binding_is_undeclared_not_multiple(store: ManifestStore) -> None:
-    """An unlinked extra assertion reported the wrong condition when it happened to be
-    a hard binding.
+    """C2PA 15.10.1.2 counts the hard bindings the claim links.
 
-    ``_count_hard_bindings`` read the STORE while the undeclared check reads the CLAIM,
-    so an unlinked ``c2pa.hash.data__1`` produced ``assertion.multipleHardBindings`` --
-    sending an investigator to look for two bindings the claim never named -- where an
-    unlinked assertion of any other type produces ``assertion.undeclared``.
-
-    Both reject, so this is a naming defect rather than a hole. It still matters: the
-    code is the first thing an operator reads, and 15.10.1.2's rule is about the
-    bindings the claim VOUCHES for. Two LINKED bindings are still
-    ``multipleHardBindings``, which the second half of this test pins.
+    An unlinked ``c2pa.hash.data__1`` is ``assertion.undeclared``. Two linked bindings
+    are ``assertion.multipleHardBindings``.
     """
     smuggled = dataclasses.replace(
         store,
@@ -2890,31 +3572,313 @@ def test_an_unlinked_second_hard_binding_is_undeclared_not_multiple(store: Manif
     assert StatusCode.ASSERTION_MULTIPLE_HARD_BINDINGS not in verdict.codes()
 
 
-def test_an_unparseable_signature_box_reports_missing_not_mismatch(store: ManifestStore) -> None:
-    """15.7's code for a signature box that will not parse is ``claimSignature.missing``.
+def _rfc9052_sig_structure(protected: bytes, payload: bytes) -> bytes:
+    """RFC 9052 4.4, encoded by the independent test-only CBOR implementation."""
+    return cbor2.dumps(["Signature1", protected, b"", payload], canonical=True)
 
-    Every other code choice in ``_verify`` is pinned -- eleven were mutated and ten
-    died -- and this one was not: swapping it to ``claimSignature.mismatch`` passed the
-    whole suite. The distinction is what an operator acts on. MISSING says the
-    credential is not there to check; MISMATCH says it is there and does not verify,
-    which sends them looking for tampering that has not happened.
+
+def _mark_with_cose_algorithm(
+    text: str,
+    private_key: ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey | Ed448PrivateKey,
+    algorithm: int,
+    hash_algorithm: hashes.HashAlgorithm | None,
+    *,
+    certificate: x509.Certificate | None = None,
+) -> str:
+    """Build a signed mark the deliberately Ed25519-only producer cannot emit."""
+    from c2patxt.manifest import _prepare_manifest, _serialize_prepared_manifest
+
+    normalized = unicodedata.normalize("NFC", text)
+    encoded = normalized.encode("utf-8")
+    if certificate is None:
+        certificate = build_certificate(private_key)
+    protected = _cbor.dumps(
+        {
+            _cose.COSE_HEADER_ALG: algorithm,
+            _cose.COSE_HEADER_X5CHAIN: certificate.public_bytes(Encoding.DER),
+        }
+    )
+
+    def prepare(exclusion_length: int) -> Callable[[int], str]:
+        prepared = _prepare_manifest(
+            disclosure=DISCLOSURE,
+            digest=hashlib.sha256(encoded).digest(),
+            exclusion_start=len(encoded),
+            exclusion_length=exclusion_length,
+            instance_id="xmp:iid:mandatory-signature-algorithm",
+            when=WHEN,
+            generator_name="C2PA signature-algorithm test fixture",
+        )
+        # Do not sign the verifier's own Sig_structure implementation. If that helper
+        # and verification share the same defect, a round trip stays green. RFC 9052's
+        # literal four-element structure is encoded by cbor2 instead.
+        to_be_signed = _rfc9052_sig_structure(protected, prepared.claim_bytes)
+        if isinstance(private_key, ec.EllipticCurvePrivateKey):
+            assert hash_algorithm is not None
+            der_signature = private_key.sign(to_be_signed, ec.ECDSA(hash_algorithm))
+            r, s = decode_dss_signature(der_signature)
+            component_size = (private_key.curve.key_size + 7) // 8
+            signature = r.to_bytes(component_size, "big") + s.to_bytes(component_size, "big")
+        elif isinstance(private_key, rsa.RSAPrivateKey):
+            assert hash_algorithm is not None
+            signature = private_key.sign(
+                to_be_signed,
+                padding.PSS(mgf=padding.MGF1(hash_algorithm), salt_length=hash_algorithm.digest_size),
+                hash_algorithm,
+            )
+        else:
+            signature = private_key.sign(to_be_signed)
+        signed = _cose._SignedClaim(protected=protected, signature=signature)
+
+        def assemble(pad_size: int) -> str:
+            cose = _cose._serialize_signed_claim(signed, pad=pad_size)
+            store = _serialize_prepared_manifest(
+                prepared,
+                signature=cose,
+                manifest_uuid=uuid.UUID("00000000-0000-4000-8000-000000000019"),
+            )
+            return build_wrapper(store)
+
+        return assemble
+
+    wrapper, _ = _fixpoint.solve(prepare)
+    return normalized + wrapper
+
+
+def _ed448_leaf_signed_by_ed25519(private_key: Ed448PrivateKey) -> x509.Certificate:
+    """An Ed448 subject key under a profile-permitted Ed25519 issuer signature."""
+    issuer_key = Ed25519PrivateKey.from_private_bytes(bytes(reversed(range(32))))
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Ed448 C2PA test leaf")])
+    issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Ed25519 C2PA test issuer")])
+    return (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(0xED448)
+        .not_valid_before(WHEN - datetime.timedelta(days=1))
+        .not_valid_after(WHEN + datetime.timedelta(days=365))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.ExtendedKeyUsage([C2PA_CLAIM_SIGNING_EKU]), critical=False)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
+            critical=False,
+        )
+        .sign(issuer_key, None)
+    )
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "curve", "hash_algorithm"),
+    [
+        (-7, ec.SECP256R1(), hashes.SHA256()),
+        (-35, ec.SECP384R1(), hashes.SHA384()),
+        (-36, ec.SECP521R1(), hashes.SHA512()),
+        # RFC 9053 permits this polymorphic combination; pairing P-256 with
+        # SHA-256 is recommended for interoperability, not required on read.
+        (-7, ec.SECP521R1(), hashes.SHA256()),
+    ],
+    ids=["es256-p256", "es384-p384", "es512-p521", "es256-p521"],
+)
+def test_public_verify_accepts_every_required_ecdsa_shape(
+    algorithm: int,
+    curve: ec.EllipticCurve,
+    hash_algorithm: hashes.HashAlgorithm,
+) -> None:
+    marked = _mark_with_cose_algorithm(
+        "ECDSA C2PA mark.",
+        ec.generate_private_key(curve),
+        algorithm,
+        hash_algorithm,
+    )
+
+    verdict = verify(marked)
+
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+    assert StatusCode.DATA_HASH_MATCH in verdict.codes()
+    assert StatusCode.ALGORITHM_UNSUPPORTED not in verdict.codes()
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "hash_algorithm"),
+    [
+        (-37, hashes.SHA256()),
+        (-38, hashes.SHA384()),
+        (-39, hashes.SHA512()),
+    ],
+    ids=["ps256", "ps384", "ps512"],
+)
+def test_public_verify_accepts_every_required_rsa_pss_algorithm(
+    algorithm: int,
+    hash_algorithm: hashes.HashAlgorithm,
+) -> None:
+    marked = _mark_with_cose_algorithm(
+        "RSA-PSS C2PA mark.",
+        rsa.generate_private_key(public_exponent=65537, key_size=2048),
+        algorithm,
+        hash_algorithm,
+    )
+
+    verdict = verify(marked)
+
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+    assert StatusCode.DATA_HASH_MATCH in verdict.codes()
+    assert StatusCode.ALGORITHM_UNSUPPORTED not in verdict.codes()
+
+
+@pytest.mark.parametrize("algorithm", [-7, -37], ids=["es256-with-ed25519-key", "ps256-with-ed25519-key"])
+def test_public_verify_rejects_a_key_that_cannot_implement_the_declared_algorithm(algorithm: int) -> None:
+    """C2PA 13.2.1: an allowed algorithm paired with the wrong key is a bad signature."""
+    if algorithm == -7:
+        private_key: ec.EllipticCurvePrivateKey | rsa.RSAPrivateKey = ec.generate_private_key(ec.SECP256R1())
+    else:
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    leaf_key = Ed25519PrivateKey.generate()
+    marked = _mark_with_cose_algorithm(
+        "C2PA algorithm and key mismatch.",
+        private_key,
+        algorithm,
+        hashes.SHA256(),
+        certificate=build_certificate(leaf_key),
+    )
+
+    verdict = verify(marked)
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.CLAIM_SIGNATURE_MISMATCH in verdict.codes()
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID not in verdict.codes()
+    assert StatusCode.ALGORITHM_UNSUPPORTED not in verdict.codes()
+
+
+def test_public_verify_rejects_ed448_as_the_forbidden_eddsa_instance() -> None:
+    """C2PA 13.2.1 permits Ed25519 only within COSE EdDSA algorithm -8."""
+    key = Ed448PrivateKey.generate()
+    marked = _mark_with_cose_algorithm(
+        "Ed448 C2PA mark.",
+        key,
+        COSE_ALG_EDDSA,
+        None,
+        certificate=_ed448_leaf_signed_by_ed25519(key),
+    )
+
+    verdict = verify(marked)
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.CLAIM_SIGNATURE_MISMATCH in verdict.codes()
+    assert StatusCode.SIGNING_CREDENTIAL_INVALID not in verdict.codes()
+    assert StatusCode.ALGORITHM_UNSUPPORTED not in verdict.codes()
+
+
+@pytest.mark.parametrize(
+    ("damage", "expected"),
+    [
+        ("malformed-cose", StatusCode.GENERAL_ERROR),
+        ("missing-credential", StatusCode.SIGNING_CREDENTIAL_INVALID),
+        ("bad-credential-shape", StatusCode.SIGNING_CREDENTIAL_INVALID),
+        ("unsupported-algorithm", StatusCode.ALGORITHM_UNSUPPORTED),
+        ("float-alg", StatusCode.ALGORITHM_UNSUPPORTED),
+        ("unknown-critical-header", StatusCode.GENERAL_ERROR),
+        ("singleton-chain", StatusCode.SIGNING_CREDENTIAL_INVALID),
+        ("bad-signature-shape", StatusCode.GENERAL_ERROR),
+        ("short-signature", StatusCode.CLAIM_SIGNATURE_MISMATCH),
+        ("long-signature", StatusCode.CLAIM_SIGNATURE_MISMATCH),
+        ("bad-signature", StatusCode.CLAIM_SIGNATURE_MISMATCH),
+    ],
+)
+# One table holds each public 15.7 category; splitting it would duplicate the wire rebuild.
+def test_signature_failures_keep_their_15_7_categories(
+    signer: Signer,
+    damage: str,
+    expected: StatusCode,
+) -> None:
+    """A present signature is not missing, and a bad algorithm is not a bad signature.
+
+    C2PA 15.7 reserves ``claimSignature.missing`` for an absent field or a URI that
+    cannot be resolved. It gives unsupported algorithms and unacceptable credentials
+    their own codes. A structurally malformed, present COSE value has no dedicated
+    code, so Table 4's ``general.error`` is the narrow fallback for an error not listed
+    elsewhere.
     """
-    broken = dataclasses.replace(store, signature=b"\xff\xff not COSE at all")
-    verdict, ok, _trusted = _verify._check_signature(broken, Verdict(state=Provenance.INVALID), VerifyContext())
+    from c2patxt import _cose
+    from c2patxt._extract import _reparse
 
-    assert not ok
-    assert StatusCode.CLAIM_SIGNATURE_MISSING in verdict.codes()
-    assert StatusCode.CLAIM_SIGNATURE_MISMATCH not in verdict.codes()
+    original = extract(mark("Hello world.", signer))
+    assert original is not None
+
+    if damage == "malformed-cose":
+        forged = b"\xff\xff not COSE at all"
+    else:
+        protected: dict[int, _cbor.CborValue] = {_cose.COSE_HEADER_ALG: COSE_ALG_EDDSA}
+        signature: _cbor.CborValue = b"\x00" * 64
+        if damage != "missing-credential":
+            protected[_cose.COSE_HEADER_X5CHAIN] = signer.x5chain()[0]
+        if damage == "bad-credential-shape":
+            protected[_cose.COSE_HEADER_X5CHAIN] = 7
+        elif damage == "unsupported-algorithm":
+            protected[_cose.COSE_HEADER_ALG] = 999
+        elif damage == "float-alg":
+            protected[_cose.COSE_HEADER_ALG] = -8.0
+        elif damage == "unknown-critical-header":
+            protected[_cose.COSE_HEADER_CRIT] = [999]
+            protected[999] = "must understand"
+        elif damage == "singleton-chain":
+            protected[_cose.COSE_HEADER_X5CHAIN] = [signer.x5chain()[0]]
+        elif damage == "bad-signature-shape":
+            signature = 7
+        elif damage == "short-signature":
+            signature = b"\x00" * 63
+        elif damage == "long-signature":
+            signature = b"\x00" * 65
+        protected_bytes = cbor2.dumps(protected) if damage == "float-alg" else _cbor.dumps(protected)
+        forged = _cbor.dumps(
+            _cbor.Tagged(
+                _cbor.TAG_COSE_SIGN1,
+                [protected_bytes, {}, None, signature],
+            )
+        )
+
+    def rebuild(manifest: JumbfBox) -> tuple[tuple[bytes, bytes], ...]:
+        children: list[tuple[bytes, bytes]] = []
+        for tbox, payload in manifest.content:
+            child, _ = _reparse(payload)
+            if child.description.label == LABEL_CLAIM_SIGNATURE:
+                child = JumbfBox(description=child.description, content=((b"cbor", forged),))
+            children.append((tbox, _jumbf.serialize_superbox(child)[8:]))
+        return tuple(children)
+
+    evaluator = RecordingTrustEvaluator(trusted=True)
+    context = VerifyContext(
+        anchors_pem=signer.certificates[0].public_bytes(Encoding.PEM),
+        trust_evaluator=evaluator,
+    )
+    verdict = verify(_restore_manifest(original, rebuild), context=context)
+
+    assert verdict.state is Provenance.INVALID
+    assert expected in verdict.codes()
+    assert not evaluator.calls, f"{damage} reached the trust backend before its signature was accepted"
+    assert StatusCode.CLAIM_SIGNATURE_MISSING not in verdict.codes()
+    if expected is not StatusCode.CLAIM_SIGNATURE_MISMATCH:
+        assert StatusCode.CLAIM_SIGNATURE_MISMATCH not in verdict.codes()
 
 
 def test_an_expired_credential_explains_which_rule_and_when(signing_key: Ed25519PrivateKey) -> None:
-    """``Verdict.explanation`` is a channel, and half of it was unasserted.
-
-    The three explanations that ARE pinned all died under mutation; this one could be
-    replaced with ``None`` and nothing noticed. An explanation that silently becomes
-    absent is worse than one that was never promised: ``raise_for_state`` and every
-    log line built from a verdict lose the only sentence saying WHY.
-    """
+    """The failure explains the certificate index, validity window and validation time."""
     import datetime
 
     expired = build_certificate(
@@ -2923,7 +3887,8 @@ def test_an_expired_credential_explains_which_rule_and_when(signing_key: Ed25519
         not_after=datetime.datetime(2021, 1, 1, tzinfo=datetime.timezone.utc),
     )
     signer = Signer(private_key=signing_key, certificates=(expired,), allow_nonconformant=True)
-    text = mark("Hello world.", signer)
+    creation_time = datetime.datetime(2020, 6, 1, tzinfo=datetime.timezone.utc)
+    text = mark("Hello world.", signer, when=creation_time)
 
     verdict = verify(text, context=VerifyContext(now=datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc)))
 

@@ -5,12 +5,18 @@ updates:
   # rot into "old pinned SHA with a known CVE".
   - package-ecosystem: "uv"
     directory: "/"
+    # Version updates follow the integration branch. Dependabot security updates target
+    # the repository's default branch instead; CONTRIBUTING.md records that exception.
+    target-branch: "develop"
     schedule:
       interval: "weekly"
     cooldown:
-      default-days: 7 # Mirrors [tool.uv] exclude-newer: never pull a freshly-compromised release.
+      # Rolling release-age delay for Dependabot. pyproject's fixed exclude-newer date
+      # serves lockfile reproducibility and is a separate control.
+      default-days: 7
   - package-ecosystem: "github-actions"
     directory: "/"
+    target-branch: "develop"
     schedule:
       interval: "weekly"
     cooldown:

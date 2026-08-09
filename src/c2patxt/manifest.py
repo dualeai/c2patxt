@@ -54,60 +54,60 @@ SPEC_VERSION = "2.4.0"
 LABEL_CLAIM_SIGNATURE = "c2pa.signature"
 
 #: The URI a claim uses to point at its own signature box, in 8.4.2.1's
-#: manifest-relative form. Named rather than inlined because a validator must RESOLVE
-#: this field (15.7) rather than assume it, so the producing and validating sides are
-#: two separate readings of one rule and the constant is where they are seen to agree.
+#: manifest-relative form. Validators resolve it under 15.7.
 CLAIM_SIGNATURE_URI = f"self#jumbf={LABEL_CLAIM_SIGNATURE}"
 
 ASSERTION_URI_PREFIX = f"self#jumbf={LABEL_ASSERTION_STORE}/"
-"""The manifest-relative assertion URI prefix (8.4.2.1).
-
-DERIVED, NOT SPELLED OUT, for the reason `CLAIM_SIGNATURE_URI` already gives: the
-producing and validating sides are two separate readings of one rule, and the constant
-is where they are seen to agree. This was a literal in three places -- the producer's
-f-string here and two prefixes in `_verify` -- for the URI written four times per
-manifest, which is the one most worth deriving.
-"""
+"""The manifest-relative assertion URI prefix (8.4.2.1)."""
 
 #: C2PA 13.1 permits exactly these three and states that implementations "shall not
 #: support additional algorithms on an optional basis".
 HASH_ALGORITHMS = {"sha256": hashlib.sha256, "sha384": hashlib.sha384, "sha512": hashlib.sha512}
 DEFAULT_HASH_ALGORITHM = "sha256"
+_MAX_TSTR_LENGTH = 1_000_000
+_UUID_VERSION = 4
 
 #: IPTC digital source type for content produced by a generative model.
 DIGITAL_SOURCE_TYPE_TRAINED = "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
 
 ASSERTION_HASH_DATA = "c2pa.hash.data"
-#: C2PA 18.15.1: "There are two versions of the actions assertion - the deprecated v1
-#: (with label c2pa.actions) and the new v2 (which shall have a label of
-#: c2pa.actions.v2)." 5.1 makes "deprecated" mean a claim generator SHALL NOT write
-#: it, and Appendix C.1 lists c2pa.actions as deprecated in both 2.3 and 2.4. We
+#: C2PA 18.15.1 defines deprecated ``c2pa.actions`` v1 and current
+#: ``c2pa.actions.v2``. This producer emits v2.
 ASSERTION_ACTIONS = "c2pa.actions.v2"
 
 ASSERTION_ACTIONS_V1 = "c2pa.actions"
-"""The deprecated v1 actions label. READ ONLY -- we never emit it.
+"""The deprecated v1 actions label, accepted on read and never emitted (C2PA 5.1).
 
-C2PA 5.1: a deprecated construct "can be read, but never written".
-
-THIS CITED 6.6 AND 6.6 IS ASSERTION SALTS. The repo used both numbers for the same
-rule, eight lines apart in this file. Two independent citations settle it without
-reaching for the specification: ``_embed.py`` cites 6.6 for salt boxes existing "for
-secure redaction, which needs per-assertion randomness", and this file cites 5.1
-twice more for ``specVersion`` declaration -- so 5.1 is versioning, which is where
-"deprecated" is defined. Recorded because the compatibility inventory only checks
-that a clause NUMBER appears somewhere, so it cannot catch a number filed under the
-wrong meaning. 15.10.3.2.3 opens
-"If the assertion's label is c2pa.actions or c2pa.actions.v2", and Table 7 lists the two
-as one row, so a validator that knows only v2 rejects a conforming v1 manifest -- and
-reports assertion.missing, naming a condition that is not the one that failed.
-
-Accepting the LABEL is not accepting the v2 SHAPE. The rules applied to a v1 body are
-the ones v1 shares: the ``actions`` array, each entry's ``action`` name, and
-``digitalSourceType``. ``templates`` and the plural ``softwareAgents`` are v2-only, and
-a v1 body carries neither, so the reference walk simply finds nothing.
+Validation applies the fields v1 and v2 share. V2-only template and plural
+``softwareAgents`` fields are not inferred for a v1 body.
 """
 ASSERTION_AI_DISCLOSURE = "c2pa.ai-disclosure"
 ASSERTION_METADATA = "c2pa.metadata"
+ASSERTION_REPOSITORY_RECEIPT = "c2pa.repository-receipt"
+
+
+def _utf8_size(value: object, *, field: str) -> int:
+    """Return the encoded size of a CDDL ``tstr``, with a field-specific error."""
+    if not isinstance(value, str):
+        msg = f"{field} must be a UTF-8 text string"
+        raise ValueError(msg)
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        msg = f"{field} must be a UTF-8 text string"
+        raise ValueError(msg) from exc
+
+
+def _rfc3339_tdate(when: datetime.datetime) -> str:
+    """Format a C2PA ``tdate`` after checking RFC 3339's offset grammar."""
+    offset = when.utcoffset() if when.tzinfo is not None else None
+    if offset is None:
+        msg = "when must be timezone-aware; a naive datetime has no defined instant"
+        raise ValueError(msg)
+    if offset % datetime.timedelta(minutes=1):
+        msg = "when must have a whole-minute UTC offset representable by RFC 3339"
+        raise ValueError(msg)
+    return when.isoformat().replace("+00:00", "Z")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -123,12 +123,9 @@ class Assertion:
     json_ld: bytes | None = None
     """Pre-serialized JSON-LD, when the clause requires JSON rather than CBOR.
 
-    ONE ASSERTION WE EMIT NEEDS THIS. Table 7 (18.4) lists ``c2pa.metadata`` as JSON-LD
-    -- and also ``c2pa.repository-receipt``, plus Embedded File entries for ingredients
-    and thumbnails, none of which we produce. 18.17.2 is explicit: "Each metadata
-    assertion shall contain a single JSON content type box containing the JSON-LD
-    serialization of one or more metadata values. The @context property within the
-    JSON-LD object shall be included".
+    Table 7 (18.4) lists ``c2pa.metadata`` and ``c2pa.repository-receipt`` as JSON-LD.
+    This producer emits metadata only. Section 18.17.2 requires one JSON content box
+    and an ``@context`` property.
     """
 
     def to_box(self) -> JumbfBox:
@@ -149,8 +146,7 @@ def hashed_uri(box: JumbfBox, url: str, algorithm: str = DEFAULT_HASH_ALGORITHM)
 
     The hash covers the description box and the content boxes but EXCLUDES the
     superbox header (8.4.2.3). Getting that wrong produces a claim that verifies
-    structurally while every assertion link fails, and it is the first thing to
-    instrument when chasing a mismatch against another implementation.
+    structurally while every assertion link fails.
     """
     if algorithm not in HASH_ALGORITHMS:
         msg = f"unsupported hash algorithm {algorithm!r}; C2PA 13.1 permits {sorted(HASH_ALGORITHMS)}"
@@ -178,36 +174,40 @@ class Claim:
     signature_url: str
     algorithm: str = DEFAULT_HASH_ALGORITHM
 
+    def __post_init__(self) -> None:
+        instance_id_size = _utf8_size(self.instance_id, field="claim instanceID")
+        if not 1 <= instance_id_size <= _MAX_TSTR_LENGTH:
+            msg = "claim instanceID must contain 1 to 1,000,000 UTF-8 bytes (C2PA claim-map-v2)"
+            raise ValueError(msg)
+
+        name_size = _utf8_size(self.claim_generator_name, field="claim generator name")
+        if not 1 <= name_size <= _MAX_TSTR_LENGTH:
+            msg = "claim generator name must contain 1 to 1,000,000 UTF-8 bytes (C2PA generator-info-map)"
+            raise ValueError(msg)
+
     def to_payload(self) -> dict[str, object]:
         generator: dict[str, object] = {"name": self.claim_generator_name}
         if self.claim_generator_version is not None:
             generator["version"] = self.claim_generator_version
-        # 10.2.3.2 and 5.1: a claim generator "should declare which version of the
-        # specification it is using". 2.4 raised this from "may" to "should" and moved
-        # the field OUT of the claim into the generator info map, deprecating the
-        # claim-level one -- so it belongs here and nowhere else.
-        #
-        # It carries real information rather than decoration: 5.1 says setting it
-        # declares the manifest "does not contain any constructs that are deprecated in
-        # that version", and we emit c2pa.actions.v2 precisely because c2pa.actions is
-        # deprecated at 2.4. Changing this constant is therefore a claim about the
-        # WHOLE producer, not a version bump.
+        # 10.2.3.2 places specVersion in claim_generator_info. Declaring 2.4 also states
+        # that this producer emits no construct deprecated in that version.
         generator["specVersion"] = SPEC_VERSION
         return {
             "instanceID": self.instance_id,
-            # A BARE MAP, not an array. The two claim versions differ here and the
-            # difference is easy to miss:
-            #   claim-map    (v1): "claim_generator_info": [1* generator-info-map]
-            #   claim-map-v2     : "claim_generator_info": $generator-info-map
-            # We emit c2pa.claim.v2, so an array makes the claim claim.malformed to a
-            # CDDL-strict validator. c2pa-rs agrees, serializing only cgi[0] as a bare
-            # object for V2 claims. The signature covers these bytes, so getting it
-            # wrong cannot be patched after the fact.
+            # claim-map-v2 carries one generator-info map; v1 used an array.
             "claim_generator_info": generator,
             "created_assertions": list(self.created_assertions),
             "signature": self.signature_url,
             "alg": self.algorithm,
         }
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _PreparedManifest:
+    """The assertion boxes and exact claim bytes for one producer candidate."""
+
+    assertion_boxes: tuple[JumbfBox, ...]
+    claim_bytes: bytes
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -276,10 +276,9 @@ def _actions_assertion(when: datetime.datetime) -> Assertion:
                 {
                     "action": "c2pa.created",
                     "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED,
-                    # TAG 0, not a bare string. 18.15.12's CDDL types this `tdate`,
-                    # 6.9 defines that as "serialized in CBOR as tag number 0", and
-                    # the spec's own example writes 0("2023-02-11T09:00:00Z"). We
-                    "when": _cbor.Tagged(0, when.isoformat().replace("+00:00", "Z")),
+                    # The actions-v2 CDDL types `when` as tdate, encoded with CBOR tag
+                    # 0. UTC instants use the `Z` form.
+                    "when": _cbor.Tagged(0, _rfc3339_tdate(when)),
                 }
             ]
         },
@@ -310,17 +309,10 @@ def _ai_disclosure_assertion(disclosure: Disclosure) -> Assertion:
 def _metadata_assertion(disclosure: Disclosure) -> Assertion:
     """The ``c2pa.metadata`` assertion, carrying ``dc:format`` (C2PA 18.17).
 
-    THIS IS WHERE ``dc:format`` LIVES IN A v2 CLAIM. The spec is explicit: "The
-    c2pa.claim has a dc:format field which is no longer present in c2pa.claim.v2",
-    and 18.17 defines the metadata assertion as the standardized home for exactly
-    this kind of field. Putting it in an assertion rather than the claim also means it
-    is covered by a hashed-URI link and therefore authenticated, which a claim field
-    would be too but by a different route.
-
-    It is not decoration. The C2PA Text Asset Conformance Rubric v0.1.0's second
-    check, ``text:is_text_asset``, is "Active manifest declares a supported text MIME
-    type in dc:format" -- so a manifest without it fails the only formal conformance
-    instrument that exists for text.
+    This producer records the format in metadata because ``claim-map-v2`` removed its
+    former ``dc:format`` field. C2PA 18.21.3 also says exact IANA text/application
+    types should appear in ``c2pa.asset-type.v2``; emitting that additional assertion
+    would change the signed producer wire and is not part of the current profile.
     """
     # JSON-LD in a `json` content box, with @context, per 18.17.2. Serialized with
     # sorted keys and no whitespace so the bytes are deterministic -- the hashed-URI
@@ -333,35 +325,36 @@ def _metadata_assertion(disclosure: Disclosure) -> Assertion:
     return Assertion(label=ASSERTION_METADATA, payload=document, json_ld=payload)
 
 
-def _hash_data_assertion(digest: bytes, start: int, length: int, algorithm: str, pad: bytes) -> Assertion:
+def _hash_data_assertion(
+    digest: bytes,
+    start: int,
+    length: int,
+    *,
+    algorithm: str,
+    pad: bytes,
+) -> Assertion:
     """The ``c2pa.hash.data`` hard binding (C2PA 18.5.2).
 
-    ``pad`` is REQUIRED -- the CDDL has no ``?`` on it -- and validators "shall
-    ignore the presence and contents of pad and pad2". It is also the only
-    spec-sanctioned place to put slack bytes (10.4 "Multiple Step Processing"), which
-    is what :mod:`c2patxt._fixpoint` uses to hit an exact wrapper length. A.8 defines
-    no padding mechanism of its own, so padding anywhere else would be an invention
-    that no other implementation could be expected to agree with.
-
-    ``pad2`` is not emitted. 10.4.4 introduces it because deterministic CBOR makes
-    some total sizes unreachable with one length-prefixed field; we reach every size
-    instead by varying the CONTENT of ``pad`` rather than only its length, since a
-    zero byte costs 3 UTF-8 bytes as a variation selector and a high byte costs 4.
+    ``pad`` is required and must be zero-filled. The A.8 size solver leaves it empty
+    and changes the separate unprotected COSE padding described by 10.4.2 and 10.4.4.
+    This producer does not preallocate the assertion box, so it does not need the
+    optional data-hash ``pad2`` used to bridge preallocated CBOR size gaps.
 
     ``url`` is deprecated: "claim generators shall not add this field".
     """
-    return Assertion(
-        label=ASSERTION_HASH_DATA,
-        payload={
-            "exclusions": [{"start": start, "length": length}],
-            "alg": algorithm,
-            "hash": digest,
-            "pad": pad,
-        },
-    )
+    if any(pad):
+        msg = "data-hash pad must be zero-filled (C2PA 18.5.2)"
+        raise ValueError(msg)
+    payload: dict[str, _cbor.CborValue] = {
+        "exclusions": [{"start": start, "length": length}],
+        "alg": algorithm,
+        "hash": digest,
+        "pad": pad,
+    }
+    return Assertion(label=ASSERTION_HASH_DATA, payload=payload)
 
 
-def _assertions_and_claim(
+def _prepare_manifest(
     *,
     disclosure: Disclosure,
     digest: bytes,
@@ -370,31 +363,28 @@ def _assertions_and_claim(
     instance_id: str,
     when: datetime.datetime,
     generator_name: str,
-    generator_version: str | None,
-    algorithm: str,
-    pad: bytes,
-) -> tuple[list[Assertion], Claim]:
-    """The assertion list and the claim that links it -- built ONCE, for both callers.
-
-    ``embed`` SIGNS the claim from :func:`claim_payload_bytes` and SHIPS the claim
-    built inside :func:`build_manifest_store`. Those were two literal copies of the six
-    lines below: the assertion list, its order, the labels, the URI template and the
-    algorithm. They agreed, and nothing made them agree -- drift would have surfaced to
-    a caller as ``claimSignature.mismatch``, sending an investigator into COSE and
-    certificate handling rather than to a copy-paste in this file.
-
-    That is the pattern this package already applies once and states the reason for:
-    ``build_wrapper`` and ``parse_wrapper_body`` share ``MAX_MANIFEST_LENGTH`` because
-    "refusing to produce something we would refuse to read keeps the two halves of the
-    codec from disagreeing". One source, so the question cannot arise.
-    """
+    generator_version: str | None = None,
+    algorithm: str = DEFAULT_HASH_ALGORITHM,
+    pad: bytes = b"",
+) -> _PreparedManifest:
+    """Build each assertion box and the signed claim bytes once for one candidate."""
     assertions = [
         _actions_assertion(when),
         _ai_disclosure_assertion(disclosure),
         _metadata_assertion(disclosure),
-        _hash_data_assertion(digest, exclusion_start, exclusion_length, algorithm, pad),
+        _hash_data_assertion(
+            digest,
+            exclusion_start,
+            exclusion_length,
+            algorithm=algorithm,
+            pad=pad,
+        ),
     ]
-    created = [hashed_uri(item.to_box(), f"{ASSERTION_URI_PREFIX}{item.label}", algorithm) for item in assertions]
+    assertion_boxes = tuple(assertion.to_box() for assertion in assertions)
+    created = [
+        hashed_uri(box, f"{ASSERTION_URI_PREFIX}{assertion.label}", algorithm)
+        for assertion, box in zip(assertions, assertion_boxes, strict=True)
+    ]
     claim = Claim(
         instance_id=instance_id,
         claim_generator_name=generator_name,
@@ -403,72 +393,32 @@ def _assertions_and_claim(
         signature_url=CLAIM_SIGNATURE_URI,
         algorithm=algorithm,
     )
-    return assertions, claim
+    return _PreparedManifest(assertion_boxes=assertion_boxes, claim_bytes=_cbor.dumps(claim.to_payload()))
 
 
-def build_manifest_store(
+def _serialize_prepared_manifest(
+    prepared: _PreparedManifest,
     *,
-    disclosure: Disclosure,
-    digest: bytes,
-    exclusion_start: int,
-    exclusion_length: int,
     signature: bytes,
-    instance_id: str,
     manifest_uuid: uuid.UUID,
-    when: datetime.datetime,
-    generator_name: str,
-    generator_version: str | None = None,
-    algorithm: str = DEFAULT_HASH_ALGORITHM,
-    pad: bytes = b"",
 ) -> bytes:
-    """Assemble a complete manifest store and return its serialized JUMBF bytes.
+    """Insert a signature beside the exact assertion boxes and claim bytes it covers."""
+    if manifest_uuid.variant != uuid.RFC_4122 or manifest_uuid.version != _UUID_VERSION:
+        msg = "manifest_uuid must be an RFC 4122 variant UUID version 4 (C2PA 8.1)"
+        raise ValueError(msg)
 
-    Every varying input is a parameter. Nothing here reads a clock, calls an RNG or
-    generates a UUID, so the output is a pure function of its arguments -- which is
-    what makes byte-stable re-embedding testable at all. The caller supplies the
-    clock and identifiers; see ``EmbedContext``.
-    """
-    assertions, claim = _assertions_and_claim(
-        disclosure=disclosure,
-        digest=digest,
-        exclusion_start=exclusion_start,
-        exclusion_length=exclusion_length,
-        instance_id=instance_id,
-        when=when,
-        generator_name=generator_name,
-        generator_version=generator_version,
-        algorithm=algorithm,
-        pad=pad,
-    )
-
-    # C2PA 11.1.4.2: "shall be labelled with a urn:c2pa value". 8.1's ABNF is
-    #   c2pa_urn = "urn:c2pa:" UUID [claim-generator [version-reason]]
-    # NOT urn:uuid:, which is RFC 9562's namespace. The label lives inside the SIGNED claim and inside every
-    # self#jumbf= resolution path, so it is a wire defect rather than a cosmetic one.
-    # The two optional suffixes are omitted: version-reason applies only to manifests
-    # versioned due to a conflict, which we never produce.
-    #
-    # THE UUID IS LOWERCASE, AND THAT CONFORMS. 8.1's ABNF spells the hex digits with
-    # RFC 5234's core rule, HEXDIG = DIGIT / "A" / "B" / "C" / "D" / "E" / "F", which
-    # reads as uppercase-only -- and Python's uuid stringifies lowercase, so the label
-    # looks like it violates the grammar that governs it. It does not: RFC 5234 2.3
-    # says "ABNF strings are case insensitive", so the terminal "A" matches "a", and a
-    # grammar wanting case sensitivity must use RFC 7405's %s prefix, which 8.1 does
-    # not. RFC 9562 4 then settles the direction -- UUIDs SHOULD be output lowercase.
-    #
-    # Worth writing down because the label sits inside the SIGNED claim and inside
-    # every self#jumbf resolution path, so changing its case later would be a MAJOR
-    # version of this package and of the vector file. It is pinned by
-    # test_the_manifest_label_is_lowercase_and_that_is_deliberate.
+    # C2PA 11.1.4.2 requires a `urn:c2pa:` label. It identifies this manifest and is
+    # the resolution context for manifest-relative `self#jumbf` URIs. Python's UUID
+    # string form is lowercase; RFC 9562 permits upper-, lower- or mixed-case hex.
     manifest_label = f"urn:c2pa:{manifest_uuid}"
 
     assertion_store = JumbfBox(
         description=DescriptionBox(uuid=UUID_ASSERTION_STORE, label=LABEL_ASSERTION_STORE),
-        content=tuple((b"jumb", _jumbf.serialize_superbox(item.to_box())[8:]) for item in assertions),
+        content=tuple((b"jumb", _jumbf.serialize_superbox(box)[8:]) for box in prepared.assertion_boxes),
     )
     claim_box = JumbfBox(
         description=DescriptionBox(uuid=UUID_CLAIM, label=LABEL_CLAIM),
-        content=((b"cbor", _cbor.dumps(claim.to_payload())),),
+        content=((b"cbor", prepared.claim_bytes),),
     )
     signature_box = JumbfBox(
         description=DescriptionBox(uuid=UUID_CLAIM_SIGNATURE, label=LABEL_CLAIM_SIGNATURE),
@@ -488,28 +438,29 @@ def build_manifest_store(
     return _jumbf.serialize_superbox(store)
 
 
-def claim_payload_bytes(
+def build_manifest_store(
     *,
     disclosure: Disclosure,
     digest: bytes,
     exclusion_start: int,
     exclusion_length: int,
+    signature: bytes,
     instance_id: str,
+    manifest_uuid: uuid.UUID,
     when: datetime.datetime,
     generator_name: str,
     generator_version: str | None = None,
     algorithm: str = DEFAULT_HASH_ALGORITHM,
     pad: bytes = b"",
 ) -> bytes:
-    """Return the claim's CBOR content-box bytes -- the payload the signature covers.
+    """Assemble a complete manifest store from caller-supplied deterministic inputs.
 
-    C2PA 13.2.2 calls this "the contents of the claim JUMBF box" while 10.3.2.4 calls
-    it "the serialized CBOR of the claim document". They reconcile through 8.4.2.3's
-    rule that JUMBF hashing covers the description and content boxes but not the
-    superbox header, which makes this the claim's cbor content-box bytes. It is the
-    first thing to instrument on a signature mismatch against another implementation.
+    This remains public for compatibility with the package's pre-1.0 releases. The
+    producer uses the private prepared-manifest path so it signs and emits the same
+    claim bytes; callers of this lower-level builder remain responsible for supplying
+    the matching signature.
     """
-    _assertions, claim = _assertions_and_claim(
+    prepared = _prepare_manifest(
         disclosure=disclosure,
         digest=digest,
         exclusion_start=exclusion_start,
@@ -521,4 +472,4 @@ def claim_payload_bytes(
         algorithm=algorithm,
         pad=pad,
     )
-    return _cbor.dumps(claim.to_payload())
+    return _serialize_prepared_manifest(prepared, signature=signature, manifest_uuid=manifest_uuid)

@@ -3,10 +3,9 @@
 Wire-format conformance vectors for **C2PA Technical Specification 2.4 (2026-04-01),
 HTML build `c7e55d5a`, Annex A.8**, "Embedding Manifests into Unstructured Text".
 
-The normative artefact is `A8ConformanceTest-1.2.1.txt`. Everything a consuming
-implementation needs — the wire format, the nine conformance invariants, and the
-flag vocabulary — is stated in that file's header, so it is self-describing and
-needs no code to interpret.
+The canonical local fixture is `A8ConformanceTest-2.0.0.txt`. Its header states the
+wire rules, the local corrupt-prefix selection policy, and the flag vocabulary. The
+file is self-describing and needs no package code to interpret.
 
 ## Using these from another language
 
@@ -25,49 +24,33 @@ corrupted by editors, terminals, diff viewers and review tools. Unicode's own
 
 ## Licence
 
-**The conformance file is CC0 1.0** — `A8ConformanceTest-*.txt` and `SHA256SUMS`, see
+**The conformance file is CC0 1.0** — `A8ConformanceTest-*.txt`, see
 `LICENSE` in this directory. Deliberately more permissive than the Apache-2.0 package
 around it, so any implementation under any licence can vendor it without an
 attribution obligation.
 
-**The vendored corpora are not.** `cbor/` is BSD-2-Clause and `cose/` is Unlicense,
-neither carrying an attribution obligation; `third_party/` is MIT and Apache-2.0, which
-do. Each directory's `PROVENANCE.md` carries its licence and its upstream commit. Take
-the conformance file alone if you want the unencumbered set.
-
-## Integrity
-
-```bash
-shasum -a 256 -c SHA256SUMS
-```
-
-Maintainers: `make checksums` regenerates the manifest, and must run after ANY change
-in this directory — this README included. The suite fails otherwise, in
-`tests/test_external_vectors.py::test_every_checksummed_file_exists_and_matches`.
+**The vendored standards corpora are not.** `cbor/` is BSD-2-Clause and `cose/` is
+Unlicense. Each directory's `PROVENANCE.md` carries its licence and upstream commit.
+Take the conformance file alone if you want the CC0 set.
 
 ## Versioning
 
 The version is in the filename and in line 1. Record ids are immutable and are never
 reused; a retired record stays as a commented-out line stating why.
 
-- **MAJOR** — an expected value changed, or a record was removed. Any consumer may
-  now fail.
+- **MAJOR** — an expected value changed, a record was removed, or the package's signed
+  producer wire changed. Any consumer may now fail or need to pin a release boundary.
 - **MINOR** — records added.
 - **PATCH** — comments or flags only; data bytes unchanged.
 
-Pin the SHA-256 rather than the version if you need certainty: it is strictly
-stronger.
+Version 2 accompanies producer-wire major 1. The A.8 carrier records did not change;
+the shared major lets a consumer pin one release boundary.
 
 ## Scope, and what has no oracle at all
 
-**Every C2PA validation rule in this package has no independent oracle.** C2PA publishes
-no A.8 vectors — that absence is why this file exists — and the manifest CBOR is
-deliberately opaque to it, so the claim's contents are checked only against tests written
-alongside the code they check. Where that matters, the tests say so: the round trip in
-`test_embed.py` asserts only that a marked document verifies, and
-`docs/mutation-audit.md` records what mutation testing found against that. **A reader
-should not infer from this directory that the validator is externally checked. It is
-not.**
+C2PA publishes no A.8 vectors — that absence is why this file exists — and the manifest
+CBOR is deliberately opaque to it. The normal suite therefore checks the claim's
+contents against tests derived from the corresponding C2PA validation clauses.
 
 These vectors cover the A.8 **wire format**: wrapper framing, the byte-to-selector
 mapping, detection, and malformed-input handling — 6 `embed` records and 23 `extract`
@@ -76,15 +59,11 @@ records, with statuses limited to `manifest.text.corruptedWrapper`,
 the hash binding, or signature validation; those need a signing key and belong to the
 package's own suite.
 
-The genuinely third-party corpora here cover the layers beneath: `cose/` from the COSE
-working group, `cbor/` from the CBOR working group. Both are other people's numbers,
-which is what makes them worth vendoring.
+The standards corpora cover the layers beneath: `cose/` comes from the COSE working
+group and `cbor/` from the CBOR working group.
 
 **The bytes of a signed manifest are pinned separately**, in
 `tests/test_vector_file.py::test_the_signed_manifest_bytes_are_exactly_what_they_were`
-— a SHA-256 of one fully pinned `embed()`. That test exists because this file's scope,
-correctly drawn above, left CONTRIBUTING.md's rule unenforceable: a change to the
-manifest's bytes is a MAJOR version of the package *and* of this file, and nothing
-could detect one. A four-byte change to the COSE `x5chain` encoding passed the whole
-suite. The golden digest lives in the package's suite rather than here because
-reproducing it needs a private key, which this corpus deliberately does not carry.
+— a SHA-256 of one fully pinned `embed()`. A change to those bytes is a MAJOR version
+of the package and this file. The digest lives in the package suite because reproducing
+it needs a private key, which this corpus does not carry.

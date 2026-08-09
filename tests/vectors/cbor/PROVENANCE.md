@@ -3,7 +3,9 @@
 Source: <https://github.com/cbor-wg/cbor-test-vectors>, `tests/rfc8949-appendixA/`
 — the CBOR working group's own corpus.
 
-**Licence: BSD-2-Clause.** Retrieved 2026-08-05; Upstream `tests/rfc8949-appendixA/` last changed 2026-01-22 in `001eb684`.
+**Licence: BSD-2-Clause.** Retrieved 2026-08-05 at commit
+`001eb6848a4014f8ba81cd16a3d9381138ca7da6`; upstream
+`tests/rfc8949-appendixA/` last changed 2026-01-22.
 
 `mt0.cbor` … `mt7-simple.cbor` hold encoded values grouped by major type, each paired with
 an `.edn` file giving the same values in CBOR diagnostic notation.
@@ -28,10 +30,12 @@ the cautionary precedent this directory exists to avoid.
 
 ## Scope
 
-These cover CBOR generally. They do **not** cover RFC 8949 §4.2.1 *deterministic*
-encoding, which is what C2PA §10.1 and §18.1 mandate and what our decoder enforces on
-read — except that `streaming` supplies the indefinite-length half of it. Vectors for
-bytewise map ordering and shortest-form lengths are ours to author: upstream publishes
-only `rfc8949-appendixA`, `rfc8949` and `spike`, none of which carries them.
+These cover CBOR generally. They do **not** cover RFC 8949 §4.2.1 deterministic
+encoding, which C2PA §10.1 and §18.1 require producers to emit. The codec's default
+mode enforces that subset; claim, assertion and COSE validation use its well-formed
+input mode and authenticate the received bytes. `streaming` supplies the
+indefinite-length half of the strict-mode cases. Vectors for bytewise map ordering and
+shortest-form lengths are local because the upstream `rfc8949-appendixA`, `rfc8949`
+and `spike` directories do not carry them.
 
 Refresh with `make download-vectors`.

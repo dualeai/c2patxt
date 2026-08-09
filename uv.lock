@@ -44,7 +44,6 @@ dev = [
     { name = "pytest-xdist", extra = ["psutil"] },
     { name = "ruff" },
     { name = "twine" },
-    { name = "typing-extensions" },
     { name = "vulture" },
 ]
 trust = [
@@ -66,7 +65,6 @@ requires-dist = [
     { name = "pytest-xdist", extras = ["psutil"], marker = "extra == 'dev'", specifier = "~=3.8" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "~=0.16" },
     { name = "twine", marker = "extra == 'dev'", specifier = "~=6.0" },
-    { name = "typing-extensions", marker = "extra == 'dev'", specifier = "~=4.12" },
     { name = "vulture", marker = "extra == 'dev'", specifier = "~=2.14" },
 ]
 provides-extras = ["trust", "dev"]

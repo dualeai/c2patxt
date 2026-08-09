@@ -27,7 +27,7 @@ users.
 
 ### Third-party dependencies
 
-This package has exactly one runtime dependency, `cryptography`. Report
+The base install has one direct runtime dependency, `cryptography`. Report
 vulnerabilities in it to [pyca/cryptography](https://github.com/pyca/cryptography)
 directly. We still want to hear about it if the issue affects users of this package, so
 that we can pin or advise.
@@ -51,8 +51,9 @@ released against the latest `0.x` only.
   length field is a vulnerability, not a performance bug.
 - Information disclosure through exceptions, return values or timing that reveals more
   than the verdict and the manifest fields.
-- Any network access, filesystem access, or subprocess execution performed by this
-  library. It is designed to do none of these; observing any of them is a finding.
+- Any network access, filesystem access, or subprocess execution performed by
+  package-owned code. A caller-supplied `TrustEvaluator` is caller code; c2patxt does
+  not provide it with a remote-fetching facility.
 
 ### Out of scope, by design
 
@@ -64,17 +65,12 @@ not report them.
   accepted; erasure of a mark by a computationally bounded attacker is possible even
   when insertion and detection share a secret.
 
-  **This is why `strip()` ships.** It converts the ten lines an attacker writes from
-  A.8.4.2 into one, which is a marginal gain for someone who already has everything
-  they need. What it gives a legitimate caller is the only correct way to re-mark a
-  document: `AlreadyMarkedError` tells you to remove the existing wrapper and call
-  again, and the span it hands you is in **bytes**. Slicing a `str` with byte offsets
-  silently leaves a zero-width residue on any non-ASCII text, and that failure is
-  invisible three times over — the residue does not render, it is shorter than the
-  magic number so `verify()` reports `UNMARKED` rather than corrupt, and `embed()` then
-  bakes it permanently inside the newly hashed text. Demonstrated by
-  `tests/test_strip.py::test_the_naive_string_slice_is_wrong_and_strip_is_not`. No
-  `remove` alias exists.
+  **This is why `strip()` ships.** It removes wrappers using their UTF-8 byte spans.
+  Slicing a Python `str` with those byte offsets can leave selector code points behind
+  on non-ASCII text; `strip()` performs the required encode, splice, and decode steps.
+  `AlreadyMarkedError` reports the span, while `strip()` supplies the public removal
+  operation. Held by
+  `tests/test_embed.py::test_the_already_marked_span_is_enough_to_re_mark`.
 - **Regeneration.** Any transform that reproduces the meaning and discards the bytes
   removes the mark. Paraphrase, retyping and truncation all defeat it.
 - **Absence of a mark.** Unmarked text is the normal case for almost all text. A
@@ -85,19 +81,57 @@ not report them.
   a correct, intact, honestly-signed mark yields `Provenance.VALID` together with
   `signingCredential.untrusted`. That is the specified and expected outcome.
 
+### Cryptographic threat model
+
+C2PA 2.4's
+[Security Considerations](https://spec.c2pa.org/specifications/specifications/2.4/security/Security_Considerations.html#_threat_and_attack_assumptions)
+exclude attacks using quantum cryptanalysis. This package makes no post-quantum
+security claim: generated claims use Ed25519, and every signature algorithm accepted
+by its C2PA 2.4 verifier is classical. [RFC 8032 section
+1](https://www.rfc-editor.org/rfc/rfc8032.html#section-1) states that a sufficiently
+large quantum computer would break Ed25519. [RFC 9958 section
+1](https://www.rfc-editor.org/rfc/rfc9958.html#section-1) reports no practical
+cryptographically relevant quantum computer at publication; that observation is not a
+post-quantum guarantee.
+
+The hard binding and hashed assertion references use SHA-256, SHA-384 or SHA-512.
+Choosing a longer digest does not change the Ed25519 claim signature or the X.509
+credential chain, so it does not make the authenticated mark post-quantum resistant.
+
+Keep these cases separate:
+
+- Removing the wrapper yields `UNMARKED`; it is not a signature forgery.
+- Changing covered text while the wrapper remains yields an invalid binding.
+- Anyone can create a `VALID` but untrusted mark with their own key. A `TRUSTED`
+  identity also depends on certificate issuance and the caller's anchors and evaluator;
+  a signature break is not the only way that trust can fail.
+
+The release attestations under [Supply chain](#supply-chain) describe package-artifact
+provenance. They do not change the cryptographic profile of a marked document.
+
 ## Security properties of this library
 
-- **No network.** Verification is a pure function of its arguments. The test suite
-  runs with `pytest-socket` and `--disable-socket`, so any egress fails the build.
-- **No logging.** This library emits no log records, so it cannot leak partial-match
-  detail into a host application's logs. Held by
-  `tests/test_package.py::test_no_log_records_are_emitted_while_doing_real_work`, over
-  real embed and verify calls captured at the root logger.
+- **No package-owned network.** Package-owned verification performs no network I/O.
+  Without `VerifyContext.now`, it reads the current clock; a custom evaluator is
+  caller-owned code and can add its own state or I/O. The exercised package paths run
+  with `pytest-socket` and `--disable-socket`, so a socket operation on those paths
+  fails the build.
+- **Silent public codec paths.** Package-owned embed and verification emit no log
+  records, so they do not leak partial-match detail into a host application's logs.
+  Held over real valid, invalid and absent inputs by
+  `tests/test_package.py::test_public_codec_work_emits_no_log_records`.
+- **Bounded Unicode normalization.** C2PA text binding requires NFC. Before that
+  operation, the package enforces [UAX #15's 30-nonstarter Stream-Safe
+  boundary](https://www.unicode.org/reports/tr15/#Stream_Safe_Text_Format) without
+  changing the text by inserting CGJ. Public producer and verifier behavior at 30 and
+  31 is held by `tests/test_normalization.py`. The policy remains while supported
+  CPython patch releases can predate the linear-time fix in
+  [CPython #149080](https://github.com/python/cpython/pull/149080).
 - **No ambient configuration.** No environment scanning, no implicit credential store,
   no configuration file discovery. Trust anchors are supplied explicitly by the caller.
   Held by `tests/test_trust.py::test_no_anchors_ship_by_default` and
-  `::test_the_environment_cannot_supply_anchors`.
-- **One runtime dependency.** `cryptography`, and nothing else. Check it yourself:
+  `tests/test_trust.py::test_the_environment_cannot_supply_anchors`.
+- **One direct dependency in the base install.** `cryptography`. Check it yourself:
 
   ```console
   $ python -c "from importlib.metadata import requires; \
@@ -105,21 +139,22 @@ not report them.
   ['cryptography~=48.0']
   ```
 
-  Asserted by `tests/test_package.py::test_the_package_declares_exactly_one_runtime_dependency`,
-  which runs on every CI job. (`uv tree --no-dev` is NOT a useful check here: the dev
-  set is an extra rather than a dependency group, so `--no-dev` is a no-op.)
-
-  The optional `[trust]` extra adds `pyhanko-certvalidator` for callers building their
-  own `TrustEvaluator`. Nothing in this package imports it.
+  The optional `[trust]` extra preserves the published install contract and currently
+  adds `pyhanko-certvalidator`. This package neither imports nor adapts it; installing
+  the extra provides no c2patxt-owned trust backend or HTTP path, though Requests is a
+  transitive dependency of that backend. c2patxt performs no remote fetching. Any
+  future package-owned AIA, OCSP, or CRL fetching will require an async verification
+  API. c2patxt-provided evaluators for synchronous `verify()` will remain offline;
+  arbitrary caller evaluators remain caller-owned code.
 - **Licence.** Apache-2.0, including its express patent grant.
 - **Supported Python.** 3.10 – 3.14, CPython.
 
 ## Supply chain
 
 Releases are published to PyPI using Trusted Publishing (OIDC); no long-lived API token
-exists. Each release carries PEP 740 digital attestations and SLSA build provenance
-binding the artifact to the source commit, plus CycloneDX and SPDX SBOMs attached to
-the GitHub release. Verify a release yourself:
+exists. Releases produced by the current workflow carry PEP 740 attestations and SLSA
+build provenance binding each artifact to its source commit, plus CycloneDX and SPDX
+SBOMs attached to the GitHub release. Verify such a release yourself:
 
 ```bash
 # artifact -> commit (SLSA provenance)

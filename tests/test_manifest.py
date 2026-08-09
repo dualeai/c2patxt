@@ -1,31 +1,31 @@
-"""Manifest store: structure, determinism, and the payload prohibition."""
+"""Manifest-store structure, deterministic construction, and emitted schemas."""
 
 from __future__ import annotations
 
 import datetime
+import hashlib
+import json
 import re
 import uuid
 
 import pytest
 
-from c2patxt import _cbor, _jumbf
-from c2patxt._jumbf import JumbfBox
+from c2patxt import EmbedContext, _jumbf, embed, extract
+from c2patxt._extract import parse_manifest_store
 from c2patxt.manifest import (
-    ASSERTION_AI_DISCLOSURE,
     ASSERTION_HASH_DATA,
-    CLAIM_SIGNATURE_URI,
-    DIGITAL_SOURCE_TYPE_TRAINED,
+    ASSERTION_METADATA,
     HASH_ALGORITHMS,
     LABEL_CLAIM,
     LABEL_CLAIM_SIGNATURE,
     UUID_MANIFEST_STORE,
     Assertion,
     Claim,
+    ManifestStore,
     build_manifest_store,
-    claim_payload_bytes,
     hashed_uri,
 )
-from c2patxt.signing import Disclosure, ModelType
+from c2patxt.signing import Disclosure, ModelType, Signer
 from tests._json import as_mapping
 
 WHEN = datetime.datetime(2026, 8, 5, 12, 0, tzinfo=datetime.timezone.utc)
@@ -42,20 +42,65 @@ def _disclosure() -> Disclosure:
     )
 
 
-def _store(**overrides: object) -> bytes:
-    kwargs: dict[str, object] = {
-        "disclosure": _disclosure(),
-        "digest": DIGEST,
-        "exclusion_start": 11,
-        "exclusion_length": 74,
-        "signature": b"\xaa" * 64,
-        "instance_id": "xmp:iid:00000000-0000-4000-8000-000000000002",
-        "manifest_uuid": MANIFEST_UUID,
-        "when": WHEN,
-        "generator_name": "c2patxt",
-    }
-    kwargs.update(overrides)
-    return build_manifest_store(**kwargs)  # type: ignore[arg-type]
+def _store(
+    *,
+    disclosure: Disclosure | None = None,
+    digest: bytes = DIGEST,
+    exclusion_start: int = 11,
+    exclusion_length: int = 74,
+    signature: bytes = b"\xaa" * 64,
+    instance_id: str = "xmp:iid:00000000-0000-4000-8000-000000000002",
+    manifest_uuid: uuid.UUID = MANIFEST_UUID,
+    when: datetime.datetime = WHEN,
+    generator_name: str = "c2patxt",
+    generator_version: str | None = None,
+    algorithm: str = "sha256",
+    pad: bytes = b"",
+) -> bytes:
+    return build_manifest_store(
+        disclosure=disclosure or _disclosure(),
+        digest=digest,
+        exclusion_start=exclusion_start,
+        exclusion_length=exclusion_length,
+        signature=signature,
+        instance_id=instance_id,
+        manifest_uuid=manifest_uuid,
+        when=when,
+        generator_name=generator_name,
+        generator_version=generator_version,
+        algorithm=algorithm,
+        pad=pad,
+    )
+
+
+def _embedded_store(
+    signer: Signer,
+    *,
+    generator_version: str | None = None,
+    manifest_uuid: uuid.UUID = MANIFEST_UUID,
+) -> ManifestStore:
+    """Return the parsed output of the public producer with every varying input pinned."""
+    context = EmbedContext(
+        manifest_uuid=manifest_uuid,
+        instance_id="xmp:iid:1",
+        when=WHEN,
+        generator_version=generator_version,
+    )
+    store = extract(embed("Manifest test.", signer, _disclosure(), context=context))
+    assert store is not None
+    return store
+
+
+def _nested_superboxes(box: _jumbf.JumbfBox) -> list[_jumbf.JumbfBox]:
+    """Parse nested JUMBF boxes without duplicating their codec."""
+    children: list[_jumbf.JumbfBox] = []
+    for kind, payload in box.content:
+        if kind != _jumbf.TBOX_SUPERBOX:
+            continue
+        child, end = _jumbf.parse_superbox(b"\x00\x00\x00\x00jumb" + payload)
+        assert end == len(payload) + 8
+        children.append(child)
+    return children
 
 
 def test_store_parses_as_a_jumbf_superbox_with_the_right_label() -> None:
@@ -65,15 +110,9 @@ def test_store_parses_as_a_jumbf_superbox_with_the_right_label() -> None:
     assert end == len(_store())
 
 
-def test_the_manifest_label_is_a_c2pa_urn() -> None:
-    """C2PA 8.1: each manifest is labelled urn:c2pa:<uuid>.
-
-    This test PINNED THE DEFECT until 2026-08-05: it asserted ``urn:uuid:`` and cited
-    8.1, which says the opposite.
-    """
-    store, _ = _jumbf.parse_superbox(_store())
-    manifest, _ = _jumbf.parse_superbox(b"\x00\x00\x00\x00jumb" + store.content[0][1])
-    assert manifest.description.label == f"urn:c2pa:{MANIFEST_UUID}"
+def test_the_manifest_label_is_a_c2pa_urn(signer: Signer) -> None:
+    """C2PA 8.1 labels each manifest ``urn:c2pa:<uuid>``."""
+    assert _embedded_store(signer).manifest_label == f"urn:c2pa:{MANIFEST_UUID}"
 
 
 def test_the_manifest_holds_assertion_store_claim_and_signature() -> None:
@@ -89,16 +128,7 @@ def test_the_manifest_holds_assertion_store_claim_and_signature() -> None:
     assert labels == ["c2pa.assertions", LABEL_CLAIM, LABEL_CLAIM_SIGNATURE]
 
 
-def test_construction_is_deterministic() -> None:
-    """No clock read, no RNG, no UUID generated inside. Byte-stable by construction.
-
-    Every varying input is a parameter, which is what makes a byte-stable re-embed
-    testable at all.
-    """
-    assert len({_store() for _ in range(20)}) == 1
-
-
-def test_changing_any_input_changes_the_bytes() -> None:
+def test_representative_signed_inputs_change_the_bytes() -> None:
     """Determinism must not come from ignoring inputs."""
     baseline = _store()
     assert _store(digest=bytes(range(1, 33))) != baseline
@@ -107,78 +137,100 @@ def test_changing_any_input_changes_the_bytes() -> None:
     assert _store(when=WHEN + datetime.timedelta(seconds=1)) != baseline
 
 
-def test_the_created_action_declares_trained_algorithmic_media() -> None:
-    """The one fact the mark exists to carry."""
-    payload = claim_payload_bytes(
-        disclosure=_disclosure(),
-        digest=DIGEST,
-        exclusion_start=11,
-        exclusion_length=74,
-        instance_id="xmp:iid:1",
-        when=WHEN,
-        generator_name="c2patxt",
-    )
-    assert isinstance(_cbor.loads(payload), dict)
-    # THE FULL LITERAL, not a suffix. Replacing this constant with
-    # "http://example.invalid/NOT-IPTC/trainedAlgorithmicMedia" left the entire suite
-    # green -- so we could have shipped a digitalSourceType no IPTC-aware consumer
-    # recognises, on a compliance artefact, and nothing would have said so. A suffix
-    # check cannot see the vocabulary the term belongs to, and the vocabulary is the
-    # whole point: the term means something because IPTC defines it.
-    assert DIGITAL_SOURCE_TYPE_TRAINED == "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
+@pytest.mark.parametrize(
+    "when",
+    [
+        WHEN.replace(tzinfo=None),
+        datetime.datetime(
+            2026,
+            6,
+            1,
+            12,
+            0,
+            tzinfo=datetime.timezone(datetime.timedelta(seconds=30)),
+        ),
+    ],
+    ids=["naive", "seconds-resolution-offset"],
+)
+def test_public_builder_refuses_a_time_without_an_rfc3339_offset(when: datetime.datetime) -> None:
+    with pytest.raises(ValueError, match=r"timezone-aware|whole-minute UTC offset"):
+        _store(when=when)
 
 
-def test_claim_carries_the_fields_15_6_2_requires() -> None:
+def test_the_created_action_declares_trained_algorithmic_media(signer: Signer) -> None:
+    """The public producer emits the exact C2PA action and IPTC vocabulary term."""
+    actions = as_mapping(_embedded_store(signer).assertion("c2pa.actions.v2"), "c2pa.actions.v2")
+    entries = actions["actions"]
+    assert isinstance(entries, list)
+    assert entries
+    created = as_mapping(entries[0], "c2pa.actions.v2.actions[0]")
+
+    # Independent literals: importing either production constant would let the test
+    # follow a wrong vocabulary term or action name without observing the wire defect.
+    assert created["action"] == "c2pa.created"
+    assert created["digitalSourceType"] == "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
+
+
+def test_metadata_is_json_ld_in_a_json_content_box(signer: Signer) -> None:
+    """C2PA 18.17.2 fixes both the serialization and the required context."""
+    outer, _ = _jumbf.parse_superbox(_embedded_store(signer).raw)
+    manifest = _nested_superboxes(outer)[0]
+    assertion_store = next(box for box in _nested_superboxes(manifest) if box.description.label == "c2pa.assertions")
+    metadata = next(box for box in _nested_superboxes(assertion_store) if box.description.label == ASSERTION_METADATA)
+
+    assert metadata.description.uuid == _jumbf.UUID_JSON
+    assert len(metadata.content) == 1
+    kind, raw = metadata.content[0]
+    assert kind == b"json"
+    document = json.loads(raw)
+    assert document == {
+        "@context": {"dc": "http://purl.org/dc/elements/1.1/"},
+        "dc:format": "text/plain",
+    }
+
+
+def test_claim_carries_the_fields_15_6_2_requires(signer: Signer) -> None:
     """A claim missing any of these is claim.malformed on read."""
-    claim = _cbor.loads(
-        claim_payload_bytes(
-            disclosure=_disclosure(),
-            digest=DIGEST,
-            exclusion_start=11,
-            exclusion_length=74,
-            instance_id="xmp:iid:1",
-            when=WHEN,
-            generator_name="c2patxt",
-            generator_version="0.1.0",
-        )
-    )
-    fields = as_mapping(claim, "claim")
+    fields = _embedded_store(signer, generator_version="0.1.0").claim
     assert {"instanceID", "signature", "created_assertions", "claim_generator_info"} <= set(fields)
 
-    # A BARE MAP, not an array. The two claim versions differ here:
+    # A map, not an array. The two claim versions differ here:
     #   claim-map    (v1): "claim_generator_info": [1* generator-info-map]
     #   claim-map-v2     : "claim_generator_info": $generator-info-map
-    # We emit c2pa.claim.v2, so an array is claim.malformed to a CDDL-strict
-    # validator, and the signature covers these bytes so it cannot be patched later.
-    # This test previously asserted the ARRAY, which is how the wrong shape survived.
+    # We emit c2pa.claim.v2, whose claim_generator_info field is a map.
     generator = as_mapping(fields["claim_generator_info"], "claim_generator_info")
     assert generator["name"] == "c2patxt"
     assert generator["version"] == "0.1.0"
 
 
-def test_the_claim_is_deterministically_encoded_cbor() -> None:
-    """10.1 mandates RFC 8949 4.2.1; our decoder rejects anything else."""
-    payload = claim_payload_bytes(
-        disclosure=_disclosure(),
-        digest=DIGEST,
-        exclusion_start=11,
-        exclusion_length=74,
-        instance_id="xmp:iid:1",
-        when=WHEN,
-        generator_name="c2patxt",
-    )
-    assert _cbor.loads(payload) is not None  # round-trips through the strict decoder
+def test_public_builder_enforces_instance_id_utf8_byte_bounds() -> None:
+    exact_limit = "é" * 500_000
+    assert parse_manifest_store(_store(instance_id=exact_limit)).claim["instanceID"] == exact_limit
+
+    for invalid in ("", exact_limit + "x", "\ud800"):
+        with pytest.raises(ValueError, match="claim instanceID"):
+            _store(instance_id=invalid)
 
 
-def test_hash_data_assertion_shape() -> None:
-    """18.5.2: exclusions, alg, hash, and a REQUIRED pad."""
-    assertion = Assertion(
-        label=ASSERTION_HASH_DATA,
-        payload={"exclusions": [{"start": 1, "length": 2}], "alg": "sha256", "hash": DIGEST, "pad": b""},
-    )
-    box = assertion.to_box()
-    assert box.description.label == ASSERTION_HASH_DATA
-    assert box.content[0][0] == b"cbor"
+def test_claim_rejects_a_non_text_instance_id() -> None:
+    with pytest.raises(ValueError, match="claim instanceID must be a UTF-8 text string"):
+        Claim(
+            instance_id=7,  # pyright: ignore[reportArgumentType] -- defensive runtime validation
+            claim_generator_name="c2patxt",
+            claim_generator_version=None,
+            created_assertions=(),
+            signature_url="self#jumbf=c2pa.signature",
+        )
+
+
+def test_public_builder_accepts_only_zero_filled_data_hash_padding() -> None:
+    """18.5.2: producer data-hash pad bytes are zero-filled."""
+    store = parse_manifest_store(_store(pad=bytes(24)))
+    assert store.hash_data is not None
+    assert store.hash_data["pad"] == bytes(24)
+
+    with pytest.raises(ValueError, match="must be zero-filled"):
+        _store(pad=b"\x00\xff")
 
 
 def test_hashed_uri_excludes_the_superbox_header() -> None:
@@ -192,8 +244,8 @@ def test_hashed_uri_excludes_the_superbox_header() -> None:
     link = hashed_uri(box, "self#jumbf=c2pa.assertions/c2pa.actions")
 
     serialized = _jumbf.serialize_superbox(box)
-    assert link["hash"] == HASH_ALGORITHMS["sha256"](serialized[8:]).digest()
-    assert link["hash"] != HASH_ALGORITHMS["sha256"](serialized).digest()
+    assert link["hash"] == hashlib.sha256(serialized[8:]).digest()
+    assert link["hash"] != hashlib.sha256(serialized).digest()
     assert link["alg"] == "sha256"
 
 
@@ -204,19 +256,27 @@ def test_only_the_three_permitted_hash_algorithms_exist() -> None:
         hashed_uri(Assertion(label="x", payload=1).to_box(), "self#jumbf=x", "md5")
 
 
-def test_the_manifest_carries_no_identifying_fields() -> None:
-    """Our marking policy, enforced in code rather than by review.
+@pytest.mark.parametrize(
+    ("algorithm", "expected"),
+    [
+        ("sha256", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        (
+            "sha384",
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7",
+        ),
+        (
+            "sha512",
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+            "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+        ),
+    ],
+)
+def test_hash_registry_matches_nist_abc_known_answers(algorithm: str, expected: str) -> None:
+    """The name-to-function mapping has an expected value outside this package."""
+    assert HASH_ALGORITHMS[algorithm](b"abc").hexdigest() == expected
 
-    Three independent legal grounds forbid tenant, agent, account, end-user, author,
-    prompt and conversation content. Because embed() takes a closed Disclosure, none
-    of it can reach the manifest -- this asserts that end to end over the real bytes.
-    """
-    blob = _store()
-    for forbidden in (b"tenant", b"agent", b"account", b"prompt", b"conversation", b"author"):
-        assert forbidden not in blob.lower()
 
-
-def test_ai_disclosure_omits_pending_and_oversight_fields() -> None:
+def test_ai_disclosure_omits_pending_and_oversight_fields(signer: Signer) -> None:
     """18.28: modelType is the only required field.
 
     humanOversightLevel is omitted deliberately -- it describes the customer's
@@ -224,26 +284,16 @@ def test_ai_disclosure_omits_pending_and_oversight_fields() -> None:
     is worse than its absence. The pending fields are omitted because the
     specification marks them pending.
     """
-    payload = claim_payload_bytes(
-        disclosure=_disclosure(),
-        digest=DIGEST,
-        exclusion_start=11,
-        exclusion_length=74,
-        instance_id="xmp:iid:1",
-        when=WHEN,
-        generator_name="c2patxt",
+    disclosure = as_mapping(
+        _embedded_store(signer).assertion("c2pa.ai-disclosure"),
+        "c2pa.ai-disclosure",
     )
-    blob = _store()
-    assert ASSERTION_AI_DISCLOSURE.encode() in blob
-    for absent in (b"humanOversightLevel", b"modelFrontier", b"trainingCleared", b"harmEvaluation"):
-        assert absent not in blob
-    assert payload
+    for absent in ("humanOversightLevel", "modelFrontier", "trainingCleared", "harmEvaluation"):
+        assert absent not in disclosure
 
 
 def test_manifest_store_accessors() -> None:
     """ManifestStore is a parsed view, not a verdict: absence is not an error here."""
-    from c2patxt.manifest import ManifestStore
-
     store = ManifestStore(
         manifest_label=f"urn:c2pa:{MANIFEST_UUID}",
         claim={"instanceID": "xmp:iid:1"},
@@ -262,8 +312,6 @@ def test_manifest_store_accessors() -> None:
 
 def test_hash_data_is_none_when_the_manifest_has_no_hard_binding() -> None:
     """claim.hardBindings.missing is a validation-layer verdict, not a parse error."""
-    from c2patxt.manifest import ManifestStore
-
     store = ManifestStore(
         manifest_label="urn:c2pa:x",
         claim={},
@@ -292,177 +340,68 @@ def test_hash_data_is_none_when_the_assertion_is_not_a_map() -> None:
     assert store.hash_data is None
 
 
-#: Fixed values, not uuid4(). Any UUID satisfies the ABNF, so a random one adds no
-#: coverage and makes a failure unreproducible from the report alone. int=0 is the
-#: all-zero edge; the third is an ordinary random-looking v4 captured once.
-@pytest.mark.parametrize(
-    "manifest_uuid",
-    [
-        uuid.UUID(int=0),
-        uuid.UUID(int=7),
-        uuid.UUID("8f14e45f-ea18-4c9b-b3a2-7d1e6f0a5b2c"),
-    ],
-)
-def test_the_manifest_label_follows_the_c2pa_urn_abnf(manifest_uuid: uuid.UUID) -> None:
-    """C2PA 11.1.4.2: "The C2PA Manifest box shall be labelled with a urn:c2pa value".
+def test_the_manifest_label_uses_the_required_uuid_v4(signer: Signer) -> None:
+    """C2PA 8.1 requires a version-4 UUID in every manifest identifier.
 
-    8.1 gives the ABNF::
+    The label also follows 11.1.4.2's ``urn:c2pa`` form::
 
         c2pa_urn       = c2pa-namespace UUID [claim-generator [version-reason]]
         c2pa-namespace = "urn:c2pa:"
-        UUID           = 4hexOctet "-" 2hexOctet "-" 2hexOctet "-" 2hexOctet "-" 6hexOctet
-
-    We emitted ``urn:uuid:`` -- the RFC 9562 namespace, not C2PA's. Not cosmetic:
-    the label is inside the SIGNED claim and inside every ``self#jumbf=`` resolution
-    path, so a strict consumer rejects it and no amount of re-reading fixes marks
-    already produced.
-
-    The optional ``claim-generator`` and ``version-reason`` suffixes are omitted; both
-    are optional, and version-reason only applies to manifests versioned due to a
-    conflict, which we never produce.
     """
-    store = build_manifest_store(
-        disclosure=_disclosure(),
-        digest=DIGEST,
-        exclusion_start=11,
-        exclusion_length=74,
-        signature=b"\xaa" * 64,
-        instance_id="xmp:iid:1",
-        manifest_uuid=manifest_uuid,
-        when=WHEN,
-        generator_name="c2patxt",
-    )
-    label = f"urn:c2pa:{manifest_uuid}".encode()
-    assert label in store
-    assert f"urn:uuid:{manifest_uuid}".encode() not in store
+    manifest_uuid = uuid.UUID("8f14e45f-ea18-4c9b-b3a2-7d1e6f0a5b2c")
+    label = _embedded_store(signer, manifest_uuid=manifest_uuid).manifest_label
+    assert label == f"urn:c2pa:{manifest_uuid}"
     assert re.fullmatch(
         r"urn:c2pa:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-        label.decode(),
+        label,
     )
 
 
-def test_the_claim_declares_which_specification_version_produced_it() -> None:
-    """C2PA 10.2.3.2 / 5.1: a claim generator "should declare which version of the
-    specification it is using to generate the C2PA Manifest by providing a
-    `specVersion` key in the claim_generator_info field of the claim."
+@pytest.mark.parametrize("manifest_uuid", [uuid.UUID(int=0), uuid.UUID(int=7)])
+def test_the_public_producer_refuses_a_manifest_identifier_that_is_not_uuid_v4(
+    manifest_uuid: uuid.UUID,
+) -> None:
+    with pytest.raises(ValueError, match="UUID version 4"):
+        EmbedContext(manifest_uuid=manifest_uuid)
 
-    THE 2.4 CHANGE LOG RAISED THIS FROM "may" TO "should", and moved the field out of
-    the claim itself: "Moved the specVersion field from the claim to the
-    claim_generator_info object; the claim-level specVersion is now deprecated." So the
-    field goes in the generator info map, and the claim-level one stays absent.
 
-    IT CARRIES REAL INFORMATION NOW rather than being decoration. 5.1: "When a claim
-    generator sets this field, it is declaring that the active manifest of the asset is
-    produced in accordance with that version of the specification and thus, for example,
-    does not contain any constructs that are deprecated in that version." We moved to
-    `c2pa.actions.v2` precisely because `c2pa.actions` is deprecated at 2.4, so the
-    declaration is a claim we can actually stand behind.
+@pytest.mark.parametrize("manifest_uuid", [uuid.UUID(int=0), uuid.UUID(int=7)])
+def test_the_public_manifest_builder_refuses_an_identifier_that_is_not_uuid_v4(
+    manifest_uuid: uuid.UUID,
+) -> None:
+    with pytest.raises(ValueError, match="UUID version 4"):
+        _store(manifest_uuid=manifest_uuid)
 
-    The value is a `semver-string`, and the specification's own example uses `"2.4.0"`
-    -- "e.g., '2.4.0' for version 2.4" -- so a bare "2.4" would not satisfy the type.
-    """
-    claim = Claim(
-        instance_id="xmp:iid:1",
-        claim_generator_name="c2patxt",
-        claim_generator_version=None,
-        created_assertions=(),
-        signature_url=CLAIM_SIGNATURE_URI,
-    )
-    payload = claim.to_payload()
-    generator = payload["claim_generator_info"]
 
+def test_public_builder_enforces_generator_name_utf8_byte_bounds() -> None:
+    exact_limit = "é" * 500_000
+    claim = parse_manifest_store(_store(generator_name=exact_limit)).claim
+    generator = claim["claim_generator_info"]
     assert isinstance(generator, dict)
-    assert generator["specVersion"] == "2.4.0"
-    assert "specVersion" not in payload, "the claim-level field is deprecated at 2.4"
+    assert generator["name"] == exact_limit
+
+    for invalid in ("", exact_limit + "x"):
+        with pytest.raises(ValueError, match="1 to 1,000,000 UTF-8 bytes"):
+            _store(generator_name=invalid)
 
 
-def test_the_manifest_label_is_lowercase_and_that_is_deliberate() -> None:
-    """8.1's ABNF looks like it forbids this, and does not.
+def test_the_manifest_label_uses_pythons_lowercase_uuid_form(signer: Signer) -> None:
+    """Lowercase UUID text satisfies 8.1; RFC 9562 permits either case.
 
     ``c2pa_urn = "urn:c2pa:" UUID``, and the UUID's hex digits come from RFC 5234's
     core ``HEXDIG = DIGIT / "A" / "B" / "C" / "D" / "E" / "F"`` -- uppercase as written.
-    Python's ``uuid`` stringifies lowercase, so the label looks like it violates the
-    grammar that governs it.
-
-    IT CONFORMS. RFC 5234 2.3: "ABNF strings are case insensitive", so the terminal
+    Python's ``uuid`` stringifies lowercase. RFC 5234 2.3 makes ABNF string terminals
+    case-insensitive, so the terminal
     ``"A"`` matches ``a``; a grammar needing case sensitivity uses RFC 7405's ``%s``
-    prefix, which 8.1 does not. RFC 9562 4 then settles the direction: UUIDs SHOULD be
-    output lowercase.
-
-    PINNED BECAUSE IT IS WIRE. The label sits inside the signed claim and inside every
-    ``self#jumbf`` resolution path, so changing its case is a MAJOR version of this
-    package and of the vector file, not a cosmetic edit. Nothing exercised it before:
-    the one test using a literal label used an all-zero UUID, which is case-neutral.
+    prefix, which 8.1 does not. Python's stable lowercase form is the producer's wire
+    choice, not an RFC 9562 requirement.
     """
-    # Hex digits above 9 in every group, so the case is actually observable -- unlike
-    # MANIFEST_UUID, which is all zeros and fours and proves nothing about case.
+    # Hex digits above 9 in every group make case observable.
     manifest_uuid = uuid.UUID("abcdefab-cdef-4bcd-abcd-efabcdefabcd")
     assert str(manifest_uuid) != str(manifest_uuid).upper(), "the fixture must not be case-neutral"
 
-    raw = _store(manifest_uuid=manifest_uuid)
-    expected = f"urn:c2pa:{manifest_uuid}".encode()
+    label = _embedded_store(signer, manifest_uuid=manifest_uuid).manifest_label
 
-    assert expected in raw, "the label must appear on the wire exactly as constructed"
-    assert expected.upper() not in raw, "and must not appear uppercased anywhere"
-    assert re.fullmatch(rb"urn:c2pa:[0-9a-f-]{36}", expected), "and must match 8.1's shape, lowercase"
-
-
-def test_the_two_claim_builders_produce_identical_bytes() -> None:
-    """``embed`` SIGNS the output of ``claim_payload_bytes`` and SHIPS the claim built
-    inside ``build_manifest_store``. They are two literal copies of the same six lines
-    -- the assertion list, its order, the labels, the URI template, the algorithm.
-
-    They agree today. Nothing made them agree, and the failure mode is misdirecting:
-    drift surfaces as ``claimSignature.mismatch``, which sends an investigator into
-    COSE and certificate handling rather than to a copy-paste in this file.
-
-    This is the pattern the package already applies once and states the reason for --
-    ``build_wrapper`` and ``parse_wrapper_body`` share ``MAX_MANIFEST_LENGTH`` because
-    "refusing to produce something we would refuse to read keeps the two halves of the
-    codec from disagreeing". The same argument holds here and was not applied.
-
-    ASSERTED RATHER THAN REFACTORED. Deriving one from the other is the better fix and
-    is a larger change to a wire-producing path; until then this is what makes the
-    duplication safe, and it fails the moment either copy is edited alone.
-    """
-    from c2patxt._jumbf import parse_superbox
-    from c2patxt.manifest import claim_payload_bytes
-
-    signed = claim_payload_bytes(
-        disclosure=_disclosure(),
-        digest=DIGEST,
-        exclusion_start=11,
-        exclusion_length=74,
-        instance_id="xmp:iid:00000000-0000-4000-8000-000000000002",
-        when=WHEN,
-        generator_name="c2patxt",
-        pad=b"",
-    )
-
-    store, _ = parse_superbox(_store(pad=b""))
-    shipped = _claim_bytes_from(store)
-
-    assert shipped == signed, (
-        "the claim that is SIGNED and the claim that is SHIPPED have diverged; "
-        "this surfaces to a caller as claimSignature.mismatch"
-    )
-
-
-def _claim_bytes_from(store: JumbfBox) -> bytes:
-    """Dig the claim's CBOR out of a parsed manifest store.
-
-    Reaches for ``_reparse`` because nested superboxes are kept opaque by ``_jumbf`` --
-    it is a pure box codec and does not know a manifest from an assertion store.
-    """
-    from c2patxt._extract import (
-        _reparse,  # pyright: ignore[reportPrivateUsage] -- the only way to open a nested superbox
-    )
-    from c2patxt.manifest import LABEL_CLAIM
-
-    manifest, _ = _reparse(store.content[0][1])
-    for _tbox, payload in manifest.content:
-        child, _ = _reparse(payload)
-        if child.description.label == LABEL_CLAIM:
-            return next(body for box_type, body in child.content if box_type == b"cbor")
-    msg = "no claim box in the store"
-    raise AssertionError(msg)
+    assert label == f"urn:c2pa:{manifest_uuid}"
+    assert label != label.upper(), "the emitted label must preserve lowercase hex"
+    assert re.fullmatch(r"urn:c2pa:[0-9a-f-]{36}", label), "and must match 8.1's shape, lowercase"

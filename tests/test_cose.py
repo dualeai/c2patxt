@@ -1,34 +1,41 @@
 # pyright: reportPrivateUsage=false
-# Drives _check_single_credential directly: it is the unit that decides which
-# bucket a credential may come from, and 14.2/14.5 give the two buckets different
-# rules that a round trip through verify() cannot tell apart.
+# Drives private COSE units where a public round trip cannot distinguish header buckets.
 """COSE_Sign1 as C2PA 13.2 narrows it: detached payload, zero-length aad, x5chain."""
 
 from __future__ import annotations
 
+import pathlib
 import uuid
 
+import cbor2
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.hazmat.primitives.asymmetric.types import CertificatePublicKeyTypes
 
 from c2patxt import EmbedContext, _cbor, _cose, embed, extract
 from c2patxt._cose import (
     COSE_HEADER_ALG,
+    COSE_HEADER_CRIT,
     COSE_HEADER_X5CHAIN,
+    CoseAlgorithmError,
+    CoseCredentialError,
     CoseError,
+    CoseSignatureError,
+    CoseStructureError,
     parse,
     sig_structure,
-    sign_claim,
-    verify_claim,
 )
 from c2patxt.signing import COSE_ALG_EDDSA, Signer
-from tests._json import load_object, str_field, str_fields
-from tests.conftest import DISCLOSURE, WHEN, build_certificate
-from tests.test_external_vectors import COSE as COSE_VECTORS
+from tests._json import load_object, str_field
+from tests.conftest import DISCLOSURE, WHEN
 
-_PINNED = EmbedContext(manifest_uuid=uuid.UUID(int=13), instance_id="xmp:iid:cose", when=WHEN)
+_PINNED = EmbedContext(
+    manifest_uuid=uuid.UUID("00000000-0000-4000-8000-00000000000d"),
+    instance_id="xmp:iid:cose",
+    when=WHEN,
+)
+COSE_VECTORS = pathlib.Path(__file__).parent / "vectors" / "cose"
 
 CLAIM = b"\xa1\x63abc\x01"  # any deterministically-encoded CBOR stands in for a claim
 
@@ -36,6 +43,22 @@ CLAIM = b"\xa1\x63abc\x01"  # any deterministically-encoded CBOR stands in for a
 @pytest.fixture
 def signer(signing_key: Ed25519PrivateKey, signing_certificate: x509.Certificate) -> Signer:
     return Signer(private_key=signing_key, certificates=(signing_certificate,))
+
+
+def _signed_claim(signer: Signer, claim: bytes = CLAIM) -> bytes:
+    signed = _cose._prepare_signed_claim(signer, claim)
+    return _cose._serialize_signed_claim(signed)
+
+
+def _verify_message(
+    message: bytes,
+    claim: bytes,
+    public_key: CertificatePublicKeyTypes,
+) -> _cose.CoseSign1:
+    parsed = parse(message)
+    algorithm = _cose._check_algorithm(parsed)
+    _cose._verify_signature(parsed, claim, public_key, algorithm)
+    return parsed
 
 
 def test_sig_structure_shape() -> None:
@@ -51,16 +74,9 @@ def test_external_aad_is_always_zero_length() -> None:
     assert decoded[2] == b""
 
 
-def test_signed_message_round_trips(signer: Signer) -> None:
-    message = sign_claim(signer, CLAIM)
-    parsed = verify_claim(message, CLAIM, signer.private_key.public_key())
-    assert len(parsed.signature) == 64
-    assert parsed.header()[COSE_HEADER_ALG] == COSE_ALG_EDDSA
-
-
 def test_the_payload_is_detached_as_nil_not_an_empty_bstr(signer: Signer) -> None:
     """13.2.2 warns explicitly that a zero-length bstr does NOT mean detached."""
-    decoded = _cbor.loads(sign_claim(signer, CLAIM))
+    decoded = _cbor.loads(_signed_claim(signer))
     assert isinstance(decoded, _cbor.Tagged)
     assert decoded.tag == 18
     body = decoded.value
@@ -73,35 +89,85 @@ def test_the_payload_is_detached_as_nil_not_an_empty_bstr(signer: Signer) -> Non
 
 
 def test_x5chain_lives_in_the_protected_bucket(signer: Signer) -> None:
-    """14.5: generators shall always place x5chain in the PROTECTED bucket.
+    """14.5: generators always place x5chain in the protected bucket."""
+    parsed = parse(_signed_claim(signer))
+    assert COSE_HEADER_X5CHAIN in parsed.decoded_protected
+    assert parsed.unprotected == {"pad": b""}
+    assert parsed.x5chain() == tuple(signer.x5chain())
 
-    Accepting it from the unprotected bucket would mean trusting an unsigned
-    certificate chain to tell us which key signed the claim.
-    """
-    parsed = parse(sign_claim(signer, CLAIM))
-    assert COSE_HEADER_X5CHAIN in parsed.header()
-    assert parsed.unprotected == {}
-    assert parsed.x5chain() == signer.x5chain()
+
+@pytest.mark.parametrize("size", [23, 24, 255, 256])
+def test_cose_padding_is_zero_filled_across_cbor_length_thresholds(signer: Signer, size: int) -> None:
+    """10.4.2: the unprotected string ``pad`` contains only zero bytes."""
+    signed = _cose._prepare_signed_claim(signer, CLAIM)
+    message = _cose._serialize_signed_claim(signed, pad=size)
+    assert parse(message).unprotected == {"pad": bytes(size)}
+
+
+def test_cbor_padding_headers_widen_at_23_and_255_bytes(signer: Signer) -> None:
+    """Pin the two preferred-CBOR jumps the solver must search across."""
+    signed = _cose._prepare_signed_claim(signer, CLAIM)
+    sizes = {size: len(_cose._serialize_signed_claim(signed, pad=size)) for size in (23, 24, 255, 256)}
+    assert sizes[24] - sizes[23] == 2
+    assert sizes[256] - sizes[255] == 2
+
+
+def test_unprotected_padding_changes_without_resigning(signer: Signer) -> None:
+    """10.4.4: shrinking the unprotected pad does not alter Sig_structure."""
+    signed = _cose._prepare_signed_claim(signer, CLAIM)
+    first = _verify_message(_cose._serialize_signed_claim(signed, pad=24), CLAIM, signer.private_key.public_key())
+    second = _verify_message(
+        _cose._serialize_signed_claim(signed, pad=19),
+        CLAIM,
+        signer.private_key.public_key(),
+    )
+    assert first.protected == second.protected
+    assert first.signature == second.signature
+    assert second.unprotected == {"pad": bytes(19)}
+
+
+def test_negative_cose_padding_lengths_are_rejected(signer: Signer) -> None:
+    signed = _cose._prepare_signed_claim(signer, CLAIM)
+    with pytest.raises(ValueError, match="non-negative"):
+        _cose._serialize_signed_claim(signed, pad=-1)
+
+
+def test_a_validator_does_not_treat_unsigned_nonzero_padding_as_a_signature_failure(signer: Signer) -> None:
+    """Zero-fill is a generator rule; the unprotected bytes are not authenticated."""
+    signed = _cose._prepare_signed_claim(signer, CLAIM)
+    message = _cbor.dumps(
+        _cbor.Tagged(
+            _cbor.TAG_COSE_SIGN1,
+            [signed.protected, {"pad": b"\xff"}, None, signed.signature],
+        )
+    )
+    _verify_message(message, CLAIM, signer.private_key.public_key())
 
 
 def test_x5chain_uses_integer_label_33_not_the_string(signer: Signer) -> None:
     """RFC 9360. C2PA: "use only the integer 33 as the label"."""
-    header = parse(sign_claim(signer, CLAIM)).header()
+    header = parse(_signed_claim(signer)).decoded_protected
     assert COSE_HEADER_X5CHAIN == 33
     assert "x5chain" not in header
 
 
-def test_a_credential_in_both_buckets_is_rejected(signer: Signer) -> None:
+@pytest.mark.parametrize("label", [COSE_HEADER_X5CHAIN, "x5chain"], ids=["integer-33", "string-label"])
+def test_the_same_credential_label_in_both_buckets_is_rejected(signer: Signer, label: int | str) -> None:
     """14.2: zero or two-or-more credentials shall be rejected.
 
     The same certificate duplicated across buckets counts as TWO.
     """
-    body = _cbor.loads(sign_claim(signer, CLAIM))
+    body = _cbor.loads(_signed_claim(signer))
     assert isinstance(body, _cbor.Tagged)
     parts = body.value
     assert isinstance(parts, list)
-    forged = _cbor.dumps(_cbor.Tagged(18, [parts[0], {COSE_HEADER_X5CHAIN: b"dup"}, None, parts[3]]))
-    with pytest.raises(CoseError, match="multiple credentials"):
+    assert isinstance(parts[0], bytes)
+    protected = _cbor.loads(parts[0])
+    assert isinstance(protected, dict)
+    chain = protected.pop(COSE_HEADER_X5CHAIN)
+    protected[label] = chain
+    forged = _cbor.dumps(_cbor.Tagged(18, [_cbor.dumps(protected), {label: b"dup"}, None, parts[3]]))
+    with pytest.raises(CoseCredentialError, match="multiple credentials"):
         parse(forged)
 
 
@@ -109,12 +175,12 @@ def test_a_missing_x5chain_is_rejected() -> None:
     """14.2: no credentials is a reject, not a soft failure."""
     protected = _cbor.dumps({COSE_HEADER_ALG: COSE_ALG_EDDSA})
     forged = _cbor.dumps(_cbor.Tagged(18, [protected, {}, None, b"\x00" * 64]))
-    with pytest.raises(CoseError, match="must be present in the protected header"):
+    with pytest.raises(CoseCredentialError, match="absent from both"):
         parse(forged)
 
 
 def test_a_tampered_signature_does_not_verify(signer: Signer) -> None:
-    body = _cbor.loads(sign_claim(signer, CLAIM))
+    body = _cbor.loads(_signed_claim(signer))
     assert isinstance(body, _cbor.Tagged)
     parts = body.value
     assert isinstance(parts, list)
@@ -123,15 +189,128 @@ def test_a_tampered_signature_does_not_verify(signer: Signer) -> None:
     broken = bytes([signature[0] ^ 0x01]) + signature[1:]
     forged = _cbor.dumps(_cbor.Tagged(18, [parts[0], {}, None, broken]))
 
-    with pytest.raises(CoseError, match="does not verify"):
-        verify_claim(forged, CLAIM, signer.private_key.public_key())
+    with pytest.raises(CoseSignatureError, match="does not verify"):
+        _verify_message(forged, CLAIM, signer.private_key.public_key())
 
 
 def test_a_different_claim_does_not_verify(signer: Signer) -> None:
     """The binding is to the claim bytes, so substituting them must fail."""
-    message = sign_claim(signer, CLAIM)
-    with pytest.raises(CoseError, match="does not verify"):
-        verify_claim(message, b"\xa1\x63xyz\x02", signer.private_key.public_key())
+    message = _signed_claim(signer)
+    with pytest.raises(CoseSignatureError, match="does not verify"):
+        _verify_message(message, b"\xa1\x63xyz\x02", signer.private_key.public_key())
+
+
+def test_well_formed_non_deterministic_cose_encoding_is_accepted(signer: Signer) -> None:
+    """RFC 9052 section 9 applies deterministic encoding to Sig_structure, not COSE.
+
+    This message uses an out-of-order protected map, an indefinite outer array, and an
+    indefinite unprotected map. The signature covers the exact protected bytes.
+    """
+    certificate = signer.x5chain()[0]
+    protected = b"\xa2\x18\x21" + _cbor.dumps(certificate) + b"\x01\x27"
+    signature = signer.sign(sig_structure(protected, CLAIM))
+    message = b"\xd2\x9f" + _cbor.dumps(protected) + b"\xbf\xff\xf6" + _cbor.dumps(signature) + b"\xff"
+
+    parsed = _verify_message(message, CLAIM, signer.private_key.public_key())
+
+    assert parsed.decoded_protected[COSE_HEADER_ALG] == COSE_ALG_EDDSA
+    assert parsed.x5chain() == tuple(signer.x5chain())
+
+
+def test_duplicate_protected_keys_remain_rejected_in_cose_mode() -> None:
+    """RFC 9052 section 9 forbids duplicate map keys in every decoding mode."""
+    protected = bytes.fromhex("a20127180127")  # key 1 twice, using two CBOR spellings
+    forged = _cbor.dumps(_cbor.Tagged(18, [protected, {}, None, b"\x00" * 64]))
+
+    with pytest.raises(CoseStructureError, match="duplicate map key"):
+        parse(forged)
+
+
+@pytest.mark.parametrize("size", [63, 65])
+def test_a_wrong_length_ed25519_signature_is_a_verification_failure(signer: Signer, size: int) -> None:
+    protected = _cbor.dumps({COSE_HEADER_ALG: COSE_ALG_EDDSA, COSE_HEADER_X5CHAIN: signer.x5chain()[0]})
+    forged = _cbor.dumps(_cbor.Tagged(18, [protected, {}, None, b"\x00" * size]))
+
+    with pytest.raises(CoseSignatureError, match="64 bytes"):
+        _verify_message(forged, CLAIM, signer.private_key.public_key())
+
+
+@pytest.mark.parametrize("chain", [[], [b"der"]], ids=["empty", "singleton"])
+def test_an_x5chain_array_requires_at_least_two_certificates(chain: list[bytes]) -> None:
+    protected = _cbor.dumps({COSE_HEADER_ALG: COSE_ALG_EDDSA, COSE_HEADER_X5CHAIN: chain})
+    forged = _cbor.dumps(_cbor.Tagged(18, [protected, {}, None, b"\x00" * 64]))
+
+    with pytest.raises(CoseCredentialError, match="at least two"):
+        parse(forged)
+
+
+@pytest.mark.parametrize("algorithm", [-8.0, "-8"], ids=["float", "text"])
+def test_the_eddsa_algorithm_identifier_must_be_the_integer_registry_value(
+    signer: Signer,
+    algorithm: float | str,
+) -> None:
+    protected = cbor2.dumps({COSE_HEADER_ALG: algorithm, COSE_HEADER_X5CHAIN: signer.x5chain()[0]})
+    forged = _cbor.dumps(_cbor.Tagged(18, [protected, {}, None, b"\x00" * 64]))
+
+    with pytest.raises(CoseAlgorithmError, match="unsupported COSE algorithm"):
+        _verify_message(forged, CLAIM, signer.private_key.public_key())
+
+
+@pytest.mark.parametrize(
+    ("protected_crit", "unprotected", "unknown_present", "pattern"),
+    [
+        (None, {COSE_HEADER_CRIT: [COSE_HEADER_ALG]}, False, "must be protected"),
+        (None, {}, False, "non-empty array"),
+        ([], {}, False, "non-empty array"),
+        ("alg", {}, False, "non-empty array"),
+        ([True], {}, False, "integer or text-string"),
+        ([b"alg"], {}, False, "integer or text-string"),
+        ([999], {}, False, "absent from the protected"),
+        ([999], {}, True, "not understood"),
+    ],
+    ids=[
+        "unprotected",
+        "null",
+        "empty",
+        "scalar",
+        "bool-label",
+        "bytes-label",
+        "missing-label",
+        "unknown-label",
+    ],
+)
+def test_malformed_or_unsupported_critical_headers_are_rejected(
+    signer: Signer,
+    protected_crit: _cbor.CborValue,
+    unprotected: dict[int | str | bytes, _cbor.CborValue],
+    unknown_present: bool,
+    pattern: str,
+) -> None:
+    protected: dict[int, _cbor.CborValue] = {
+        COSE_HEADER_ALG: COSE_ALG_EDDSA,
+        COSE_HEADER_X5CHAIN: signer.x5chain()[0],
+        COSE_HEADER_CRIT: protected_crit,
+    }
+    if unknown_present:
+        protected[999] = "must understand"
+    forged = _cbor.dumps(_cbor.Tagged(18, [_cbor.dumps(protected), unprotected, None, b"\x00" * 64]))
+
+    with pytest.raises(CoseStructureError, match=pattern):
+        parse(forged)
+
+
+def test_understood_critical_headers_are_accepted(signer: Signer) -> None:
+    protected = _cbor.dumps(
+        {
+            COSE_HEADER_ALG: COSE_ALG_EDDSA,
+            COSE_HEADER_CRIT: [COSE_HEADER_ALG, COSE_HEADER_X5CHAIN],
+            COSE_HEADER_X5CHAIN: signer.x5chain()[0],
+        }
+    )
+    signature = signer.sign(sig_structure(protected, CLAIM))
+    message = _cbor.dumps(_cbor.Tagged(18, [protected, {}, None, signature]))
+
+    _verify_message(message, CLAIM, signer.private_key.public_key())
 
 
 @pytest.mark.parametrize(
@@ -141,26 +320,37 @@ def test_a_different_claim_does_not_verify(signer: Signer) -> None:
         (_cbor.dumps(_cbor.Tagged(18, [b"", {}, None])), "four-element array"),
         (_cbor.dumps(_cbor.Tagged(18, [1, {}, None, b"\x00" * 64])), "protected header must be a byte string"),
         (_cbor.dumps(_cbor.Tagged(18, [b"", 1, None, b"\x00" * 64])), "unprotected header must be a map"),
-        (_cbor.dumps(_cbor.Tagged(18, [b"", {}, None, b"short"])), "64 bytes"),
+        (_cbor.dumps(_cbor.Tagged(18, [b"", {}, None, 7])), "signature must be a byte string"),
+        (_cbor.dumps(_cbor.Tagged(18, [b"\xff", {}, None, b"\x00" * 64])), "protected header is not valid CBOR"),
         (b"\xff\xff", "not valid CBOR"),
     ],
 )
 def test_malformed_structures_are_rejected(forged: bytes, pattern: str) -> None:
-    with pytest.raises(CoseError, match=pattern):
+    with pytest.raises(CoseStructureError, match=pattern):
         parse(forged)
 
 
-def test_a_non_eddsa_algorithm_is_rejected(signer: Signer) -> None:
-    """13.2.1 permits EdDSA over Ed25519 only for this package."""
-    protected = _cbor.dumps({COSE_HEADER_ALG: -7, COSE_HEADER_X5CHAIN: signer.x5chain()[0]})
+@pytest.mark.parametrize("bucket", ["protected", "unprotected"])
+@pytest.mark.parametrize(
+    "header_map",
+    [bytes.fromhex("a18000"), _cbor.dumps({b"x": 0})],
+    ids=["array", "byte-string"],
+)
+def test_non_label_cbor_keys_are_not_cose_header_labels(bucket: str, header_map: bytes) -> None:
+    """The generic CBOR reader stays wider than COSE's header-label model."""
+    protected = header_map if bucket == "protected" else _cbor.dumps({})
+    unprotected = header_map if bucket == "unprotected" else _cbor.dumps({})
+    forged = b"\xd2\x84" + _cbor.dumps(protected) + unprotected + b"\xf6" + _cbor.dumps(b"\x00" * 64)
+
+    with pytest.raises(CoseStructureError, match=f"{bucket} header contains a label"):
+        parse(forged)
+
+
+def test_an_algorithm_outside_c2pa_is_rejected(signer: Signer) -> None:
+    protected = _cbor.dumps({COSE_HEADER_ALG: 999, COSE_HEADER_X5CHAIN: signer.x5chain()[0]})
     forged = _cbor.dumps(_cbor.Tagged(18, [protected, {}, None, b"\x00" * 64]))
-    with pytest.raises(CoseError, match="unsupported COSE algorithm"):
-        verify_claim(forged, CLAIM, signer.private_key.public_key())
-
-
-def test_signing_is_byte_stable(signer: Signer) -> None:
-    """Ed25519 is deterministic, so the whole message is too."""
-    assert len({sign_claim(signer, CLAIM) for _ in range(20)}) == 1
+    with pytest.raises(CoseAlgorithmError, match="unsupported COSE algorithm"):
+        _verify_message(forged, CLAIM, signer.private_key.public_key())
 
 
 #: Every vendored cose-wg file carrying a Sig_structure with a zero-length
@@ -194,11 +384,11 @@ def test_no_vendored_sig_structure_vector_goes_unread() -> None:
 
 @pytest.mark.parametrize("name", _SIG_STRUCTURE_VECTORS)
 def test_our_sig_structure_matches_the_cose_wg_encoding(name: str) -> None:
-    """THE interop check for this module, over every vendored vector that has one.
+    """Check every applicable vendored COSE WG Sig_structure encoding.
 
     Each file publishes ``intermediates.ToBeSign_hex`` -- the serialized
-    Sig_structure. Reproducing it byte for byte proves our assembly matches an
-    independently produced encoding rather than merely matching itself.
+    Sig_structure. Reproducing it byte for byte checks our assembly against the
+    standards working group's corpus rather than against our own encoder.
 
     THE ALGORITHMS AND THE PROTECTED HEADERS DIFFER ACROSS THE ROWS, which is the
     reason to run all of them: eight are ES256 over P-256 and one is Ed448, none of
@@ -251,23 +441,12 @@ def test_the_one_vector_with_external_aad_is_a_negative_oracle() -> None:
 
 
 def test_the_multi_signer_vector_is_the_shape_c2pa_excludes() -> None:
-    """``eddsa-01`` carries no top-level ToBeSign, and the reason is the point.
-
-    It is a multi-signer ``COSE_Sign``: its Sig_structure is five elements and its
-    context string is "Signature", not "Signature1". C2PA 13.2 permits ``COSE_Sign1``
-    only, so this file is vendored as the shape we must never emit, and reading it
-    keeps ``PROVENANCE.md``'s claim about it checkable.
-    """
+    """The official multi-signer ``COSE_Sign`` must not parse as ``COSE_Sign1``."""
     doc = load_object(COSE_VECTORS / "eddsa-01.json")
-    intermediates = doc["intermediates"]
-    assert isinstance(intermediates, dict)
-    signers = intermediates["signers"]
-    assert isinstance(signers, list)
+    message = bytes.fromhex(str_field(doc, "output", "cbor"))
 
-    decoded = _cbor.loads(bytes.fromhex(str_fields(signers[0], "eddsa-01.json:signers[0]")["ToBeSign_hex"]))
-    assert isinstance(decoded, list)
-    assert decoded[0] == "Signature", "the multi-signer context, which we never build"
-    assert len(decoded) == 5, "COSE_Sign adds the signer's own protected bucket"
+    with pytest.raises(CoseStructureError, match="not a tagged COSE_Sign1"):
+        parse(message)
 
 
 def _cbor_head(major: int, length: int) -> bytes:
@@ -327,119 +506,77 @@ def test_a_non_map_protected_header_is_rejected() -> None:
     """The protected bucket is a serialized CBOR map, not an arbitrary item."""
     protected = _cbor.dumps([1, 2])
     forged = _cbor.dumps(_cbor.Tagged(18, [protected, {}, None, b"\x00" * 64]))
-    with pytest.raises(CoseError, match="not a CBOR map"):
+    with pytest.raises(CoseStructureError, match="not a CBOR map"):
         parse(forged)
-
-
-def test_a_multi_certificate_chain_keeps_the_order_it_was_given(signing_key: Ed25519PrivateKey) -> None:
-    """RFC 9360: a bare bstr for one certificate, an array for a chain, leaf first (14.5).
-
-    THE TWO CERTIFICATES DIFFER, AND THE LARGER DER COMES FIRST. This test passed the
-    same certificate twice, so ``reversed(self.certificates)`` survived in
-    ``Signer.x5chain`` -- against a two-element chain of identical bytes, every ordering
-    is the same list. A reversed chain is not cosmetic: a verifier taking element 0 as
-    the leaf would check the signature against the wrong public key, or reject a chain
-    that is in fact well formed.
-
-    A BARE ``sorted(self.certificates)`` IS NOT A MUTATION THIS HAS TO CATCH, and an
-    earlier version of this docstring claimed it had survived. It cannot run at all --
-    ``x509.Certificate`` has no ordering, so it raises ``TypeError`` whatever the values
-    -- and two existing tests already killed it. Ordering by DER descending is still
-    what the rows below are for: it catches a sort with a KEY, which does run, and a
-    sort that claims to be a no-op has to be handed a sequence it would actually move.
-    """
-    certificates: list[x509.Certificate] = sorted(
-        (build_certificate(signing_key, common_name=name) for name in ("leaf one", "leaf two")),
-        key=lambda certificate: certificate.public_bytes(Encoding.DER),
-        reverse=True,
-    )
-    der = [certificate.public_bytes(Encoding.DER) for certificate in certificates]
-    assert der[0] != der[1]
-    assert der != sorted(der), "the given order is not the sorted order"
-
-    signer = Signer(private_key=signing_key, certificates=(certificates[0], certificates[1]))
-    assert signer.x5chain() == der, "leaf first, as given"
-    assert parse(sign_claim(signer, CLAIM)).x5chain() == der, "and the same after a round trip"
 
 
 def test_a_chain_containing_a_non_byte_string_is_rejected(signer: Signer) -> None:
     """A certificate slot holding something other than DER is malformed input."""
     protected = _cbor.dumps({COSE_HEADER_ALG: COSE_ALG_EDDSA, COSE_HEADER_X5CHAIN: [b"der", 1]})
     forged = _cbor.dumps(_cbor.Tagged(18, [protected, {}, None, b"\x00" * 64]))
-    with pytest.raises(CoseError, match="only byte strings"):
+    with pytest.raises(CoseCredentialError, match="only byte strings"):
         parse(forged).x5chain()
 
 
-def test_x5chain_accessor_reports_absence(signer: Signer) -> None:
-    """Reachable via a header that passed the presence check but holds a bad type."""
-    from c2patxt._cose import CoseSign1
-
-    empty = CoseSign1(protected=_cbor.dumps({COSE_HEADER_ALG: COSE_ALG_EDDSA}), unprotected={}, signature=b"")
-    with pytest.raises(CoseError, match="absent from the protected header"):
-        empty.x5chain()
-
-
 @pytest.mark.parametrize(
-    ("labels", "accepted"),
+    "labels",
     [
-        ((COSE_HEADER_X5CHAIN,), True),
-        (("x5chain",), True),
-        ((COSE_HEADER_X5CHAIN, "x5chain"), True),
+        (COSE_HEADER_X5CHAIN,),
+        ("x5chain",),
+        (COSE_HEADER_X5CHAIN, "x5chain"),
     ],
     ids=["integer-33", "string-label", "both-in-protected"],
 )
-def test_the_x5chain_string_label_is_accepted_in_the_protected_bucket(
-    labels: tuple[int | str, ...], accepted: bool
-) -> None:
+def test_the_x5chain_string_label_is_accepted_in_the_protected_bucket(labels: tuple[int | str, ...]) -> None:
     """C2PA 14.5 verbatim: "Validators shall accept either the string `x5chain` or the
     integer 33 as the label for this header. If both labels are present, validators
     shall use the header with the integer label 33 and ignore the header with the
     string x5chain."
 
-    We read only the integer, so a producer using the deprecated-but-legal string
-    label read as "no credential at all". The asymmetry is what marks it an oversight
-    rather than a decision: ``_check_single_credential`` ALREADY recognises the
-    string label in the UNPROTECTED bucket, for the 14.2 duplicate check.
-
     The ``both-in-protected`` case carries DIFFERENT chains under the two labels, so
     "33 wins" is observable rather than assumed.
     """
-    integer_chain: list[_cbor.CborValue] = [b"\x01" * 8]
-    string_chain: list[_cbor.CborValue] = [b"\x02" * 8]
+    integer_chain = b"\x01" * 8
+    string_chain = b"\x02" * 8
 
     protected: dict[int | str | bytes, _cbor.CborValue] = {COSE_HEADER_ALG: COSE_ALG_EDDSA}
     for label in labels:
         protected[label] = integer_chain if label == COSE_HEADER_X5CHAIN else string_chain
 
-    message = _cose.CoseSign1(
-        protected=_cbor.dumps(protected),
-        unprotected={},
-        signature=b"\x00" * 64,
-    )
-
-    assert accepted
-    chain = message.x5chain()
+    forged = _cbor.dumps(_cbor.Tagged(18, [_cbor.dumps(protected), {}, None, b"\x00" * 64]))
+    chain = parse(forged).x5chain()
     # 33 wins wherever it is present; the string label is used only in its absence.
     expected = integer_chain if COSE_HEADER_X5CHAIN in labels else string_chain
-    assert list(chain) == list(expected)
+    assert chain == (expected,)
 
 
-def test_the_unprotected_bucket_is_still_refused() -> None:
-    """A DELIBERATE DEVIATION FROM A `shall`, pinned so it stays deliberate.
+@pytest.mark.parametrize("integer_bucket", ["protected", "unprotected"])
+def test_integer_x5chain_wins_across_header_buckets(integer_bucket: str) -> None:
+    """14.5's label precedence applies before the protected-bucket preference."""
+    integer_chain = b"integer chain"
+    string_chain = b"string chain"
+    protected: dict[int | str | bytes, _cbor.CborValue] = {COSE_HEADER_ALG: COSE_ALG_EDDSA}
+    unprotected: dict[int | str | bytes, _cbor.CborValue] = {}
+    if integer_bucket == "protected":
+        protected[COSE_HEADER_X5CHAIN] = integer_chain
+        unprotected["x5chain"] = string_chain
+    else:
+        protected["x5chain"] = string_chain
+        unprotected[COSE_HEADER_X5CHAIN] = integer_chain
+    forged = _cbor.dumps(_cbor.Tagged(18, [_cbor.dumps(protected), unprotected, None, b"\x00" * 64]))
 
-    14.5 also says "Validators shall accept the header from either the protected or
-    unprotected bucket, to maintain compatibility with previous versions". We do not.
-    An unprotected header is not covered by the signature, so a certificate chain
-    taken from there is one an attacker can swap for their own -- and the whole point
-    of the chain is to say which key signed the claim.
+    parsed = parse(forged)
 
-    Recorded in docs/deviations.md and in the compatibility document's exclusion list.
-    Asserted on the exact message so the refusal cannot become incidental.
-    """
-    message = _cose.CoseSign1(
-        protected=_cbor.dumps({COSE_HEADER_ALG: COSE_ALG_EDDSA}),
-        unprotected={"x5chain": [b"\x01" * 8]},
-        signature=b"\x00" * 64,
-    )
-    with pytest.raises(_cose.CoseError, match="protected header"):
-        _cose._check_single_credential(message)
+    assert parsed.x5chain() == (integer_chain,)
+
+
+@pytest.mark.parametrize("label", [COSE_HEADER_X5CHAIN, "x5chain"], ids=["integer-33", "string-label"])
+def test_a_validator_accepts_x5chain_from_the_unprotected_bucket(signer: Signer, label: int | str) -> None:
+    """14.5 requires this compatibility path even though generators use protected."""
+    protected = _cbor.dumps({COSE_HEADER_ALG: COSE_ALG_EDDSA})
+    signature = signer.sign(sig_structure(protected, CLAIM))
+    message = _cbor.dumps(_cbor.Tagged(18, [protected, {label: signer.x5chain()[0]}, None, signature]))
+
+    parsed = _verify_message(message, CLAIM, signer.private_key.public_key())
+
+    assert parsed.x5chain() == tuple(signer.x5chain())

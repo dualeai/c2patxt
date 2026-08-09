@@ -44,18 +44,17 @@ answer differently.
 `verify` runs assertions, then the hard binding, then the claim signature. 15.1.2 says
 the phases are "listed in no particular order", so both orders conform.
 
-**Everything before the signature check runs on input nobody has authenticated.** That is
-what allowed pre-authentication hash amplification: a manifest could name one large
-assertion many times and have it re-hashed per reference. Closed by memoizing digests per
-`(label, algorithm)`, which bounds the work at the store's own size — but the exposure
-class remains, and the next expensive check added before the signature would reopen it.
+**Everything before the signature check runs on input nobody has authenticated.** That
+is why assertion digests are memoized per `(label, algorithm)`: repeated references do
+not repeat the hash. The exposure class remains, and any new pre-signature check must
+have a bound of its own.
 
 Signature-first would remove it at the root. Two things argue against doing it casually:
 
 - **It changes the ORDER of reported codes, not the set.** `verify` runs all three
   phases unconditionally and accumulates every code, so a manifest broken in several ways already reports all of
   them. Nothing pins the top-level phase order — the three ordering tests pin
-  `_assertion_failure`'s INTERNAL order, which is a different rule.
+  `_assertion_result`'s INTERNAL order, which is a different rule.
 - **It changes what a caller learns.** Reporting `claimSignature.mismatch` for a manifest
   whose disclosure is also missing tells an operator less than reporting the missing
   disclosure.

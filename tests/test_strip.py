@@ -16,6 +16,17 @@ from c2patxt.signing import Signer
 from tests.conftest import DISCLOSURE, mark
 
 
+def _selectors_from_spec(payload: bytes) -> str:
+    """Encode bytes with A.8.3.1 literals, independent of the package codec."""
+    return "".join(chr(0xFE00 + value) if value < 0x10 else chr(0xE0100 + value - 0x10) for value in payload)
+
+
+def _corrupt_wrapper_from_spec() -> str:
+    """A literal A.8 wrapper header declaring unsupported version 2."""
+    body = bytes.fromhex("4332504154585400") + b"\x02\x00\x00\x00\x00"
+    return "\ufeff" + _selectors_from_spec(body)
+
+
 @pytest.fixture(scope="session")
 def signer(signing_key: Ed25519PrivateKey, signing_certificate: x509.Certificate) -> Signer:
     return Signer(private_key=signing_key, certificates=(signing_certificate,))
@@ -96,6 +107,19 @@ def test_strip_refuses_a_corrupt_wrapper_rather_than_guessing() -> None:
     corrupt = "Doc." + MARKER + bytes_to_selectors(MAGIC + b"\x02" + b"\x00\x00\x00\x00")
     with pytest.raises(MarkCorruptError):
         strip(corrupt)
+
+
+@pytest.mark.parametrize("corrupt_first", [False, True], ids=["valid-then-corrupt", "corrupt-then-valid"])
+def test_strip_refuses_corruption_beside_a_valid_wrapper(signer: Signer, *, corrupt_first: bool) -> None:
+    """Detection may keep the valid mark, but destructive removal cannot guess the corrupt extent."""
+    valid = mark("Document.", signer)
+    corrupt = _corrupt_wrapper_from_spec()
+    mixed = corrupt + valid if corrupt_first else valid + corrupt
+
+    with pytest.raises(MarkCorruptError) as caught:
+        strip(mixed)
+
+    assert caught.value.code == "manifest.text.corruptedWrapper"
 
 
 def test_strip_reports_unencodable_text_like_every_other_entry_point() -> None:

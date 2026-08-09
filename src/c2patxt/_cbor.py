@@ -5,24 +5,6 @@ C2PA mandates this twice, normatively: 10.1 for the claim ("a CBOR payload, whic
 shall comply with the Core Deterministic Encoding Requirements of CBOR (see RFC 8949,
 clause 4.2.1)") and 18.1 for all standard assertions.
 
-WHY THIS IS NOT cbor2
----------------------
-cbor2's ``canonical=True`` implements the WRONG ORDERING. It sorts map keys
-length-first -- by ``(len(encoded_key), encoded_key)`` -- which is RFC 8949 4.2.3,
-the *old* CTAP2/RFC 7049 rule. 4.2.1 requires purely BYTEWISE lexicographic ordering
-of the encoded keys. The two coincide for every map C2PA currently uses, because for
-text-string keys the CBOR head byte is monotonic in length, but they diverge the
-moment a negative integer key sits alongside a positive one at or above 24. We were
-already sorting keys ourselves and calling ``canonical=False``, which reduced cbor2
-to a primitive serializer.
-
-The decisive reason is on the decode side: a decoder that REJECTS non-deterministic
-input is a security property no general-purpose library offers. Anything not
-deterministically encoded is input no conforming C2PA producer would ever emit, so
-accepting it widens the attack surface for nothing. Everything here fails closed.
-
-cbor2 remains a dev dependency, used only as a differential-testing oracle.
-
 SCOPE
 -----
 THE WRITER AND THE READER HAVE DIFFERENT SCOPES, deliberately.
@@ -32,19 +14,21 @@ THE WRITER AND THE READER HAVE DIFFERENT SCOPES, deliberately.
 needs one, and 4.2.1's shortest-float rule is easy to get subtly wrong, so it is better
 absent than half-implemented. What we emit is a wire commitment, so this stays narrow.
 
-``loads`` accepts any WELL-FORMED CBOR, because 15.10.3.1 rejects assertion content
-only when it "is NOT WELL-FORMED CBOR", defined by RFC 8949 Appendix C. Any tag is
-carried as ``Tagged`` and floats are decoded. Reading only what we write refused
-conforming third-party manifests -- the CDDL needs tag 37 for ``instanceID`` and floats
-for region coordinates.
+``loads`` defaults to deterministic CBOR. Its well-formed-input mode carries any tag
+as ``Tagged``, retains every CBOR key type, decodes floats, and carries unassigned
+simple values as ``SimpleValue``. C2PA 15.6.2 and 15.10.3.1 reject content that is not
+well-formed CBOR; they do not impose the producer's deterministic subset. Duplicate
+map keys remain an RFC 8949 validity failure. RFC 9052 section 9 likewise applies its
+encoding restrictions to ``Sig_structure``, not the transported ``COSE_Sign1`` or its
+header maps.
 
-WHAT IS STILL REFUSED ON READ, and the distinction matters because folding the two
-together is the overclaim shape this package corrects elsewhere:
+READ-SIDE REJECTION RULES
+-------------------------
 
-- Indefinite lengths, non-shortest arguments, non-shortest FLOATS, a NaN encoded as
-  anything but ``f97e00``, and out-of-order or duplicate map keys are refused because
-  RFC 8949 4.2.1 and 4.2.2 FORBID THEM. Rejecting non-deterministic input is a
-  security property no general-purpose decoder offers.
+- In deterministic mode, indefinite lengths, non-shortest arguments, non-shortest
+  FLOATS, a NaN encoded as anything but ``f97e00``, and out-of-order map keys are
+  refused because RFC 8949 4.2.1 and 4.2.2 forbid them. Duplicate keys are refused in
+  both modes.
 - Tags 25/256 (string references) are refused BY US on the write side only, as a
   consequence of the two-tag allowlist in ``dumps``. That is our scope decision, not the
   specification's -- calling it "forbidden by deterministic encoding" would credit
@@ -56,17 +40,10 @@ from __future__ import annotations
 import dataclasses
 import math
 import struct
+from collections.abc import Hashable
 from typing import TypeAlias
 
-from c2patxt.constants import MAX_JUMBF_DEPTH
-
-__all__ = [
-    "CborDecodeError",
-    "CborValue",
-    "Tagged",
-    "dumps",
-    "loads",
-]
+from c2patxt.constants import MAX_CBOR_DEPTH
 
 # Major types, in the high three bits of the initial byte.
 _MT_UINT = 0
@@ -84,11 +61,14 @@ _AI_2BYTE = 25
 _AI_4BYTE = 26
 _AI_8BYTE = 27
 _AI_INDEFINITE = 31
+_BREAK_BYTE = 0xFF
 
 # Simple values (major type 7).
 _SIMPLE_FALSE = 20
 _SIMPLE_TRUE = 21
 _SIMPLE_NULL = 22
+_SIMPLE_UNDEFINED = 23
+_SIMPLE_ONE_BYTE_MIN = 32
 
 TAG_COSE_SIGN1 = 18
 """COSE_Sign1_Tagged (RFC 9052)."""
@@ -103,17 +83,44 @@ writes ``0("2023-02-11T09:00:00Z")``. An untagged text string is a different CBO
 value and does not satisfy the CDDL.
 """
 
-#: Deliberately an ALLOWLIST, not a check for known-bad tags: a tag we do not
-#: understand is a value we cannot claim to have validated, and 10.1's deterministic
-#: encoding gives us no way to round-trip one faithfully.
+#: Tags emitted by this producer. The reader can retain any integer tag; deterministic
+#: encoding does not itself restrict which tags may be encoded.
 _ALLOWED_TAGS = frozenset({TAG_DATETIME, TAG_COSE_SIGN1})
 
 _MAX_UINT64 = (1 << 64) - 1
 
 
-CborValue: TypeAlias = (
-    "int | float | bytes | str | bool | list[CborValue] | dict[int | str | bytes, CborValue] | Tagged | None"
-)
+# Pyright requires this recursive TypeAlias to be one string literal; splitting it
+# makes every use Unknown, so the line-length rule cannot be applied here.
+CborKey: TypeAlias = "int | str | bytes | MapKey"
+CborValue: TypeAlias = "int | float | bytes | str | bool | list[CborValue] | dict[int | str | bytes, CborValue] | dict[CborKey, CborValue] | SimpleValue | Tagged | None"  # noqa: E501
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class SimpleValue:
+    """A CBOR simple value with no native Python equivalent.
+
+    ``loads`` uses this for unassigned values 0 through 19, undefined (23), and
+    one-byte values 32 through 255. It stays distinct from :class:`int`, so CBOR
+    ``simple(16)`` cannot silently become the unsigned integer 16. The writer does
+    not accept it: no C2PA structure produced by this package needs one.
+    """
+
+    value: int
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class MapKey:
+    """A decoded CBOR map key that has no safe native Python ``dict`` key.
+
+    CBOR permits every data item as a key, including arrays, maps and tagged values.
+    ``loads`` keeps the decoded key in ``value`` and uses the stored identity for
+    RFC 8949 section 5.6.1 equality and duplicate detection. The writer refuses this
+    holder: no structure emitted by this package needs a wrapped key.
+    """
+
+    value: CborValue = dataclasses.field(compare=False, hash=False)
+    identity: Hashable = dataclasses.field(repr=False)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -129,8 +136,47 @@ class Tagged:
     value: CborValue
 
 
+def _map_key_identity(value: CborValue) -> Hashable:
+    """Return RFC 8949 section 5.6.1 generic-data-model key identity."""
+    if value is None:
+        identity: Hashable = ("null",)
+    elif isinstance(value, bool):
+        identity = ("bool", value)
+    elif isinstance(value, int):
+        identity = ("int", value)
+    elif isinstance(value, float):
+        if math.isnan(value):
+            # Key equivalence ignores a NaN's sign and compares its significand after
+            # extension to binary64. `_float` has already converted every width to
+            # Python's binary64 representation.
+            bits = int.from_bytes(struct.pack(">d", value), "big")
+            identity = ("float-nan", bits & ((1 << 52) - 1))
+        else:
+            identity = ("float", 0.0 if value == 0.0 else value)
+    elif isinstance(value, bytes):
+        identity = ("bytes", value)
+    elif isinstance(value, str):
+        identity = ("text", value)
+    elif isinstance(value, SimpleValue):
+        identity = ("simple", value.value)
+    elif isinstance(value, Tagged):
+        identity = ("tag", value.tag, _map_key_identity(value.value))
+    elif isinstance(value, list):
+        identity = ("array", tuple(_map_key_identity(item) for item in value))
+    else:
+        pairs = frozenset(
+            (
+                key.identity if isinstance(key, MapKey) else _map_key_identity(key),
+                _map_key_identity(item),
+            )
+            for key, item in value.items()
+        )
+        identity = ("map", pairs)
+    return identity
+
+
 class CborDecodeError(ValueError):
-    """Input is not valid deterministically-encoded CBOR.
+    """Input violates the selected CBOR decoding mode.
 
     Deriving from ``ValueError`` rather than this package's own root: this is a
     parsing fault in a self-contained codec, and callers reasonably expect
@@ -144,9 +190,6 @@ class CborDecodeError(ValueError):
         self.msg = msg
         self.pos = pos
         super().__init__(f"{msg} (at byte {pos})")
-
-    def __reduce__(self) -> tuple[type[CborDecodeError], tuple[str, int]]:
-        return (self.__class__, (self.msg, self.pos))
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +246,8 @@ def _encode_scalar(value: object) -> bytes | None:
 
 
 def _encode(value: object, depth: int) -> bytes:
-    if depth > MAX_JUMBF_DEPTH:
-        msg = f"nesting deeper than {MAX_JUMBF_DEPTH}"
+    if depth > MAX_CBOR_DEPTH:
+        msg = f"nesting deeper than {MAX_CBOR_DEPTH}"
         raise ValueError(msg)
 
     scalar = _encode_scalar(value)
@@ -259,10 +302,11 @@ def dumps(value: object) -> bytes:
 
 
 class _Decoder:
-    __slots__ = ("data", "pos")
+    __slots__ = ("data", "deterministic", "pos")
 
-    def __init__(self, data: bytes) -> None:
+    def __init__(self, data: bytes, *, deterministic: bool) -> None:
         self.data = data
+        self.deterministic = deterministic
         self.pos = 0
 
     def _fail(self, msg: str) -> CborDecodeError:
@@ -276,16 +320,13 @@ class _Decoder:
         return chunk
 
     def _argument(self, info: int) -> int:
-        """Read an argument, rejecting any non-shortest-form encoding.
+        """Read an argument, rejecting non-shortest forms in deterministic mode.
 
-        This check is what makes the decoder *verify* determinism rather than merely
-        produce it. RFC 8949 4.2.1 requires the shortest form, so a longer one is
-        input no conforming producer emits.
+        RFC 8949 4.2.1 requires the shortest form from a conforming generator.
+        Validation paths that require only well-formed CBOR disable this check.
         """
         if info < _AI_1BYTE:
             return info
-        if info == _AI_INDEFINITE:
-            raise self._fail("indefinite-length item: forbidden by deterministic encoding")
         if info > _AI_8BYTE:
             raise self._fail(f"reserved additional information {info}")
 
@@ -293,9 +334,62 @@ class _Decoder:
         value = int.from_bytes(self._take(width), "big")
 
         minimum = (0, 0x18, 0x100, 0x10000, 0x100000000)[info - _AI_1BYTE + 1]
-        if value < minimum:
+        if self.deterministic and value < minimum:
             raise self._fail(f"value {value} is not in shortest form")
         return value
+
+    def _take_break(self) -> bool:
+        """Consume and report a break code at the current position."""
+        if self.pos < len(self.data) and self.data[self.pos] == _BREAK_BYTE:
+            self.pos += 1
+            return True
+        return False
+
+    def _indefinite_string(self, major: int) -> bytes | str:
+        """Decode an indefinite byte/text string from definite chunks."""
+        byte_chunks: list[bytes] = []
+        text_chunks: list[str] = []
+        while not self._take_break():
+            chunk_start = self.pos
+            initial = self._take(1)[0]
+            chunk_major, info = initial >> 5, initial & 0x1F
+            if chunk_major != major or info == _AI_INDEFINITE:
+                kind = "byte" if major == _MT_BYTES else "text"
+                raise CborDecodeError(
+                    f"an indefinite {kind} string must contain definite chunks of its own type",
+                    chunk_start,
+                )
+            argument = self._argument(info)
+            if major == _MT_BYTES:
+                byte_chunks.append(self._take(argument))
+                continue
+            raw = self._take(argument)
+            try:
+                text_chunks.append(raw.decode("utf-8"))
+            except UnicodeDecodeError as exc:
+                raise CborDecodeError("text string is not valid UTF-8", chunk_start) from exc
+        if major == _MT_BYTES:
+            return b"".join(byte_chunks)
+        return "".join(text_chunks)
+
+    def _indefinite_array(self, depth: int) -> list[CborValue]:
+        """Decode array items up to their break code."""
+        out: list[CborValue] = []
+        while not self._take_break():
+            out.append(self.decode(depth + 1))
+        return out
+
+    def _decode_indefinite(self, major: int, depth: int, start: int) -> CborValue:
+        """Decode an indefinite container in well-formed-input mode."""
+        if self.deterministic:
+            raise self._fail("indefinite-length item: forbidden by deterministic encoding")
+        if major in (_MT_BYTES, _MT_TEXT):
+            return self._indefinite_string(major)
+        if major == _MT_ARRAY:
+            return self._indefinite_array(depth)
+        if major == _MT_MAP:
+            return self._map(None, depth)
+        raise CborDecodeError("this major type cannot use an indefinite length", start)
 
     def _decode_scalar(self, major: int, argument: int, start: int) -> CborValue:
         """Decode a non-container item. Callers handle containers themselves."""
@@ -313,8 +407,8 @@ class _Decoder:
             raise CborDecodeError("text string is not valid UTF-8", start) from exc
 
     def decode(self, depth: int = 0) -> CborValue:
-        if depth > MAX_JUMBF_DEPTH:
-            raise self._fail(f"nesting deeper than {MAX_JUMBF_DEPTH}")
+        if depth > MAX_CBOR_DEPTH:
+            raise self._fail(f"nesting deeper than {MAX_CBOR_DEPTH}")
 
         start = self.pos
         initial = self._take(1)[0]
@@ -322,6 +416,9 @@ class _Decoder:
 
         if major == _MT_SIMPLE:
             return self._simple(info, start)
+
+        if info == _AI_INDEFINITE:
+            return self._decode_indefinite(major, depth, start)
 
         argument = self._argument(info)
 
@@ -331,48 +428,28 @@ class _Decoder:
             return [self.decode(depth + 1) for _ in range(argument)]
         if major == _MT_MAP:
             return self._map(argument, depth)
-        # major == _MT_TAG. ANY tag is decoded, and carried as Tagged.
-        #
-        # This accepted only tags 0 and 18, so anything else raised and _parse_assertions
-        # turned that into assertion.cbor.invalid -- refusing a whole conforming manifest
-        # before verification began. 15.10.3.1 triggers on content that "is NOT WELL-
-        # FORMED CBOR", and defines that by RFC 8949 Appendix C, whose grammar accepts
-        # any tag number over any well-formed item. Recognising a tag and accepting its
-        # bytes are different questions; only the second one is the decoder's.
-        #
-        # The CDDL needs at least two we did not have: the buuid type, which is CBOR
-        # tag 37 over a byte string, used by instanceID in the action-items map; and
-        # tag 1, epoch time.
-        #
-        # `dumps` is unchanged and still refuses everything outside _ALLOWED_TAGS.
-        # Deterministic encoding is a PRODUCER obligation (RFC 8949 4.2.1) and our
-        # output is a wire commitment.
+        # major == _MT_TAG. RFC 8949 Appendix C permits any integer tag over a
+        # well-formed item. Position-specific C2PA validation happens after decoding;
+        # ``dumps`` remains limited to the producer's tag allowlist.
         return Tagged(argument, self.decode(depth + 1))
 
-    def _simple(self, info: int, start: int) -> bool | float | None:
-        """Major type 7: the three simple values we emit, plus floats on READ only.
+    def _simple(self, info: int, start: int) -> SimpleValue | bool | float | None:
+        """Decode major type 7 simple values and all three RFC 8949 float widths.
 
-        Floats were rejected as "unsupported simple value", which was the same false
-        reject as the tag one: the CDDL puts them in ``coordinate-map`` and
-        ``shape-map`` (x, y, width, height), reachable from an action's ``changes``
-        field and from ``regionOfInterest`` in an assertion's metadata. A region with a
-        fractional coordinate -- the ordinary case -- made a manifest unreadable.
-
-        All three widths are decoded because RFC 8949 defines them as three encodings
-        of one type, and a deterministic encoder prefers the shortest that round-trips.
-
-        NOTHING HERE WIDENS WHAT IS ALLOCATED. Each float is a fixed 2, 4 or 8 bytes
-        read through the same ``_take`` bounds check as every other item; the reason
-        this decoder is careful is that it is the first thing to touch attacker bytes,
-        and that is a length-and-depth property, untouched by admitting a wider set of
-        VALUES. ``dumps`` still refuses floats, so this cannot reach the wire.
+        Each float consumes a fixed 2, 4, or 8 bytes through ``_take``. The producer
+        still refuses floats.
         """
-        if info == _SIMPLE_FALSE:
-            return False
-        if info == _SIMPLE_TRUE:
-            return True
-        if info == _SIMPLE_NULL:
-            return None
+        if _SIMPLE_FALSE <= info <= _SIMPLE_NULL:
+            return (False, True, None)[info - _SIMPLE_FALSE]
+        if info < _SIMPLE_FALSE:
+            return SimpleValue(info)
+        if info == _SIMPLE_UNDEFINED:
+            return SimpleValue(info)
+        if info == _AI_1BYTE:
+            value = self._take(1)[0]
+            if value < _SIMPLE_ONE_BYTE_MIN:
+                raise CborDecodeError(f"one-byte simple value {value} is below 32", start)
+            return SimpleValue(value)
         if info in (_AI_2BYTE, _AI_4BYTE, _AI_8BYTE):
             return self._float(info, start)
         if info == _AI_INDEFINITE:
@@ -380,17 +457,14 @@ class _Decoder:
         raise CborDecodeError(f"unsupported simple value {info}", start)
 
     def _float(self, info: int, start: int) -> float:
-        """Decode a float, REJECTING any encoding 4.2.1 forbids.
+        """Decode a float, enforcing 4.2.1 only in deterministic mode.
 
-        This module's whole argument is that a decoder rejecting non-deterministic
-        input is a security property no general-purpose library offers, and floats
-        arrived without it: ``fb3ff0000000000000`` decoded to 1.0 where 4.2.1 requires
-        ``f93c00``, sitting alongside ``_argument``, which refuses a
-        non-shortest INTEGER. Widening the reader is not licence to stop checking.
+        Strict decoding remains the producer-side wire assertion: for example,
+        ``fb3ff0000000000000`` is 1.0 where 4.2.1 requires ``f93c00``. Validation
+        paths that require only well-formed CBOR retain the value instead.
 
-        4.2.1: "the shortest form that preserves the value". So the test is a round
-        trip -- if a narrower width decodes back to the same bits, this encoding was
-        not the shortest and no conforming producer emitted it.
+        4.2.1 requires "the shortest form that preserves the value". Re-encoding at
+        narrower widths determines whether the supplied width was necessary.
 
         4.2.2 pins NaN to ``f97e00`` exactly, which is why NaN is compared on BITS
         rather than by value: every NaN payload is ``!= itself`` and ``== nan`` is
@@ -402,8 +476,11 @@ class _Decoder:
         value = struct.unpack(code, raw)[0]
 
         # 4.2.2 pins NaN to exactly f97e00. Checked FIRST and on the bits, because
-        # every NaN is unequal to itself and to every other NaN, so the round-trip
-        # test below cannot see one.
+        # every NaN is unequal to itself and to every other NaN, so the width
+        # comparison below cannot identify one.
+        if not self.deterministic:
+            return value
+
         if math.isnan(value):
             if raw != b"\x7e\x00":
                 msg = "NaN must be encoded as f97e00 (RFC 8949 4.2.2)"
@@ -420,64 +497,67 @@ class _Decoder:
                 repacked = struct.pack(narrow_code, value)
             except (OverflowError, ValueError):
                 # A value the narrower format cannot hold is trivially not expressible
-                # in it, so the encoding we were handed IS the shortest and the check
-                # simply does not apply. `>e` overflows above 65504, which is an
-                # ordinary magnitude, not an exotic one.
-                #
-                # THIS CARRIED `# pragma: no cover -- struct widens rather than failing`
-                # AND STRUCT DOES NOT WIDEN: `struct.pack(">e", 1e300)` raises
-                # OverflowError, and line-tracing `loads(fb7e37e43c8800759c)` shows this
-                # handler running. The pragma hid a live branch from the coverage gate,
-                # and deleting the handler on the strength of it would have put an
-                # OverflowError -- not a CborDecodeError -- out of `verify()`, which
-                # promises never to raise on attacker bytes.
+                # in it, so that narrower width cannot preserve the value. `>e`
+                # overflows above 65504; this is an expected part of probing widths,
+                # not malformed CBOR and not an exception that may escape verification.
                 continue
             if struct.unpack(narrow_code, repacked)[0] == value:
                 msg = f"float is not in shortest form: {width} bytes where {narrower} preserves the value"
                 raise CborDecodeError(msg, start)
         return value
 
-    def _map(self, count: int, depth: int) -> dict[int | str | bytes, CborValue]:
-        """Decode a map, enforcing bytewise key ordering and uniqueness."""
-        out: dict[int | str | bytes, CborValue] = {}
+    def _map(self, count: int | None, depth: int) -> dict[CborKey, CborValue]:
+        """Decode a map, retaining every key type and enforcing uniqueness."""
+        out: dict[CborKey, CborValue] = {}
         previous: bytes | None = None
-        for _ in range(count):
+        remaining = count
+        while remaining is None or remaining > 0:
+            if remaining is None and self._take_break():
+                break
             key_start = self.pos
-            key = self.decode(depth + 1)
+            decoded_key = self.decode(depth + 1)
             key_bytes = self.data[key_start : self.pos]
 
-            if previous is not None and key_bytes <= previous:
+            if self.deterministic and previous is not None and key_bytes <= previous:
                 what = "duplicate" if key_bytes == previous else "out-of-order"
                 raise CborDecodeError(f"{what} map key: not deterministically encoded", key_start)
             previous = key_bytes
 
-            # bool is a subclass of int, so `True` would otherwise pass this gate and
-            # then collide with integer key 1 in the output dict -- a two-entry map
-            # would decode to one entry, silently dropping content a signer wrote.
-            if isinstance(key, bool) or not isinstance(key, (int, str, bytes)):
-                raise CborDecodeError("map keys must be integers, text or byte strings", key_start)
+            # Python cannot use arrays or maps as dict keys, and it equates bool keys
+            # with integer 0/1. Wrap every key without a safe native representation so
+            # valid CBOR stays distinct and hashable without changing its decoded value.
+            key: CborKey
+            if type(decoded_key) is int or isinstance(decoded_key, (str, bytes)):
+                key = decoded_key
+            else:
+                key = MapKey(decoded_key, _map_key_identity(decoded_key))
+            if key in out:
+                raise CborDecodeError("duplicate map key", key_start)
+            if remaining is None and self._take_break():
+                raise CborDecodeError("break code where a map value is required", self.pos - 1)
             out[key] = self.decode(depth + 1)
+            if remaining is not None:
+                remaining -= 1
         return out
 
 
-def loads(data: bytes) -> CborValue:
-    """Parse deterministically-encoded CBOR, failing closed on anything else.
+def loads(data: bytes, *, deterministic: bool = True) -> CborValue:
+    """Parse CBOR, requiring deterministic encoding unless explicitly disabled.
 
-    Rejects, in addition to malformed input: indefinite-length items, non-shortest-form
-    integers, lengths and FLOATS, a NaN encoded as anything but ``f97e00`` (4.2.2),
-    out-of-order or duplicate map keys, simple values other than false/true/null, and
-    trailing bytes after the top-level item.
+    Deterministic mode additionally rejects indefinite-length items, non-shortest-form
+    integers, lengths and floats, a NaN encoded as anything but ``f97e00`` (4.2.2),
+    and out-of-order map keys. Both modes reject duplicate keys, reserved additional
+    information, malformed input, and trailing bytes.
 
-    ACCEPTS any tag, carried as :class:`Tagged`, and floats. This said it rejected
-    "unknown tags" and every simple value but the three -- both true before the reader
-    was widened to all well-formed CBOR, and both then left contradicting the module
-    docstring in this same file. What is rejected is what 4.2.1 FORBIDS, not what we
-    happen not to emit; ``dumps`` is the narrow one, and deliberately.
+    ACCEPTS any tag, carried as :class:`Tagged`, floats, and simple values carried as
+    :class:`SimpleValue` when Python has no native equivalent. What is rejected is
+    what 4.2.1 forbids, not what we happen not to emit; ``dumps`` is the narrow one,
+    and deliberately.
 
     Raises:
         CborDecodeError: on any of the above.
     """
-    decoder = _Decoder(data)
+    decoder = _Decoder(data, deterministic=deterministic)
     value = decoder.decode()
     if decoder.pos != len(data):
         raise CborDecodeError(f"{len(data) - decoder.pos} trailing byte(s) after the top-level item", decoder.pos)

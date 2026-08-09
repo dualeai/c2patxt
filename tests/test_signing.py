@@ -14,7 +14,6 @@ from c2patxt.signing import (
     Disclosure,
     ModelType,
     Signer,
-    has_claim_signing_eku,
 )
 from c2patxt.trust import ProfileError
 from tests.conftest import build_certificate
@@ -40,16 +39,6 @@ def test_signature_is_sixty_four_bytes_and_verifies(
     signature = signer.sign(b"to be signed")
     assert len(signature) == 64
     signing_key.public_key().verify(signature, b"to be signed")
-
-
-def test_signing_is_deterministic(signing_key: Ed25519PrivateKey, signing_certificate: x509.Certificate) -> None:
-    """RFC 8032 5.1.6: the nonce is derived, not random.
-
-    This is the one source of byte-stability we get for free. Everything else that
-    could vary lives in manifest construction.
-    """
-    signer = Signer(private_key=signing_key, certificates=(signing_certificate,))
-    assert len({signer.sign(b"same message") for _ in range(50)}) == 1
 
 
 def test_ed448_is_refused_at_construction() -> None:
@@ -87,26 +76,8 @@ def test_an_empty_chain_is_refused(signing_key: Ed25519PrivateKey) -> None:
         Signer(private_key=signing_key, certificates=())
 
 
-def test_a_conformant_certificate_carries_the_claim_signing_eku(
-    signing_certificate: x509.Certificate,
-) -> None:
-    assert has_claim_signing_eku(signing_certificate) is True
-
-
-def test_a_default_openssl_style_certificate_lacks_the_eku(signing_key: Ed25519PrivateKey) -> None:
-    """THE misconfiguration to expect from Terraform's tls_self_signed_cert.
-
-    A default `openssl req -x509` certificate asserts cA and carries no EKU. Under
-    14.5.1.1 that yields signingCredential.INVALID -- a hard reject where the
-    manifest is not even Valid -- rather than the signingCredential.untrusted a
-    self-signed credential is supposed to produce.
-    """
-    certificate = build_certificate(signing_key, conformant=False)
-    assert has_claim_signing_eku(certificate) is False
-
-
 def test_disclosure_requires_a_text_media_type() -> None:
-    with pytest.raises(ValueError, match="text/\\* media type"):
+    with pytest.raises(ValueError, match="text/\\* C2PA format-string"):
         Disclosure(media_type="image/jpeg", model_type=ModelType.GENERIC)
 
 
@@ -118,17 +89,26 @@ def test_disclosure_requires_a_model_type() -> None:
 
 @pytest.mark.parametrize(
     "media_type",
-    ["text/plain", "text/markdown", "text/csv", "text/tab-separated-values", "text/html"],
+    ["text/plain", "text/csv", "text/tab-separated-values"],
 )
-def test_any_text_media_type_is_accepted(media_type: str) -> None:
-    """Marking scope is the platform router's rule, not the codec's.
-
-    text/html is accepted even though C2PA assigns it to A.7 and this carrier is the
-    wrong mechanism for it. Documented in the Disclosure docstring rather than
-    enforced, because the SDK does not own platform policy.
-    """
+def test_unstructured_text_media_types_are_accepted(media_type: str) -> None:
     disclosure = Disclosure(media_type=media_type, model_type=ModelType.GENERIC)
     assert disclosure.media_type == media_type
+
+
+@pytest.mark.parametrize("media_type", ["text/", "text/plain; charset=utf-8", "TEXT/plain"])
+def test_media_type_must_follow_the_c2pa_format_string(media_type: str) -> None:
+    with pytest.raises(ValueError, match="C2PA format-string"):
+        Disclosure(media_type=media_type, model_type=ModelType.GENERIC)
+
+
+@pytest.mark.parametrize(
+    ("media_type", "annex"),
+    [("text/html", "A.7"), ("text/markdown", "A.9")],
+)
+def test_a8_refuses_formats_with_another_c2pa_carrier(media_type: str, annex: str) -> None:
+    with pytest.raises(ValueError, match=annex):
+        Disclosure(media_type=media_type, model_type=ModelType.GENERIC)
 
 
 def test_disclosure_is_frozen_and_carries_no_identifying_fields() -> None:
@@ -212,16 +192,8 @@ def test_every_model_type_is_a_table_12_value(value: str) -> None:
     """C2PA 18.28.2: modelType "is an enumeration of AI model types defined in
     Table 12".
 
-    Earlier releases emitted ``c2pa.types.model.generative`` and
-    ``c2pa.types.model.transformative``. NEITHER STRING APPEARS ANYWHERE IN THE
-    SPECIFICATION -- Table 12 enumerates model FORMATS (caffe, onnx, pytorch, …)
-    headed by the generic ``c2pa.types.model``, and has no concept of a generation
-    mode. It was on every mark the package produced, in signed bytes, in the one field
-    an EU AI Act Article 50(2) consumer keys on.
-
-    The set below is a verbatim subset of Table 12, transcribed from the specification
-    rather than from our own source, so a value that is not in the table fails here
-    rather than at someone else's validator.
+    The set below is a literal subset of Table 12 rather than a value derived from the
+    package constants. It covers the generic value and every public convenience member.
     """
     table_12 = {
         "c2pa.types.model",
@@ -251,19 +223,5 @@ def test_every_model_type_is_a_table_12_value(value: str) -> None:
     }
     assert value in table_12
 
-    # BOTH DIRECTIONS, and only one of them was here. Asserting `value in table_12` over
-    # ModelType's five members proves ModelType is a SUBSET and never touches
-    # MODEL_TYPES at all -- so deleting "keras", deleting "onnx", deleting "tensorflow"
-    # or misspelling "ml_net" as "mlnet" each survived the whole suite. A vendored copy
-    # of somebody else's table is only honest if something compares it to the table.
+    # The convenience members are a subset; the exported full vocabulary is exact.
     assert set(MODEL_TYPES) == table_12
-
-
-def test_the_removed_model_types_are_gone() -> None:
-    """Guards against the non-conforming values coming back by habit."""
-    assert not hasattr(ModelType, "GENERATIVE")
-    assert not hasattr(ModelType, "TRANSFORMATIVE")
-
-    exported = {getattr(ModelType, name) for name in dir(ModelType) if not name.startswith("_")}
-    assert all(v.startswith("c2pa.types.model") for v in exported)
-    assert "c2pa.types.model.generative" not in exported

@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 # Deny by default. A compromised third-party action cannot scrape a broad GITHUB_TOKEN
 # out of runner memory if the token has no scopes to begin with. This is the exact
@@ -68,3 +68,17 @@ jobs:
           name: ${{ env.JUNIT_XML }}
           path: ${{ env.JUNIT_XML }}
           if-no-files-found: ignore
+
+  # Stable branch-protection context for the develop ruleset. Matrix job names carry
+  # the OS and Python version, so none of them can provide its required `build` check.
+  build:
+    name: build
+    if: ${{ always() }}
+    needs: test
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 2
+    steps:
+      - name: Require every test job
+        env:
+          TEST_RESULT: ${{ needs.test.result }}
+        run: test "$TEST_RESULT" = success
