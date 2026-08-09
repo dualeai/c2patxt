@@ -15,6 +15,7 @@ import hashlib
 import unicodedata
 import uuid
 from collections.abc import Callable
+from typing import TypeGuard
 
 import cbor2
 import pytest
@@ -58,7 +59,7 @@ from c2patxt.trust import ProfileError
 from c2patxt.verdict import Provenance, Verdict
 from tests.conftest import DISCLOSURE, WHEN, FloatingTimezone, RecordingTrustEvaluator, build_certificate, mark
 
-from c2patxt import VerifyContext, embed, extract, locate, verify  # isort: skip
+from c2patxt import MarkCorruptError, VerifyContext, embed, extract, locate, verify  # isort: skip
 
 
 #: This suite exercises the WHOLE stack -- selectors, JUMBF, CBOR, COSE, certificate
@@ -347,14 +348,18 @@ def test_empty_text_is_unmarked() -> None:
     assert verdict.state is Provenance.UNMARKED
 
 
-def test_the_span_locates_the_wrapper(marked: str) -> None:
-    """The reported span must name the wrapper exactly, so a caller can strip it."""
+def test_the_span_locates_the_wrapper_by_utf8_bytes(signer: Signer) -> None:
+    """A non-ASCII prefix separates byte offsets from Python character indexes."""
+    text = "café 漢字"
+    marked = mark(text, signer)
     verdict = verify(marked)
     span = verdict.span
     assert span is not None
     encoded = marked.encode("utf-8")
+    assert span.utf8_start == len(text.encode("utf-8"))
+    assert encoded[span.utf8_start : span.utf8_stop].decode("utf-8").startswith(MARKER)
     stripped = encoded[: span.utf8_start] + encoded[span.utf8_stop :]
-    assert stripped.decode("utf-8") == "The quick brown fox jumps over the lazy dog."
+    assert stripped.decode("utf-8") == text
 
 
 @pytest.mark.parametrize(
@@ -1491,6 +1496,15 @@ def _widen(mapping: dict[str, _cbor.CborValue]) -> CborMap:
     return {key: value for key, value in mapping.items()}
 
 
+def _is_string_cbor_map(value: object) -> TypeGuard[dict[str, _cbor.CborValue]]:
+    """Recognize the string-keyed, writer-supported CBOR maps these mutators edit."""
+    try:
+        decoded = _cbor.loads(_cbor.dumps(value))
+    except (TypeError, ValueError):
+        return False
+    return isinstance(decoded, dict) and all(isinstance(key, str) for key in decoded)
+
+
 #: 8.4.2.1's store-relative form, naming THIS manifest: the shape of the spec's
 #: own Example 1, naming the version-4 UUID pinned by conftest.
 _STORE_RELATIVE = (
@@ -1965,8 +1979,17 @@ def _restore_manifest(original: ManifestStore, rebuild: Callable[[JumbfBox], tup
         ("assertion-cbor", StatusCode.ASSERTION_CBOR_INVALID),
         ("metadata-json", StatusCode.ASSERTION_JSON_INVALID),
         ("duplicate-label", StatusCode.ASSERTION_MISSING),
+        ("duplicate-claim", StatusCode.CLAIM_MULTIPLE),
     ],
-    ids=["claim-cbor", "no-claim-box", "claim-without-cbor", "assertion-cbor", "metadata-json", "duplicate-label"],
+    ids=[
+        "claim-cbor",
+        "no-claim-box",
+        "claim-without-cbor",
+        "assertion-cbor",
+        "metadata-json",
+        "duplicate-label",
+        "duplicate-claim",
+    ],
 )
 def test_verify_reports_the_specific_parse_code(signer: Signer, damage: str, expected: StatusCode) -> None:
     """Every parse failure reaches public ``verify`` with its specific code.
@@ -2003,13 +2026,22 @@ def test_verify_reports_the_specific_parse_code(signer: Signer, damage: str, exp
             if damage in {"assertion-cbor", "metadata-json", "duplicate-label"} and label == LABEL_ASSERTION_STORE:
                 child = _damage_store(child, damage, ASSERTION_METADATA)
             out.append((tbox, _jumbf.serialize_superbox(child)[8:]))
+            if damage == "duplicate-claim" and label == LABEL_CLAIM:
+                out.append((tbox, _jumbf.serialize_superbox(child)[8:]))
         return tuple(out)
 
-    verdict = verify(_restore_manifest(original, rebuild))
+    damaged = _restore_manifest(original, rebuild)
+    with pytest.raises(MarkCorruptError) as caught:
+        extract(damaged)
+    assert caught.value.code is expected
+
+    verdict = verify(damaged)
 
     assert verdict.state is Provenance.INVALID
     assert expected in verdict.codes()
     assert StatusCode.TEXT_CORRUPTED_WRAPPER not in verdict.codes(), "the carrier is intact; only the manifest is not"
+    if expected is StatusCode.CLAIM_MULTIPLE:
+        assert StatusCode.GENERAL_ERROR not in verdict.codes()
 
 
 def _damage_store(store: JumbfBox, damage: str, metadata_label: str) -> JumbfBox:
@@ -2158,6 +2190,19 @@ def test_one_assertion_can_be_authenticated_under_two_hash_algorithms(signer: Si
         if status.code is StatusCode.ASSERTION_HASHED_URI_MATCH and status.url == url
     ]
     assert len(matches) == 2
+
+
+def test_an_external_claim_link_reports_outside_manifest_through_public_verify(signer: Signer) -> None:
+    """The 15.10.3.1 status survives serialized claim parsing and verdict assembly."""
+
+    def point_outside(_items: list[Assertion], links: list[dict[str, object]]) -> None:
+        links[0] = {**links[0], "url": "https://elsewhere.invalid/assertion"}
+
+    verdict = verify(_resigned(signer, _unchanged, mutate_links=point_outside))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.ASSERTION_OUTSIDE_MANIFEST in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
 
 
 @pytest.mark.parametrize(
@@ -2622,6 +2667,26 @@ def _placed_with_component(items: list[Assertion], _claim: dict[str, object]) ->
             {"action": "c2pa.placed", "parameters": {"ingredients": [_assertion_link(component)]}},
         ],
     )
+
+
+def _v1_placed_with_singular_component(items: list[Assertion], _claim: dict[str, object]) -> None:
+    component = _ingredient("c2pa.ingredient.v3", "componentOf")
+    items.append(component)
+    items[0] = Assertion(
+        label=ASSERTION_ACTIONS_V1,
+        payload={
+            "actions": [
+                {"action": "c2pa.created", "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED},
+                {"action": "c2pa.placed", "parameters": {"ingredient": _assertion_link(component)}},
+            ]
+        },
+    )
+
+
+def _v1_placed_with_plural_component(items: list[Assertion], claim: dict[str, object]) -> None:
+    _placed_with_component(items, claim)
+    actions = items[0]
+    items[0] = Assertion(label=ASSERTION_ACTIONS_V1, payload=actions.payload)
 
 
 def _placed_without_ingredient(items: list[Assertion], _claim: dict[str, object]) -> None:
@@ -3093,6 +3158,27 @@ def test_plural_wrappers_use_the_one_whose_exclusion_matches(signer: Signer) -> 
     assert StatusCode.TEXT_MULTIPLE_WRAPPERS not in verdict.codes()
 
 
+def test_two_manifests_whose_own_wrapper_ranges_match_are_ambiguous(signer: Signer) -> None:
+    """15.12.1.3.1 rejects before choosing between two matching candidates."""
+    visible = "Visible"
+    first = _resigned(signer, _unchanged, prefix=visible)
+    text = _resigned(signer, _unchanged, prefix=first)
+
+    encoded = text.encode("utf-8")
+    first_span = (len(visible.encode("utf-8")), len(first.encode("utf-8")))
+    second_span = (first_span[1], len(encoded))
+    assert text.count(MARKER) == 2
+    for start, stop in (first_span, second_span):
+        assert encoded[start:stop].decode("utf-8").startswith(MARKER)
+
+    verdict = verify(text)
+
+    assert verdict.state is Provenance.INVALID
+    assert verdict.manifest is None
+    assert StatusCode.TEXT_MULTIPLE_WRAPPERS in verdict.codes()
+    assert StatusCode.GENERAL_ERROR not in verdict.codes()
+
+
 def test_two_wrapper_ranges_named_by_the_binding_are_reported_as_multiple(signer: Signer) -> None:
     """15.12.1.3.1 rejects only when more than one wrapper matches an exclusion."""
     visible = "Visible"
@@ -3120,6 +3206,54 @@ def test_an_additional_exclusion_is_informational_and_is_applied(signer: Signer)
     assert verdict.state is Provenance.VALID
     assert [status.code for status in verdict.informational] == [StatusCode.DATA_HASH_ADDITIONAL_EXCLUSIONS]
     assert StatusCode.DATA_HASH_MATCH in verdict.codes()
+
+
+def _binding_without_hash(items: list[Assertion], _claim: dict[str, object]) -> None:
+    binding = items[3]
+    assert binding.label == ASSERTION_HASH_DATA
+    payload = binding.payload
+    assert _is_string_cbor_map(payload)
+    items[3] = Assertion(
+        label=binding.label,
+        payload={key: value for key, value in payload.items() if key != "hash"},
+    )
+
+
+def test_a_signed_data_hash_without_hash_reports_mismatch(signer: Signer) -> None:
+    """15.12.1.1 gives an absent hash the mismatch code, not malformed."""
+    verdict = verify(_resigned(signer, _binding_without_hash))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.DATA_HASH_MISMATCH in verdict.codes()
+    assert StatusCode.DATA_HASH_MALFORMED not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+
+
+def _binding_with_exclusion_past_eof(items: list[Assertion], _claim: dict[str, object]) -> None:
+    binding = items[3]
+    assert binding.label == ASSERTION_HASH_DATA
+    payload = binding.payload
+    assert _is_string_cbor_map(payload)
+    exclusions = payload["exclusions"]
+    assert isinstance(exclusions, list)
+    overrun = _widen({"start": 10_000_000, "length": 1})
+    items[3] = Assertion(
+        label=binding.label,
+        payload={
+            **payload,
+            "exclusions": [*exclusions, overrun],
+        },
+    )
+
+
+def test_an_additional_exclusion_past_eof_reports_mismatch(signer: Signer) -> None:
+    """The exact wrapper range matches before the later impossible range is checked."""
+    verdict = verify(_resigned(signer, _binding_with_exclusion_past_eof))
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.DATA_HASH_MISMATCH in verdict.codes()
+    assert StatusCode.DATA_HASH_MALFORMED not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
 
 
 def _second_hard_binding(items: list[Assertion], _claim: dict[str, object]) -> None:
@@ -3346,41 +3480,79 @@ def test_a_trust_evaluator_that_raises_yields_untrusted_not_a_crash(
     assert type(failure).__name__ in explanations, "the evaluator's failure must be visible, not swallowed"
 
 
-def test_a_store_labelled_c2pa_actions_v1_is_accepted(store: ManifestStore) -> None:
+def test_a_serialized_store_labelled_c2pa_actions_v1_is_accepted(signer: Signer) -> None:
     """Every clause names both action labels. 15.10.3.2.3 opens "If the assertion's label is
     c2pa.actions or c2pa.actions.v2"; Table 7 lists them as one row; 5.1 says a
     deprecated construct "can be read, but never written", and we still emit v2 only.
 
-    Relabelling the assertion, its raw bytes, and the claim link together drives the
-    accepted v1 shape through the assertion-store boundary.
+    The fixture is serialized and signed before public extraction and verification, so
+    the parser cannot silently drop the deprecated label while private verifier tests
+    remain green.
     """
-    v1 = ASSERTION_ACTIONS_V1
-    original = store.claim["created_assertions"]
-    assert isinstance(original, list)
 
-    links: list[_cbor.CborValue] = []
-    for link in original:
-        if isinstance(link, dict):
-            url = link.get("url")
-            if isinstance(url, str) and ASSERTION_ACTIONS in url:
-                links.append({**_copy_cbor_map(link), "url": url.replace(ASSERTION_ACTIONS, v1)})
-                continue
-        links.append(link)
-    relabelled = dataclasses.replace(
-        store,
-        claim={**store.claim, "created_assertions": links},
-        assertions={
-            (v1 if label == ASSERTION_ACTIONS else label): payload for label, payload in store.assertions.items()
-        },
-        assertion_bytes={
-            (v1 if label == ASSERTION_ACTIONS else label): raw for label, raw in store.assertion_bytes.items()
-        },
-    )
+    def relabel_actions(items: list[Assertion], _claim: dict[str, object]) -> None:
+        actions = items[0]
+        assert actions.label == ASSERTION_ACTIONS
+        items[0] = Assertion(label=ASSERTION_ACTIONS_V1, payload=actions.payload)
 
-    verdict, accepted = _verify._check_assertions(relabelled, Verdict(state=Provenance.INVALID))
+    marked = _resigned(signer, relabel_actions)
+    store = extract(marked)
+    assert store is not None
+    assert ASSERTION_ACTIONS_V1 in store.assertions
+    assert ASSERTION_ACTIONS not in store.assertions
 
-    assert accepted, f"a v1 actions assertion was rejected: {verdict.failure}"
+    verdict = verify(marked)
+
+    assert verdict.state is Provenance.VALID
     assert StatusCode.ASSERTION_MISSING not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+    assert StatusCode.SIGNING_CREDENTIAL_UNTRUSTED in verdict.codes()
+
+
+def test_actions_v1_resolves_its_singular_ingredient_field(signer: Signer) -> None:
+    """The deprecated v1 shape uses ``ingredient``, not v2's ``ingredients`` array."""
+    marked = _resigned(signer, _v1_placed_with_singular_component)
+    store = extract(marked)
+    assert store is not None
+    actions = store.assertion(ASSERTION_ACTIONS_V1)
+    assert isinstance(actions, dict)
+    entries = actions["actions"]
+    assert isinstance(entries, list)
+    placed = entries[1]
+    assert isinstance(placed, dict)
+    parameters = placed["parameters"]
+    assert isinstance(parameters, dict)
+    assert "ingredient" in parameters
+    assert "ingredients" not in parameters
+
+    verdict = verify(marked)
+
+    assert StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH not in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
+    assert StatusCode.GENERAL_ERROR in verdict.codes(), "full ingredient-manifest validation remains unsupported"
+
+
+def test_actions_v1_rejects_the_v2_plural_ingredient_field(signer: Signer) -> None:
+    """A valid component link under the wrong field proves the v1 check actually ran."""
+    marked = _resigned(signer, _v1_placed_with_plural_component)
+    store = extract(marked)
+    assert store is not None
+    actions = store.assertion(ASSERTION_ACTIONS_V1)
+    assert isinstance(actions, dict)
+    entries = actions["actions"]
+    assert isinstance(entries, list)
+    placed = entries[1]
+    assert isinstance(placed, dict)
+    parameters = placed["parameters"]
+    assert isinstance(parameters, dict)
+    assert "ingredient" not in parameters
+    assert "ingredients" in parameters
+
+    verdict = verify(marked)
+
+    assert verdict.state is Provenance.INVALID
+    assert StatusCode.ASSERTION_ACTION_INGREDIENT_MISMATCH in verdict.codes()
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
 
 
 def test_an_unlinked_second_hard_binding_is_undeclared_not_multiple(store: ManifestStore) -> None:
