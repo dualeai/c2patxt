@@ -127,30 +127,13 @@ def require_encodable(text: str) -> int:
         raise UnencodableTextError(exc.start) from exc
 
 
-def find_wrappers(text: str) -> list[WrapperMatch]:
-    """Locate every structurally valid wrapper, in order of appearance.
+def _scan_wrappers(text: str) -> tuple[list[WrapperMatch], MarkCorruptError | None]:
+    """Return valid wrappers and the first structurally corrupt candidate.
 
-    Implements A.8.4.2: scan for U+FEFF; for each, decode the following contiguous
-    variation-selector run; if its first eight bytes are the magic, parse the rest.
-
-    Four hazards A.8.4.2 does not address, all handled here:
-
-    1. A candidate whose magic does not match is NOT an error. Scanning simply
-       continues. Inventing a failure code here would hand a denial of service to
-       anyone able to append a garbage selector run to a document -- they could
-       invalidate a genuine wrapper elsewhere in the same text.
-    2. A leading UTF-8 byte-order mark IS a U+FEFF and is scanned as a candidate. It
-       is rejected on the magic check like any other non-match, with no special case.
-    3. Fewer than eight selectors after a marker is undefined in A.8. Treated as
-       "not a wrapper", consistent with (1).
-    4. A wrapper ends at ``HEADER_SIZE + manifestLength`` decoded bytes, never at the
-       end of the contiguous run. Variation selectors the author wrote immediately
-       after a wrapper are not part of it.
-
-    Raises:
-        MarkCorruptError: when a candidate's magic matches but its structure is
-            malformed. A matched magic is a positive assertion that a wrapper was
-            intended, so unlike (1) above this is a real failure.
+    Detection callers keep a genuine wrapper usable when a corrupt decoy appears
+    elsewhere in the document. Destructive callers also need the remembered error:
+    they cannot remove a candidate whose extent is unknown. Keeping both results here
+    lets each public operation apply its own policy without implementing the scan twice.
     """
     document_length = require_encodable(text)
 
@@ -188,11 +171,6 @@ def find_wrappers(text: str) -> list[WrapperMatch]:
                 offset=prefix_bytes + marker_bytes,
             )
         except MarkCorruptError as exc:
-            # A corrupt candidate must NOT discard wrappers already found. Otherwise
-            # appending twenty-odd characters of malformed run to a document makes a
-            # genuine wrapper unfindable -- the same denial of service that hazard 1
-            # rejects, arriving through the parse path instead of the scan path.
-            # The error is remembered and raised only if nothing valid turns up.
             if corrupt is None:
                 corrupt = exc
             index = found + len(MARKER)
@@ -206,6 +184,35 @@ def find_wrappers(text: str) -> list[WrapperMatch]:
         matches.append(WrapperMatch(span=Span(prefix_bytes, stop), payload=payload))
         index = found + wrapper_chars
 
+    return matches, corrupt
+
+
+def find_wrappers(text: str) -> list[WrapperMatch]:
+    """Locate every structurally valid wrapper, in order of appearance.
+
+    Implements A.8.4.2: scan for U+FEFF; for each, decode the following contiguous
+    variation-selector run; if its first eight bytes are the magic, parse the rest.
+
+    Four hazards A.8.4.2 does not address, all handled here:
+
+    1. A candidate whose magic does not match is NOT an error. Scanning simply
+       continues. Inventing a failure code here would hand a denial of service to
+       anyone able to append a garbage selector run to a document -- they could
+       invalidate a genuine wrapper elsewhere in the same text.
+    2. A leading UTF-8 byte-order mark IS a U+FEFF and is scanned as a candidate. It
+       is rejected on the magic check like any other non-match, with no special case.
+    3. Fewer than eight selectors after a marker is undefined in A.8. Treated as
+       "not a wrapper", consistent with (1).
+    4. A wrapper ends at ``HEADER_SIZE + manifestLength`` decoded bytes, never at the
+       end of the contiguous run. Variation selectors the author wrote immediately
+       after a wrapper are not part of it.
+
+    Raises:
+        MarkCorruptError: when a candidate's magic matches but its structure is
+            malformed and no valid wrapper is found. A corrupt decoy cannot hide a
+            genuine wrapper elsewhere in the document.
+    """
+    matches, corrupt = _scan_wrappers(text)
     if not matches and corrupt is not None:
         raise corrupt
     return matches
@@ -246,7 +253,9 @@ def strip(text: str) -> str:
             Removing an unknown extent would be guesswork.
         UnencodableTextError: ``text`` cannot be encoded as UTF-8.
     """
-    matches = find_wrappers(text)
+    matches, corrupt = _scan_wrappers(text)
+    if corrupt is not None:
+        raise corrupt
     if not matches:
         return text
 
