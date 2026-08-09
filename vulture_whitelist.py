@@ -1,7 +1,16 @@
-# Vulture whitelist for false positives
-# These variables are required by protocols/interfaces but unused by design
+"""Public caller surface that a source-only reachability scan cannot observe."""
 
-# Async context manager protocol requires these args even if unused
-exc_type  # noqa
-exc_val  # noqa
-exc_tb  # noqa
+from c2patxt.signing import ModelType, Signer
+from c2patxt.status import StatusCode
+from c2patxt.verdict import Verdict
+
+_PUBLIC_CALLER_SURFACE = (
+    ModelType.GENERIC,
+    ModelType.HUGGINGFACE_TRANSFORMERS,
+    ModelType.ONNX,
+    ModelType.PYTORCH,
+    ModelType.TENSORFLOW,
+    Signer.leaf,
+    Verdict.raise_for_state,
+    StatusCode.__doc__,
+)

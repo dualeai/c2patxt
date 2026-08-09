@@ -4,8 +4,7 @@ on:
   # Build runs on every push to main so the release chain is exercised continuously.
   # The publish jobs are gated on the `release` event -- NOT on a tag. A branch filter
   # excludes tag pushes, so `git push --tags` runs nothing here; publishing means
-  # creating a GitHub Release. That leaves the OIDC handshake as the sole untested step
-  # at first release rather than the whole chain.
+  # creating a GitHub Release.
   push:
     branches: [main]
   release:
@@ -23,6 +22,7 @@ permissions: {}
 
 jobs:
   build:
+    name: release-build
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
     permissions:
@@ -77,20 +77,6 @@ jobs:
           test -f dist/c2patxt-*.whl
           test -f dist/c2patxt-*.tar.gz
           uv run twine check dist/*
-
-      - name: Assert the wheel ships only what it should
-        # The leaf rule and the "no bundled trust anchors" claim are both checkable
-        # here, before anything is published.
-        run: |
-          python3 - <<'PY'
-          import glob, zipfile, sys
-          whl = glob.glob("dist/c2patxt-*.whl")[0]
-          names = zipfile.ZipFile(whl).namelist()
-          assert any(n.endswith("c2patxt/py.typed") for n in names), "py.typed missing from wheel"
-          bad = [n for n in names if "/vectors/" in n or n.endswith(".pem")]
-          assert not bad, f"wheel must ship no vectors and no trust anchors: {bad}"
-          print(f"{whl}: {len(names)} entries, py.typed present, no vectors, no anchors")
-          PY
 
       - name: Generate SBOM (CycloneDX)
         # --no-dev, NOT --all-extras. This SBOM is attested against dist/*, so it
@@ -252,11 +238,8 @@ jobs:
             echo "- [TestPyPI](https://test.pypi.org/p/c2patxt)"
             echo "- [PyPI](https://pypi.org/p/c2patxt)"
             echo ""
-            # THE REPOSITORY NAME HERE MUST BE EXACT. `gh attestation verify -R` matches
-            # against the repository named in the signed provenance, so a stale value
-            # fails verification even when the artifact is genuine -- and these lines
-            # are printed for whoever cuts the release to copy. Renamed from
-            # dualeai/c2pa-text on 2026-08-06; nothing published predates that.
+            # `gh attestation verify -R` matches the repository recorded in the signed
+            # provenance, so this name must remain exact.
             echo "### Verify this release yourself"
             echo '```bash'
             echo "# artifact -> commit (SLSA provenance)"

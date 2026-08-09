@@ -2,17 +2,21 @@
 
 ```console
 $ make install     # uv sync
-$ make test        # static checks + every test except the benchmarks
+$ make test        # static checks + every test except benchmarks
 $ make lint        # ruff format, ruff check --fix, pyright strict, vulture
 ```
 
-Both must be green before a pull request. CI runs `make test-static` and
-`make test-func` — the same checks, not the same targets: it cannot run `make lint`,
-which rewrites files rather than reporting on them.
+`make test` and `make lint` must be green before a pull request. CI runs
+`make test-static` and `make test-func` — the same checks, not the same targets: it
+cannot run `make lint`, which rewrites files rather than reporting on them.
 
 **Branch from `develop` and open the pull request against `develop`.** `main` is the
 release branch: it is what the publish workflow reads and what `git describe` tags. Work
 lands on `develop` first and reaches `main` when a release is cut.
+
+Dependabot version-update pull requests follow the same rule. GitHub always opens
+Dependabot security-update pull requests against the default branch, so those target
+`main`; the Test workflow also covers that branch.
 
 **Commit subjects are [Conventional Commits](https://www.conventionalcommits.org)** —
 `feat:`, `fix:`, `docs:`, `test:`, `ci:`, `refactor:` — because the release notes are
@@ -27,9 +31,9 @@ which for a compliance artefact is worse than a failing build.
 **Expected values come from the specification or from hand calculation. Never from
 running our own implementation.** A fixture generated with `embed()` and checked with
 `extract()` proves only that a function is its own inverse, and stays green when both
-halves share a bug. Where a reference exists — `unicodedata` for normalization, the
-RFC 8949 corpus for CBOR, another implementation's published vectors — assert against
-that instead.
+halves share a bug. Where a standard publishes source data — the Unicode Character
+Database for normalization or the RFC 8949 corpus for CBOR — assert against that
+instead.
 
 **A test must fail if you break the code it covers.** Before adding one, delete the
 function body in your head: if the test still passes, the assertion is too weak. This
@@ -47,9 +51,8 @@ test to skip. Use `xfail(strict=True)` for a known unfixed bug.
 
 **There are no test markers, and adding one needs a reason.** Selection is by
 directory: `make test-func` runs everything except `tests/benchmarks/`, and
-`make test-bench` runs only that. Nothing here talks to a database, a network or a
-clock it does not own — `--disable-socket` enforces the middle one — so a
-unit/integration split would label tests without letting anyone select differently.
+`make test-bench` runs only that tree. The suite talks to no database, network or
+clock it does not own — `--disable-socket` enforces the middle one.
 
 **The vector file's data is ASCII-only**, and CI enforces it. The subject matter is
 invisible characters; a file containing them literally is one no reviewer, diff tool
@@ -76,11 +79,10 @@ with both sides quoted**, not in a code comment. The document exists because tha
 reasoning is recoverable from nowhere else. A clause cited in `src/` should also appear
 in [docs/c2pa-compatibility.md](docs/c2pa-compatibility.md).
 
-**One direction of that is checked, and only one.**
-`tests/test_compatibility.py::test_every_where_column_names_a_file_that_cites_its_clause`
-holds that each file a row NAMES cites that clause. Two gaps, both on review: a row
-naming no file at all passes, and nothing checks the reverse direction — a clause you
-cite in `src/` and forget to add to the document goes unnoticed.
+No test grades that inventory against source comments. A clause number in a comment is
+not evidence that its rule executes, and deleting a filename from a table row can make
+such a test pass without fixing the claim. Review each row against behavior or wire
+tests instead.
 
 ## Changing the wire format
 
@@ -96,27 +98,17 @@ record means is MAJOR.
 
 ## Changing anything under `tests/vectors/`
 
-Run `make checksums`. Every file in that directory is listed in `SHA256SUMS` — the
-data file, the README, the LICENCE, the loader, the third-party corpora — so editing
-any of them, including a one-line prose change, invalidates the manifest.
-
-`tests/test_external_vectors.py::test_every_checksummed_file_exists_and_matches` is what
-fails, and it fails on a clean checkout rather than only for you. The manifest is not
-decoration: `tests/vectors/README.md` tells third parties to run
-`shasum -a 256 -c SHA256SUMS`, and a corpus offered to C2PA and C2SP whose own integrity
-check does not pass is worse than one carrying no check at all.
-
-Refreshing an external corpus is a separate step: `make download-vectors-cose`,
-`make download-vectors-cbor` and `make download-vectors-third-party` re-fetch the COSE
-working group, CBOR working group and third-party implementation vectors respectively;
-`make download-vectors` does all three. Those are other people's numbers, which is what
-makes them worth vendoring — re-fetch, then `make checksums`, and read the diff before
-committing.
+Refreshing a standards corpus is a separate step: `make download-vectors-cose` and
+`make download-vectors-cbor` re-fetch the COSE and CBOR working-group vectors;
+`make download-vectors` does both. Record the upstream commit and licence in the
+adjacent `PROVENANCE.md`, run the consuming CBOR/COSE tests, and read the diff before
+committing. Git already authenticates the committed files; there is no second checksum
+manifest over the same tree.
 
 ## Benchmarks
 
-`make test-bench` runs them; CI runs them via CodSpeed on pushes to `main` and `develop`, and on pull requests
-against `main`.
+`make test-bench` runs them; CI runs them via CodSpeed on pushes and pull requests against
+`main` and `develop`.
 What a benchmark holds, what an assertion holds, and the two things that will mislead
 you reading a local run are in [docs/benchmarks.md](docs/benchmarks.md).
 

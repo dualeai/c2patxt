@@ -42,18 +42,16 @@ classifiers = [
 # Exactly one runtime dependency, matching hpke-http. CBOR is implemented in-house
 # (see src/c2patxt/_cbor.py) rather than taking cbor2, because C2PA 10.1 mandates
 # RFC 8949 4.2.1 bytewise map ordering while cbor2's canonical=True implements
-# 4.2.3 length-first ordering, and because a decoder that REJECTS non-deterministic
-# input is a security property a general-purpose library cannot provide.
+# 4.2.3 length-first ordering, and because producer wire tests need a reader mode that
+# rejects non-deterministic encodings without narrowing the validator's read mode.
 dependencies = ["cryptography~=48.0"]
 
 [project.optional-dependencies]
-# RFC 5280 6 certificate path validation. Kept optional because pyca/cryptography's
-# x509.verification hardcodes an SPKI allowlist that excludes Ed25519 entirely
-# (pyca/cryptography#13391), so the default install can reach C2PA state "Valid" but
-# never "Trusted". This extra installs a validator a caller can BUILD a TrustEvaluator
-# with -- it does not itself make anything Trusted. Nothing in this package imports it;
-# TrustEvaluator is a Protocol the caller implements, and the shipped default trusts
-# nothing. See src/c2patxt/trust.py.
+# Preserves the published c2patxt[trust] install contract while backend adoption is
+# blocked on pyHanko#809 and pyca/cryptography#13391. c2patxt neither imports nor
+# adapts this package; it provides no c2patxt-owned backend or HTTP path even though
+# the backend brings Requests transitively. A future remote-fetch path requires an
+# async public API.
 trust = ["pyhanko-certvalidator~=0.31"]
 dev = [
     "cbor2~=6.1",       # Differential-testing oracle for our own CBOR codec. NEVER a runtime dep.
@@ -67,9 +65,6 @@ dev = [
     "pytest~=9.0",
     "ruff~=0.16",
     "twine~=6.0",
-    # This package never imports it -- grep src/ is clean. It is here for type-checking
-    # and is present at runtime anyway on Python < 3.14, as a transitive of cryptography.
-    "typing_extensions~=4.12",
     "vulture~=2.14",
 ]
 
@@ -112,30 +107,20 @@ addopts = [
     "--cov-fail-under=90",       # Raised from hpke-http's 80: this is a small pure codec, not a large async surface
     "--tb=short",                # Short traceback format
     "-v",                        # Verbose output, easier LLM debugging
-    # With no markers registered HERE, this makes an UNREGISTERED marker a hard
-    # collection error rather than a warning. It is not a guarantee that no marker
-    # appears: a marker a PLUGIN registers passes this check, and one did --
-    # `pytestmark = pytest.mark.benchmark` sat in tests/benchmarks/ against
-    # CONTRIBUTING.md's no-markers rule, accepted because pytest-codspeed registers
-    # `benchmark` itself. It was inert, since selection is by directory and the plugin
-    # gives the fixture precedence over the marker, and it has been removed. The rule
-    # is enforced by review; this flag only catches the unregistered case.
+    # Unregistered markers are collection errors. CONTRIBUTING.md forbids registered
+    # markers too; review enforces that broader repository rule.
     "--strict-markers",
     "-n",                        # Run tests in parallel
     "auto",                      # Use all available CPUs
     "--disable-socket",          # Self-contained: verification is offline, so tests must prove it
-    # This package parses adversarial input. A malformed box once made the JUMBF
-    # content loop spin forever; without a timeout that burns CI's 6-hour default
-    # instead of failing. The whole suite runs in well under a minute, so 30s per
-    # test is generous and still catches a hang immediately.
+    # Hostile-input tests must terminate. The per-test timeout turns a parser hang
+    # into a bounded failure.
     "--timeout=30",
     # Benchmarks are NOT tests: they assert nothing about cost, and under this config
     # they would run with coverage and --timeout=30 and fold into --cov-fail-under=90.
     # Here rather than only in the Makefile so a bare `uv run pytest` excludes them too.
     # `make test-bench` blanks addopts entirely, which is how it still reaches them.
     #
-    # NOT norecursedirs: that REPLACES pytest's defaults rather than extending them, so
-    # it silently stopped ignoring .hypothesis, .git, build and dist.
     "--ignore=tests/benchmarks",
 ]
 # NOTE: Rules for static testing are standard across all the monorepo, those rules are strict and
@@ -212,7 +197,7 @@ ban-relative-imports = "all"
 known-first-party = ["c2patxt"]
 
 [tool.vulture]
-exclude = [".venv/"]              # Exclude dependencies
-paths = ["src", "tests", "vulture_whitelist.py"]
-min_confidence = 80               # Ignore crap detections
-sort_by_size = true               # Most impactful issues first
+exclude = [".venv/"]
+paths = ["src", "vulture_whitelist.py"]
+min_confidence = 60
+sort_by_size = true
