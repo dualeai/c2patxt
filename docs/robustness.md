@@ -11,7 +11,7 @@ $ uv run python -m tools.robustness train.jsonl
 
 **Corpus:** PAN'26 Text Watermarking, [zenodo.org/records/18620130](https://zenodo.org/records/18620130),
 DOI 10.5281/zenodo.18620130, CC-BY-4.0. 300 documents, 701,594 characters.
-Measured 2026-08-05.
+Measured 2026-08-05 and reproduced 2026-08-09 against the exact checksum above.
 
 ## Results
 
@@ -22,13 +22,15 @@ Measured 2026-08-05.
 | strip invisible characters | 0.000 | 0.000 |
 | truncate to 50% | 0.000 | 1.000 |
 | excerpt 30% | 0.000 | 1.000 |
-| delete 15% of words | 0.000 | 1.000 |
-| typos in 5% of tokens | 0.000 | 1.000 |
+| delete word indexes 0, 7, 14, ... | 0.000 | 1.000 |
+| case flip every 20th character | 0.000 | 1.000 |
 | synthetic word substitution | 0.000 | 1.000 |
 | whitespace collapse (NBSP folding) | 0.500 | 1.000 |
 
 The manual command exits nonzero if either bolded cell falls below 1.000. It is not a
-CI build gate; everything else is a measurement.
+CI build gate; everything else is a measurement. CI pins the corpus identity, attack
+inventory, literal rewrites, table rows and the two gate columns. It does not download
+the corpus or recalculate these historical rates.
 
 ## Read the two columns separately
 

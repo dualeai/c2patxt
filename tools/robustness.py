@@ -101,17 +101,19 @@ def excerpt_30(text: str) -> str:
     return visible[start : start + int(len(visible) * 0.3)] + MARKER + mark if mark else visible
 
 
-def delete_15_percent_of_words(text: str) -> str:
+def delete_word_indexes_divisible_by_seven(text: str) -> str:
+    """Delete zero-based word indexes 0, 7, 14, and so on."""
     visible, _, mark = text.partition(MARKER)
     words = visible.split()
-    kept = [w for i, w in enumerate(words) if i % 7]  # drops ~14.3%
+    kept = [word for index, word in enumerate(words) if index % 7]
     return " ".join(kept) + MARKER + mark if mark else " ".join(kept)
 
 
-def typos_in_5_percent(text: str) -> str:
+def case_flip_every_twentieth_character(text: str) -> str:
+    """Swap case at character indexes 0, 20, 40, ... when that character is alphabetic."""
     visible, _, mark = text.partition(MARKER)
     chars = list(visible)
-    for i in range(0, len(chars), 20):  # 5%
+    for i in range(0, len(chars), 20):
         if chars[i].isalpha():
             chars[i] = chars[i].swapcase()
     return "".join(chars) + MARKER + mark if mark else "".join(chars)
@@ -147,12 +149,12 @@ def whitespace_collapse(text: str) -> str:
 
 ATTACKS: dict[str, Callable[[str], str]] = {
     "identity": identity,
-    "nfkd + casefold + whitespace": nfkd_casefold_whitespace,
+    "NFKD + casefold + whitespace collapse": nfkd_casefold_whitespace,
     "strip invisible characters": strip_invisibles,
     "truncate to 50%": truncate_half,
     "excerpt 30%": excerpt_30,
-    "delete 15% of words": delete_15_percent_of_words,
-    "typos in 5% of tokens": typos_in_5_percent,
+    "delete word indexes 0, 7, 14, ...": delete_word_indexes_divisible_by_seven,
+    "case flip every 20th character": case_flip_every_twentieth_character,
     "synthetic word substitution": synthetic_word_substitution,
     "whitespace collapse (NBSP folding)": whitespace_collapse,
 }
@@ -162,7 +164,7 @@ ATTACKS: dict[str, Callable[[str], str]] = {
 #: anything. The normalization row gates `located`: the carrier must survive every
 #: Unicode normalization form, while the binding is EXPECTED to fail because the
 #: visible bytes were rewritten.
-_GATES = {"identity": "verified", "nfkd + casefold + whitespace": "located"}
+_GATES = {"identity": "verified", "NFKD + casefold + whitespace collapse": "located"}
 
 
 def load_documents(path: pathlib.Path) -> list[str]:
@@ -201,8 +203,11 @@ def main(path: pathlib.Path) -> int:
     character_count = sum(map(len, documents))
     print(f"corpus: {path.name}, md5 {_CORPUS_MD5}, {len(documents)} documents, {character_count} characters\n")
 
-    print(f"{'attack':32} {'verified':>9} {'located':>9}")
-    print("-" * 52)
+    attack_width = 32
+    for name in ATTACKS:
+        attack_width = max(attack_width, len(name))
+    print(f"{'attack':{attack_width}} {'verified':>9} {'located':>9}")
+    print("-" * (attack_width + 20))
     failures: list[str] = []
     for name, attack in ATTACKS.items():
         verified = located = 0
@@ -216,7 +221,7 @@ def main(path: pathlib.Path) -> int:
             if verdict.at_least(Provenance.VALID):
                 verified += 1
         rates = {"verified": verified / len(marked), "located": located / len(marked)}
-        print(f"{name:32} {rates['verified']:9.3f} {rates['located']:9.3f}")
+        print(f"{name:{attack_width}} {rates['verified']:9.3f} {rates['located']:9.3f}")
         gate = _GATES.get(name)
         if gate is not None and rates[gate] < 1.0:
             failures.append(f"{name}: {gate}={rates[gate]:.3f}, expected 1.000 -- the codec is broken")
@@ -228,7 +233,8 @@ def main(path: pathlib.Path) -> int:
         "\nanalytic false-positive probability: a false positive requires U+FEFF followed by\n"
         "eight variation selectors decoding to 0x4332504154585400. Treating each selector as\n"
         "uniform over the 256 reachable values, that is 256**-8 = 2**-64 per U+FEFF in the\n"
-        "corpus. No natural-language process emits that sequence."
+        "corpus. This is an analytic candidate-detection model, not a measured natural-language\n"
+        "false-positive rate."
     )
 
     print("\nCARRIER SURVIVAL IS NOT PROVENANCE SURVIVAL. Compare the two columns: the")
