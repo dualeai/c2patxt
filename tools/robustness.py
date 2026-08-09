@@ -26,9 +26,9 @@ dominated by the true-positive rate and tells a reader nothing the survival tabl
 not. The analytic false-positive probability is reported instead, which is the honest
 form of the same claim.
 
-The attack list is writerslogic/c2pa-text-binding's disclosed list, reused verbatim so
-these numbers are directly comparable to the only other published set (their
-ROBUSTNESS.md).
+The battery uses deterministic byte rewrites derived from the attacks disclosed by
+writerslogic/c2pa-text-binding. Duplicate transforms are omitted; these labels describe
+what this script does rather than claiming a model or translation service ran.
 
 SINGLE CORPUS. The harness author's own stated limitation is that single-dataset
 robustness does not transfer. We used one corpus and say so.
@@ -36,6 +36,7 @@ robustness does not transfer. We used one corpus and say so.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import pathlib
 import re
@@ -58,6 +59,8 @@ _INVISIBLE = (
     f"{MARKER}\u200b-\u200f{chr(VS_LOW_BASE)}-{chr(VS_LOW_BASE + 15)}{chr(VS_HIGH_BASE)}-{chr(VS_HIGH_BASE + 239)}"
 )
 _SELECTORS = re.compile(f"[{_INVISIBLE}]")
+_CORPUS_MD5 = "777a1f5376eb6e0d5b54db2acff8c3ff"
+_CORPUS_RECORDS = 300
 
 
 def identity(text: str) -> str:
@@ -67,11 +70,6 @@ def identity(text: str) -> str:
 def strip_invisibles(text: str) -> str:
     """Remove every zero-width character. The attack the carrier cannot survive."""
     return _SELECTORS.sub("", text)
-
-
-def retype(text: str) -> str:
-    """A human reading the text and typing it out again: the visible characters only."""
-    return "".join(c for c in text if not _SELECTORS.match(c))
 
 
 def nfkd_casefold_whitespace(text: str) -> str:
@@ -90,11 +88,6 @@ def nfkd_casefold_whitespace(text: str) -> str:
     visible, _, mark = text.partition(MARKER)
     folded = " ".join(unicodedata.normalize("NFKD", visible).casefold().split())
     return folded + MARKER + mark if mark else folded
-
-
-def carrier_only_nfkd(text: str) -> str:
-    """The same, but asking only whether the CARRIER survives, not the binding."""
-    return nfkd_casefold_whitespace(text)
 
 
 def truncate_half(text: str) -> str:
@@ -124,17 +117,11 @@ def typos_in_5_percent(text: str) -> str:
     return "".join(chars) + MARKER + mark if mark else "".join(chars)
 
 
-def paraphrase(text: str) -> str:
-    """Stand-in for a paraphrase: every word replaced by a synonym is equivalent, at
-    the byte level, to rewriting the text. No model needed to know the answer."""
+def synthetic_word_substitution(text: str) -> str:
+    """Apply three fixed visible-word replacements; no model or translation runs."""
     visible, _, mark = text.partition(MARKER)
     reworded = visible.replace(" the ", " a ").replace(" is ", " was ").replace(" and ", " plus ")
     return reworded + MARKER + mark if mark else reworded
-
-
-def translate_round_trip(text: str) -> str:
-    """Stand-in for a round-trip translation: the visible text changes."""
-    return paraphrase(text)
 
 
 def whitespace_collapse(text: str) -> str:
@@ -162,13 +149,11 @@ ATTACKS: dict[str, Callable[[str], str]] = {
     "identity": identity,
     "nfkd + casefold + whitespace": nfkd_casefold_whitespace,
     "strip invisible characters": strip_invisibles,
-    "retype (visible text only)": retype,
     "truncate to 50%": truncate_half,
     "excerpt 30%": excerpt_30,
     "delete 15% of words": delete_15_percent_of_words,
     "typos in 5% of tokens": typos_in_5_percent,
-    "paraphrase": paraphrase,
-    "translate round-trip": translate_round_trip,
+    "synthetic word substitution": synthetic_word_substitution,
     "whitespace collapse (NBSP folding)": whitespace_collapse,
 }
 
@@ -180,13 +165,41 @@ ATTACKS: dict[str, Callable[[str], str]] = {
 _GATES = {"identity": "verified", "nfkd + casefold + whitespace": "located"}
 
 
+def load_documents(path: pathlib.Path) -> list[str]:
+    """Load exactly the published PAN'26 corpus used for the reported table."""
+    raw = path.read_bytes()
+    digest = hashlib.md5(raw, usedforsecurity=False).hexdigest()
+    if digest != _CORPUS_MD5:
+        msg = f"{path} has md5 {digest}; expected the published PAN'26 corpus {_CORPUS_MD5}"
+        raise ValueError(msg)
+
+    documents: list[str] = []
+    for line_number, line in enumerate(raw.decode("utf-8").splitlines(), start=1):
+        if not line.strip():
+            msg = f"{path}:{line_number}: blank records are not allowed"
+            raise ValueError(msg)
+        record: object = json.loads(line)
+        match record:
+            case {"text": str(text)}:
+                documents.append(text)
+            case _:
+                msg = f"{path}:{line_number}: each JSON record must be an object with a string text field"
+                raise ValueError(msg)
+
+    if len(documents) != _CORPUS_RECORDS:
+        msg = f"{path} has {len(documents)} records; expected {_CORPUS_RECORDS}"
+        raise ValueError(msg)
+    return documents
+
+
 def main(path: pathlib.Path) -> int:
     key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
     signer = Signer(private_key=key, certificates=(build_certificate(key),))
 
-    documents = [json.loads(line)["text"] for line in path.read_text("utf-8").splitlines() if line.strip()]
+    documents = load_documents(path)
     marked = [embed(doc, signer, DISCLOSURE) for doc in documents]
-    print(f"corpus: {path.name}, {len(documents)} documents, {sum(map(len, documents))} characters\n")
+    character_count = sum(map(len, documents))
+    print(f"corpus: {path.name}, md5 {_CORPUS_MD5}, {len(documents)} documents, {character_count} characters\n")
 
     print(f"{'attack':32} {'verified':>9} {'located':>9}")
     print("-" * 52)
@@ -195,10 +208,9 @@ def main(path: pathlib.Path) -> int:
         verified = located = 0
         for text in marked:
             attacked = attack(text)
-            try:
-                verdict = verify(attacked)
-            except Exception:  # noqa: BLE001 - an attack producing malformed text is a result, not a crash
-                continue
+            # verify() promises not to raise on hostile text. A raised exception is a
+            # harness failure, not a zero in a non-gating row, so let it stop the run.
+            verdict = verify(attacked)
             if verdict.state is not Provenance.UNMARKED:
                 located += 1
             if verdict.at_least(Provenance.VALID):

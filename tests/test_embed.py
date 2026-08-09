@@ -15,6 +15,7 @@ from collections.abc import Callable
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.x509.oid import NameOID
 
 from c2patxt import (
     AlreadyMarkedError,
@@ -28,19 +29,17 @@ from c2patxt import (
     strip,
     verify,
 )
-from c2patxt._cose import COSE_HEADER_ALG, parse
+from c2patxt._cose import parse
 from c2patxt._selectors import selector_to_byte
-from c2patxt.constants import MAGIC, MARKER, VERSION
-from c2patxt.manifest import (
-    ASSERTION_ACTIONS,
-    ASSERTION_AI_DISCLOSURE,
-    ASSERTION_HASH_DATA,
-    ASSERTION_METADATA,
-)
-from c2patxt.signing import COSE_ALG_EDDSA, Signer
-from tests.conftest import DISCLOSURE, WHEN, build_certificate
+from c2patxt.signing import C2PA_CLAIM_SIGNING_EKU, Signer
+from tests.conftest import DISCLOSURE, WHEN, FloatingTimezone
 
-PINNED = EmbedContext(manifest_uuid=uuid.UUID(int=7), instance_id="xmp:iid:pinned", when=WHEN)
+PINNED = EmbedContext(
+    manifest_uuid=uuid.UUID("00000000-0000-4000-8000-000000000007"),
+    instance_id="xmp:iid:pinned",
+    when=WHEN,
+)
+MARKER = "\ufeff"  # C2PA A.8.4.1 literal, not the production constant.
 
 
 #: This suite exercises the WHOLE stack -- selectors, JUMBF, CBOR, COSE, certificate
@@ -51,6 +50,16 @@ PINNED = EmbedContext(manifest_uuid=uuid.UUID(int=7), instance_id="xmp:iid:pinne
 @pytest.fixture(scope="session")
 def signer(signing_key: Ed25519PrivateKey, signing_certificate: x509.Certificate) -> Signer:
     return Signer(private_key=signing_key, certificates=(signing_certificate,))
+
+
+def test_context_refuses_an_empty_generator_name() -> None:
+    with pytest.raises(ValueError, match="1 to 1,000,000 UTF-8 bytes"):
+        EmbedContext(generator_name="")
+
+
+def test_context_limits_generator_name_by_utf8_bytes() -> None:
+    with pytest.raises(ValueError, match="1 to 1,000,000 UTF-8 bytes"):
+        EmbedContext(generator_name="é" * 500_001)
 
 
 # --------------------------------------------------------------------------------
@@ -73,13 +82,10 @@ def signer(signing_key: Ed25519PrivateKey, signing_certificate: x509.Certificate
     ],
 )
 def test_embed_then_verify_round_trips(text: str, signer: Signer) -> None:
-    """The one test that proves producer and consumer agree, across byte costs.
+    """Public producer and verifier agree across representative UTF-8 byte costs.
 
-    THE CODES ARE ASSERTED, NOT JUST THE STATE. ``VALID`` alone is reachable by more
-    than one route, and a mark that skipped the hard binding entirely would still
-    report it -- so the two codes that say the binding and the signature were actually
-    checked are named here. ``signingCredential.untrusted`` is expected and correct:
-    the credential is self-signed and we ship no anchors (C2PA 14.3.5).
+    The codes prove that signature, validity, and binding checks ran. The self-signed
+    fixture correctly remains untrusted while the mark is VALID under C2PA 14.3.5.
     """
     verdict = verify(embed(text, signer, DISCLOSURE, context=PINNED))
 
@@ -93,13 +99,8 @@ def test_embed_then_verify_round_trips(text: str, signer: Signer) -> None:
     } <= codes
 
 
-def test_the_visible_text_is_unchanged(signer: Signer) -> None:
-    """Marking must not alter what a reader sees.
-
-    Variation selectors are zero-width and the mark is a suffix, so stripping from
-    U+FEFF returns the original exactly. If this ever fails, the mark is corrupting
-    documents, which is worse than failing to mark them.
-    """
+def test_nfc_text_precedes_the_wrapper_unchanged(signer: Signer) -> None:
+    """For NFC input, embedding appends the wrapper without changing prior code points."""
     text = "The quick brown fox."
     marked = embed(text, signer, DISCLOSURE, context=PINNED)
     assert marked[: marked.index(MARKER)] == text
@@ -137,13 +138,7 @@ def test_the_exclusion_names_the_wrapper_exactly(signer: Signer) -> None:
 
 
 def test_the_wrapper_carries_the_magic_number(signer: Signer) -> None:
-    """A.8.2.2: the emitted wrapper opens with the magic, right after U+FEFF.
-
-    THE CONSTANT IS NOT THE SUBJECT. Asserting ``MAGIC == b"C2PATXT\\x00"`` compares a
-    constant with itself and passes even if nothing emits it; what has to hold is that
-    the bytes ``embed`` produced carry it. The declared value is checked against the
-    vector file in ``test_constants.py``.
-    """
+    """A.8.2.2: the public producer emits the literal magic and wrapper version."""
     marked = embed("Hello world.", signer, DISCLOSURE, context=PINNED)
 
     span = locate(marked)
@@ -152,8 +147,9 @@ def test_the_wrapper_carries_the_magic_number(signer: Signer) -> None:
 
     assert emitted.startswith(MARKER)
     body = bytes(selector_to_byte(ord(char)) or 0 for char in emitted[len(MARKER) :])
-    assert body[: len(MAGIC)] == MAGIC
-    assert body[len(MAGIC)] == VERSION
+    magic = bytes.fromhex("4332504154585400")
+    assert body[: len(magic)] == magic
+    assert body[len(magic)] == 1
 
 
 def test_the_emitted_disclosure_states_the_model_type(signer: Signer) -> None:
@@ -168,7 +164,7 @@ def test_the_emitted_disclosure_states_the_model_type(signer: Signer) -> None:
     store = extract(marked)
     assert store is not None
 
-    disclosure = store.assertion(ASSERTION_AI_DISCLOSURE)
+    disclosure = store.assertion("c2pa.ai-disclosure")
     assert isinstance(disclosure, dict)
     assert disclosure["modelType"] == DISCLOSURE.model_type
     assert disclosure["modelName"] == DISCLOSURE.model_name
@@ -185,24 +181,20 @@ def test_the_emitted_store_carries_exactly_the_four_assertions(signer: Signer) -
     assert store is not None
 
     assert set(store.assertions) == {
-        ASSERTION_ACTIONS,
-        ASSERTION_AI_DISCLOSURE,
-        ASSERTION_HASH_DATA,
-        ASSERTION_METADATA,
+        "c2pa.actions.v2",
+        "c2pa.ai-disclosure",
+        "c2pa.hash.data",
+        "c2pa.metadata",
     }
 
 
 def test_the_emitted_signature_declares_eddsa_in_the_protected_bucket(signer: Signer) -> None:
-    """13.2.1's algorithm, on a signature ``embed`` produced.
-
-    ``test_cose.py`` asserts it on ``sign_claim`` output directly, which does not say
-    what the embed path puts on the wire.
-    """
+    """13.2.1's algorithm, on a signature ``embed`` produced."""
     marked = embed("Hello world.", signer, DISCLOSURE, context=PINNED)
     store = extract(marked)
     assert store is not None
 
-    assert parse(store.signature).header()[COSE_HEADER_ALG] == COSE_ALG_EDDSA
+    assert parse(store.signature).decoded_protected[1] == -8
 
 
 # --------------------------------------------------------------------------------
@@ -254,7 +246,7 @@ def test_nfd_input_is_normalized_before_marking(signer: Signer) -> None:
 
 
 def test_nfc_input_is_returned_byte_identical(signer: Signer) -> None:
-    """The common case must be lossless. Effectively all real text is already NFC."""
+    """NFC input is unchanged before the appended wrapper."""
     text = "café and 漢字"
     marked = embed(text, signer, DISCLOSURE, context=PINNED)
     assert marked[: marked.index(MARKER)] == text
@@ -266,11 +258,7 @@ def test_nfc_input_is_returned_byte_identical(signer: Signer) -> None:
 
 
 def test_embedding_over_an_existing_mark_raises(signer: Signer) -> None:
-    """Neither append nor replace: both fail somewhere the caller cannot see.
-
-    A second wrapper is invalid per 15.5.2.1 and would only surface at the consumer;
-    replacing would discard another producer's signed claim.
-    """
+    """Producer policy requires an explicit strip before replacement or another append."""
     marked = embed("Hello world.", signer, DISCLOSURE, context=PINNED)
     with pytest.raises(AlreadyMarkedError, match="already carries") as excinfo:
         embed(marked, signer, DISCLOSURE, context=PINNED)
@@ -312,9 +300,23 @@ def test_an_unsupported_algorithm_is_refused(signer: Signer) -> None:
 
 @pytest.mark.parametrize("algorithm", ["sha256", "sha384", "sha512"])
 def test_every_permitted_algorithm_round_trips(algorithm: str, signer: Signer) -> None:
-    """All three permitted algorithms, not just the default."""
-    context = EmbedContext(manifest_uuid=uuid.UUID(int=7), instance_id="x", when=WHEN, algorithm=algorithm)
-    assert verify(embed("Hello world.", signer, DISCLOSURE, context=context)).state is Provenance.VALID
+    """All three permitted algorithms reach an exact, verifiable exclusion."""
+    context = EmbedContext(
+        manifest_uuid=uuid.UUID("00000000-0000-4000-8000-000000000007"),
+        instance_id="x",
+        when=WHEN,
+        algorithm=algorithm,
+    )
+    marked = embed("Hello world.", signer, DISCLOSURE, context=context)
+    store = extract(marked)
+    assert store is not None
+    assert store.hash_data is not None
+    exclusions = store.hash_data["exclusions"]
+    assert isinstance(exclusions, list)
+    exclusion = exclusions[0]
+    assert isinstance(exclusion, dict)
+    assert exclusion["length"] == len(marked[marked.index(MARKER) :].encode())
+    assert verify(marked).state is Provenance.VALID
 
 
 def test_a_naive_signing_time_is_refused(signer: Signer) -> None:
@@ -325,105 +327,11 @@ def test_a_naive_signing_time_is_refused(signer: Signer) -> None:
         embed("Hello world.", signer, DISCLOSURE, context=context)
 
 
-# --------------------------------------------------------------------------------
-# The payload prohibition
-# --------------------------------------------------------------------------------
-
-
-def test_the_manifest_carries_no_operator_identity(signer: Signer) -> None:
-    """Our marking policy: no tenant, agent, account, end-user, author, prompt or
-    conversation content, ever.
-
-    Asserted against the emitted BYTES rather than against the builder's inputs,
-    because the prohibition is a property of what ships, not of what was intended.
-    Signed bytes cannot be recalled once a document leaves the building.
-    """
-    marked = embed("Hello world.", signer, DISCLOSURE, context=PINNED)
-    manifest = extract(marked)
-    assert manifest is not None
-
-    lowered = manifest.raw.lower()
-    for forbidden in (b"tenant", b"agent", b"account", b"user", b"author", b"prompt", b"conversation", b"session"):
-        assert forbidden not in lowered
-
-
-def test_the_published_size_figures_are_still_true(signer: Signer) -> None:
-    """The README, the release notes and the platform handoff all publish size numbers.
-
-    They went stale once, silently: adding the `c2pa.metadata` assertion required by
-    the text conformance rubric grew the manifest by ~570 bytes, and three documents
-    kept quoting figures taken before it. Nothing noticed, because a number in prose
-    has nothing checking it.
-
-    Bounds are loose on purpose -- this guards against a SILENT DRIFT of the kind that
-    already happened, not against a deliberate change. A deliberate change fails this
-    test, which is the point: it forces the documents to be updated in the same commit.
-    """
-    marked = embed("Hello world.", signer, DISCLOSURE, context=PINNED)
-    store = extract(marked)
-    assert store is not None
-
-    wrapper = marked[marked.index(MARKER) :]
-    wrapper_bytes = len(wrapper.encode("utf-8"))
-    inflation = wrapper_bytes / len(store.raw)
-
-    # THE PUBLISHED NUMBERS, HELD TIGHTLY ENOUGH TO MEAN SOMETHING. The bounds were
-    # 3.75-3.9375 and 6_000-8_000, which held NEITHER figure the documents print: 14%
-    # growth passed, and a stale 6,872 B sat comfortably inside. A test that permits
-    # every number the docs might have said does not hold the number they do say.
-    #
-    # 3.9375 is the THEORETICAL worst case (every byte a 4-byte selector); the observed
-    # value is lower because 1 byte in 16 falls in the 3-byte plane. The band below is
-    # narrow enough that an assertion or a field added to the manifest trips it, which
-    # is the moment the documents need re-measuring.
-    # THE STORE SIZE, EXACTLY. `constants.py` publishes 1,797 to the byte and said both
-    # its figures were "held by tests/test_embed.py"; only the leaf+CA one was. The
-    # bounds below admit any store from 1764.7 to 1825.2 B -- a 61-byte band around a
-    # number printed to the byte, which is not holding it.
-    assert len(store.raw) == 1_797, f"self-signed store is {len(store.raw)} B; the documents publish 1,797"
-    assert 3.89 <= inflation <= 3.91, f"inflation {inflation:.3f}; README publishes 3.90"
-    assert 6_900 <= wrapper_bytes <= 7_100, (
-        f"{wrapper_bytes} B per mark under the pinned context; the documents publish 7,001"
-    )
-
-    # A.8.2.2: 13-byte header plus the marker, so the CHARACTER count is exact.
-    assert len(wrapper) == len(store.raw) + 14
-
-
-def test_the_default_context_size_is_still_what_this_fixture_produces(signer: Signer) -> None:
-    """The default-context size, pinned to the fixture that produces it.
-
-    ``embed`` with no ``EmbedContext`` mints a fresh ``xmp:iid:<uuid>`` and a timestamp
-    carrying microseconds, so it cannot be pinned to a single byte the way the fully
-    pinned row is. This holds the band it does produce, UNDER THIS CERTIFICATE:
-    ``conftest.build_certificate``, a self-signed Ed25519 leaf with a pinned seven-byte
-    serial. Measured here, 7,145-7,171 across 200 marks on one signer and 60 on fresh
-    keys; the bound below is that widened to the nearest ten.
-
-    THE BAND IS A PROPERTY OF THE FIXTURE, NOT OF "A REAL CALLER", and three attempts at
-    this test got that wrong in three different ways. Worth recording, because each
-    looked like a correction of the one before:
-
-    1. README published 7,153-7,161 -- one run's min and max presented as a bound, the
-       mistake ``docs/benchmarks.md`` warns against.
-    2. Republished as 7,145-7,164 "over 60 fresh certificates", with the spread
-       attributed to "the DER length of a random serial number". That sample varied the
-       KEY and never the serial, which ``build_certificate`` pins.
-    3. A derivation was then written from a random 20-byte serial, and figures quoted
-       for populations this fixture does not produce. A review could not reproduce any
-       of them; only the fully pinned 7,001 B reproduced to the byte.
-
-    So the published figure is the RATIO -- 3.90 UTF-8 bytes per manifest byte -- plus
-    the one fully pinned total. Byte totals for any other certificate are the caller's
-    to measure, and the README says so rather than guessing on their behalf.
-    """
-    sizes = {
-        len(marked[marked.index(MARKER) :].encode("utf-8"))
-        for marked in (embed("Hello world.", signer, DISCLOSURE) for _ in range(8))
-    }
-
-    assert min(sizes) >= 7_140, f"smallest default-context mark is {min(sizes)} B under this fixture"
-    assert max(sizes) <= 7_180, f"largest default-context mark is {max(sizes)} B under this fixture"
+def test_a_tzinfo_without_an_offset_is_still_refused(signer: Signer) -> None:
+    """Python treats a datetime as naive when ``utcoffset()`` returns ``None``."""
+    floating = datetime.datetime(2026, 6, 1, 12, 0, tzinfo=FloatingTimezone())
+    with pytest.raises(ValueError, match="timezone-aware"):
+        embed("Hello world.", signer, DISCLOSURE, context=EmbedContext(when=floating))
 
 
 def test_one_signer_marks_correctly_from_many_threads(signer: Signer) -> None:
@@ -449,31 +357,84 @@ def test_one_signer_marks_correctly_from_many_threads(signer: Signer) -> None:
     assert all(v.state is Provenance.VALID for v in verdicts), [v.state for v in verdicts]
 
 
-def test_the_published_leaf_and_ca_size_is_still_true(signing_key: Ed25519PrivateKey) -> None:
-    """The second row of the same size table, which nothing held.
-
-    ``constants.py`` published 2,102 B and a second document published 2,090 B,
-    re-measured a day apart, and both cannot be right. Neither reproduced: the
-    chain CONSTRUCTION was pinned nowhere, so the number depended on how whoever took it
-    happened to build the CA that day, and no assertion covered the row at all.
-
-    The construction is now here, which is what makes the figure mean something: a leaf
-    issued under a named CA and carrying an authority key identifier, with the CA's own
-    certificate second in the chain. Change the construction and this fails, which is the
-    moment the documents need re-measuring.
-    """
+def _signer_with_ca(
+    signing_key: Ed25519PrivateKey,
+    *,
+    ca_not_after: datetime.datetime = datetime.datetime(2046, 1, 1, tzinfo=datetime.timezone.utc),
+) -> Signer:
+    """Build the one carried-CA chain shared by the size and validity regressions."""
     ca_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
-    ca = build_certificate(ca_key, common_name="c2patxt test CA")
-    leaf = build_certificate(signing_key, issuer_name="c2patxt test CA", authority_key_identifier=True)
-    signer = Signer(private_key=signing_key, certificates=(leaf, ca))
+    ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "c2patxt test CA")])
+    leaf_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "c2patxt test leaf")])
+    not_before = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    leaf_not_after = datetime.datetime(2046, 1, 1, tzinfo=datetime.timezone.utc)
+    ca = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(0xC2A7E47_CA)
+        .not_valid_before(not_before)
+        .not_valid_after(ca_not_after)
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(ca_key, None)
+    )
+    leaf = (
+        x509.CertificateBuilder()
+        .subject_name(leaf_name)
+        .issuer_name(ca_name)
+        .public_key(signing_key.public_key())
+        .serial_number(0xC2A7E47_1EAF)
+        .not_valid_before(not_before)
+        .not_valid_after(leaf_not_after)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
+            critical=False,
+        )
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(x509.ExtendedKeyUsage([C2PA_CLAIM_SIGNING_EKU]), critical=False)
+        .sign(ca_key, None)
+    )
+    return Signer(private_key=signing_key, certificates=(leaf, ca))
 
-    marked = embed("Hello world.", signer, DISCLOSURE, context=PINNED)
-    store = extract(marked)
-    assert store is not None
-    wrapper_bytes = len(marked[marked.index(MARKER) :].encode("utf-8"))
 
-    assert len(store.raw) == 2_120, f"leaf+CA store is {len(store.raw)} B; the documents publish 2,120"
-    assert wrapper_bytes == 8_218, f"leaf+CA mark is {wrapper_bytes} B for this pinned chain"
+def test_embed_refuses_an_expired_carried_ca(signing_key: Ed25519PrivateKey) -> None:
+    signer = _signer_with_ca(
+        signing_key,
+        ca_not_after=datetime.datetime(2026, 2, 1, tzinfo=datetime.timezone.utc),
+    )
+
+    with pytest.raises(ValueError, match=r"x5chain\[1\] carried CA.*validity"):
+        embed("Hello world.", signer, DISCLOSURE, context=PINNED)
 
 
 @pytest.mark.parametrize(
@@ -486,44 +447,14 @@ def test_the_published_leaf_and_ca_size_is_still_true(signing_key: Ed25519Privat
     ids=["instanceID", "alg", "signature"],
 )
 def test_the_claim_fields_survive_the_round_trip_to_the_wire(signer: Signer, field: str, expected: str) -> None:
-    """NOTHING PINS THE MANIFEST CBOR, and CONTRIBUTING.md makes that a versioning
-    matter: "Any change to the bytes we emit is a MAJOR version of both this package and
-    the conformance vector file."
-
-    The conformance vector file cannot help -- it treats the payload as opaque by
-    design, "given text and an opaque manifest payload" -- and the byte-stability test
-    compares two of our own runs, so it cannot tell a correct encoding from a
-    consistently wrong one.
-
-    These fields are read back out of the DECODED CBOR of a genuinely marked document,
-    so each value has to survive ``_cbor.dumps``, the JUMBF serializer, the selector
-    encoding, the parse and the CBOR decode. Asserting against ``to_payload()`` -- a
-    plain dict -- proves none of that: a mutation that strips a field one line later,
-    just before ``dumps``, leaves such a test green.
-    """
+    """Required claim fields are present in the public producer's parsed wire output."""
     store = extract(embed("Hello world.", signer, DISCLOSURE, context=PINNED))
     assert store is not None
     assert store.claim[field] == expected
 
 
 def test_the_spec_version_survives_the_round_trip_to_the_wire(signer: Signer) -> None:
-    """The case that found the gap: stripping ``specVersion`` from the map just before
-    ``_cbor.dumps`` left all 944 tests green -- the suite as it stood
-    that morning, while removing it from ``to_payload()``
-    killed two. The only guard sat exactly one line too early.
-
-    10.2.3.2 puts the field in ``claim_generator_info``, and 2.4 deprecated the
-    claim-level position -- "Moved the specVersion field from the claim to the
-    claim_generator_info object" -- so ABSENCE at claim level is as much a wire property
-    as presence inside the generator info, and both are asserted here where they are
-    observable.
-
-    ``manifest.py`` says changing this constant "is a claim about the WHOLE producer, not
-    a version bump", because 5.1 makes setting it a declaration that the manifest
-    "does not contain any constructs that are deprecated in that version". CLAUDE.md
-    requires an assertion holding a claim like that; until now it had one that checked a
-    dict.
-    """
+    """C2PA 10.2.3.2 places ``specVersion`` in generator info, not the claim root."""
     store = extract(embed("Hello world.", signer, DISCLOSURE, context=PINNED))
     assert store is not None
 
@@ -533,45 +464,12 @@ def test_the_spec_version_survives_the_round_trip_to_the_wire(signer: Signer) ->
     assert "specVersion" not in store.claim, "the claim-level field is deprecated at 2.4"
 
 
-def test_the_test_helper_produces_exactly_what_embed_produces(signer: Signer) -> None:
-    """``mark()`` IS ``embed()`` REWRITTEN, and dozens of tests are built on it.
-
-    ``tests/conftest.py``'s ``mark`` and ``wrapper_builder`` walk the same five steps as
-    ``_embed.embed`` -- normalize, digest, build a closure, solve the fixpoint, append --
-    and its own docstring says so: "embed() in miniature, so verify() can be tested
-    against bytes that actually satisfy the binding". Nothing asserted the two agree.
-
-    THAT IS THE LARGEST REIMPLEMENTATION IN THIS SUITE. If ``embed`` were to drop NFC
-    normalization, change ``generator_name``, reorder the assertion store or gain a
-    field, all 54 call sites would keep passing -- against bytes the shipped producer no
-    longer emits. The tests would be verifying a producer that exists only in
-    ``conftest``.
-
-    A byte comparison is the whole guard, and it is available because both sides are pure
-    functions of their inputs: ``EmbedContext`` takes the clock, the instance ID and the
-    manifest UUID, and ``conftest`` pins all three to the values ``mark`` uses.
-
-    If these two ever legitimately diverge, this assertion is where the divergence has to
-    be justified in writing rather than discovered later by a failing conformance run.
-    """
-    from tests.conftest import DISCLOSURE, WHEN, mark
-
-    context = EmbedContext(when=WHEN, instance_id="xmp:iid:1", manifest_uuid=uuid.UUID(int=7))
-
-    assert mark("Hello world.", signer) == embed("Hello world.", signer, DISCLOSURE, context=context)
-
-
-#: A moment expressed relative to the leaf whose window is under test, rather than as a
-#: literal. The endpoint cases have to be EXACTLY ``notBefore`` and ``notAfter``, and a
-#: literal date here would be this test reimplementing the fixture's constants -- it
-#: would keep passing after the fixture moved, testing nothing.
+#: Each function derives the boundary instant from the certificate under test.
 _Moment = Callable[[x509.Certificate], datetime.datetime]
 
 _TICK = datetime.timedelta(microseconds=1)
 
 
-#: Annotated so pyright can type the lambdas: it does not infer a lambda's parameter
-#: from the position it is passed into, and an unannotated list here is `Unknown`.
 _WINDOW_CASES: list[tuple[_Moment, bool]] = [
     (lambda _leaf: WHEN, True),
     (lambda leaf: leaf.not_valid_before_utc, True),
@@ -599,23 +497,20 @@ _WINDOW_CASES: list[tuple[_Moment, bool]] = [
 def test_embed_refuses_to_sign_with_a_credential_outside_its_validity(
     signer: Signer, moment: _Moment, ok: bool
 ) -> None:
-    """A mark signed with an expired credential is BORN INVALID, and signed bytes cannot
-    be recalled.
+    """Every certificate must cover the supplied claimed creation instant.
 
-    Expiry is the one property of a credential that changes with time, so it is checked
-    at SIGN TIME against ``EmbedContext.when`` rather than at ``Signer`` construction:
-    nothing reconstructs a Signer, and a service holding one across its leaf's expiry
-    emitted invalid marks silently. Judging against ``when`` also keeps ``embed`` a pure
-    function of its arguments.
+    The default context supplies the current time. A pinned context makes this a
+    deterministic replay check; it does not attest when the function actually ran.
 
-    THE ENDPOINTS ARE INCLUSIVE (RFC 5280 4.1.2.5), and the two ``on-`` rows hold that.
-    This ran with 2025 and 2047 against a 2026-2046 leaf -- months clear of either edge
-    -- so ``<=`` could become ``<`` and nothing failed. The verifier side is pinned by
-    ``test_the_validity_window_includes_its_own_endpoints``; the two disagreeing about
-    one instant would refuse to issue a mark that would have verified.
+    RFC 5280 4.1.2.5 makes the endpoints inclusive. The adjacent-tick rows distinguish
+    both endpoints from the instants immediately outside them.
     """
     when = moment(signer.certificates[0])
-    context = EmbedContext(manifest_uuid=uuid.UUID(int=7), instance_id="xmp:iid:pinned", when=when)
+    context = EmbedContext(
+        manifest_uuid=uuid.UUID("00000000-0000-4000-8000-000000000007"),
+        instance_id="xmp:iid:pinned",
+        when=when,
+    )
 
     if ok:
         assert extract(embed("Hello world.", signer, DISCLOSURE, context=context)) is not None

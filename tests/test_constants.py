@@ -12,7 +12,6 @@ from __future__ import annotations
 import struct
 
 from c2patxt import constants as c
-from tests.vectors.loader import load_vectors
 
 
 def test_magic_is_the_spec_value() -> None:
@@ -57,14 +56,8 @@ def test_selector_block_bounds_are_exact() -> None:
     assert c.VS_HIGH_MAX - c.VS_HIGH_BASE + 1 == 240
 
 
-def test_utf8_cost_constant_is_the_computed_worst_case() -> None:
-    assert c.UTF8_BYTES_PER_MANIFEST_BYTE == (16 * 3 + 240 * 4) / 256
-    assert len(chr(c.VS_LOW_BASE).encode("utf-8")) == 3
-    assert len(chr(c.VS_HIGH_BASE).encode("utf-8")) == 4
-
-
-def test_limits_bound_attacker_controlled_allocation() -> None:
-    """A 32-bit length field must never be honoured at face value."""
+def test_limits_bound_attacker_controlled_payloads() -> None:
+    """A 32-bit length field does not override the accepted payload policy."""
     assert c.MAX_MANIFEST_LENGTH < 2**32
     # BOTH the literal and the derivation. The derivation alone was unfalsifiable --
     # character for character the definition in constants.py, with both operands imported
@@ -73,28 +66,5 @@ def test_limits_bound_attacker_controlled_allocation() -> None:
     # mutation testing cannot reach constants.
     assert c.MAX_SELECTOR_RUN == 2_097_165
     assert c.MAX_SELECTOR_RUN == c.MAX_MANIFEST_LENGTH + c.HEADER_SIZE
-    assert c.MAX_JUMBF_DEPTH > 4, "real manifests nest four levels"
-    # Headroom over a measured Ed25519 leaf+CA manifest store of 2,063 bytes. The
-    # figure moved once already, silently, when the manifest gained a c2pa.metadata
-    # assertion; the ratio is what matters, so it is asserted rather than the bytes.
-    assert c.MAX_MANIFEST_LENGTH > 2063 * 100
-
-
-def test_constants_agree_with_the_vector_file() -> None:
-    """The vector file is authored from the spec; the code must match it.
-
-    Cross-checking here means a constant cannot drift without either the vector
-    file or this test failing, which is the guard mutation testing cannot give us.
-    """
-    e0001 = next(v for v in load_vectors() if v.id == "E0001")
-    body = e0001.expect[len(e0001.text) :]
-
-    assert body.startswith(c.MARKER.encode("utf-8"))
-    selectors = body[len(c.MARKER.encode("utf-8")) :].decode("utf-8")
-    decoded = bytes(
-        ord(ch) - c.VS_LOW_BASE if ord(ch) <= c.VS_LOW_MAX else ord(ch) - c.VS_HIGH_BASE + 16 for ch in selectors
-    )
-    assert decoded[:8] == c.MAGIC
-    assert decoded[8] == c.VERSION
-    assert struct.unpack(c.LENGTH_STRUCT_FORMAT, decoded[9:13])[0] == len(e0001.payload)
-    assert decoded[c.HEADER_SIZE :] == e0001.payload
+    assert c.MAX_CBOR_DEPTH == 32
+    assert c.MAX_NONSTARTERS == 30

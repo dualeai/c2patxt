@@ -14,17 +14,17 @@ Unmarked text rendered as "FAKE" is the most damaging collapse available, and a
 separate flag is the one an integrator forgets. RFC 8601 made the same call for mail
 authentication: ``none`` is a peer of ``pass`` and ``fail``, not a modifier on them.
 
-There is no fifth state. RFC 8601 needs ``temperror`` because DKIM does DNS lookups;
-verification here has no network and no ambient configuration, so there are no
-transient failures. It is a pure function of ``(text, context)`` when the caller
-supplies ``VerifyContext.now``; with the default it reads the clock, so a mark can pass
-before its certificate expires and fail after. That is a property worth stating, not an omission.
+There is no fifth state. Package-owned verification performs no network or ambient
+configuration lookup. It is a pure function of ``(text, context)`` when the caller
+supplies ``VerifyContext.now`` and a deterministic evaluator; the default reads the
+clock, and caller-owned evaluators can use their own state.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import enum
+from collections.abc import Iterable
 
 from c2patxt._locate import Span
 from c2patxt.manifest import ManifestStore
@@ -60,43 +60,34 @@ class Provenance(str, enum.Enum):
     kind of thing to expect, not so they can be matched on.
 
     THE CARRIER
-        The wrapper itself is damaged, or the text carries more than one.
-        ``manifest.text.multipleWrappers`` is the reason verification returns a result
-        rather than raising: two wrappers is a specification failure code, not an
-        exception, and the caller still needs the manifest back.
+        The wrapper itself is damaged, or more than one located wrapper matches the
+        signed exclusions.
 
     THE MANIFEST STRUCTURE
         The claim will not parse, is duplicated, or links an assertion that is absent,
         outside this manifest, or whose hashed URI does not resolve or does not match.
 
-    WHAT THE ASSERTIONS ASSERT -- and these two are why this package exists.
-        ``assertion.action.malformed`` covers a ``c2pa.created`` action with no
-        ``digitalSourceType``, which is the field that actually says a model generated
-        the text, and an inception action that is not first. ``general.error`` covers an
-        AI disclosure carrying no ``modelType``. A mark can be perfectly well-formed,
-        correctly bound and validly signed, and still land here because it discloses
-        nothing -- which is the case an EU AI Act Article 50(2) reader most needs to see
-        and is least likely to predict.
+    WHAT THE ASSERTIONS ASSERT
+        ``assertion.action.malformed`` covers an inception action that is not first.
+        Producer-only schema rules are not promoted into generic validator failures.
 
     THE BINDING
         The hard binding does not match the text, names a range that is not the located
         wrapper, or there is more than one binding to choose between.
 
     THE SIGNATURE AND THE CREDENTIAL
-        The claim signature does not verify, the leaf is outside its validity window,
-        or the certificate fails the 14.5.1.1 profile.
+        The claim signature does not verify, a carried certificate is outside its
+        validity window, or the certificate chain fails the 14.5.1.1 profile.
 
-        ``signingCredential.invalid`` ALSO carries a restriction that is ours, not the
-        clause's: this package accepts Ed25519 alone, where 13.2.1's list is wider. A
-        conforming ES256 mark is refused here and reported under the same code. That is
-        deliberate and it is a deviation -- see docs/deviations.md -- but it is not
-        14.5.1.1 speaking, so do not describe the profile as the only cause.
+        Generation uses Ed25519. Validation accepts C2PA 13.2.1's ES256/384/512,
+        PS256/384/512 and Ed25519 set. An algorithm outside that set reports
+        ``algorithm.unsupported``; an allowed algorithm paired with an incompatible key
+        reports ``claimSignature.mismatch``. ``signingCredential.invalid`` stays limited
+        to credential shape and profile failures.
 
     SO INVALID DOES NOT MEAN "TAMPERED". "The text may have been altered after signing"
     is true of the binding case and false of an expired certificate, where nothing was
-    altered and the mark is simply no longer acceptable. It is equally false of a
-    disclosure that names no model, where the text is exactly what was signed and the
-    claim is the thing that is inadequate.
+    altered and the mark is simply no longer acceptable.
     """
 
     VALID = "valid"
@@ -105,15 +96,13 @@ class Provenance(str, enum.Enum):
     The signer is NOT corroborated against any trust anchor supplied to this call.
     **This is the expected outcome for a self-signed credential and is not an
     error.** This package bundles no trust anchors, so with none supplied there is
-    nothing to chain to and this is as far as verification can go. Maps to c2pa-rs
-    ``ValidationState::Valid``.
+    nothing to chain to and this is as far as verification can go.
     """
 
     TRUSTED = "trusted"
     """VALID, and the certificate chain reaches a supplied trust anchor.
 
-    Maps to c2pa-rs ``ValidationState::Trusted``. Requires a ``TrustEvaluator``;
-    see :mod:`c2patxt.trust`.
+    Requires a ``TrustEvaluator``; see :mod:`c2patxt.trust`.
     """
 
     def __str__(self) -> str:
@@ -128,8 +117,8 @@ class Provenance(str, enum.Enum):
     __format__ = str.__format__
 
 
-#: Assurance ordering for at_least(). UNMARKED and INVALID share a rank: neither
-#: clears any threshold, and neither is "better" than the other.
+#: Assurance ordering for at_least(). UNMARKED and INVALID share the floor when
+#: compared with the two assurance thresholds; neither ranks against the other.
 _RANK: dict[Provenance, int] = {
     Provenance.UNMARKED: 0,
     Provenance.INVALID: 0,
@@ -161,18 +150,11 @@ class Verdict:
     state: Provenance
     success: tuple[Status, ...] = ()
     informational: tuple[Status, ...] = ()
-    """**Always empty today.** Present because 15.2.2 defines the bucket, not because
-    anything fills it: every code this package emits is a success or a failure.
+    """Statuses that report a condition without invalidating the manifest.
 
-    The specification does define informational codes -- ``assertion.dataHash.
-    additionalExclusionsPresent`` among them -- and we emit none of them, because the
-    cases they describe are ones we reject instead (see docs/deviations.md). So the
-    bucket is real and our set is empty.
-
-    Said here so a caller building a three-panel display knows the third panel is dead
-    BY DESIGN and can decide not to render it, rather than shipping an empty box and
-    wondering. ``test_the_informational_bucket_is_empty_until_a_code_lands_in_it``
-    fails the day that stops being true, which forces this paragraph to change with it.
+    A data-hash assertion with extra exclusion ranges adds
+    ``assertion.dataHash.additionalExclusionsPresent`` here while its digest can still
+    match and the verdict can remain Valid.
     """
 
     failure: tuple[Status, ...] = ()
@@ -181,9 +163,9 @@ class Verdict:
     validation then failed, so a caller can inspect what was rejected without bypassing
     verification to do it.
 
-    ``None`` WHEN THE PARSE ITSELF DID NOT GET THERE: unmarked text, a corrupt wrapper,
-    more than one wrapper, and every structural failure inside the manifest. The
-    carrier-level codes are exactly the ones that report those cases.
+    ``None`` WHEN PARSING AND SELECTION DID NOT YIELD ONE MANIFEST: unmarked text, a
+    corrupt wrapper, or plural wrappers whose signed exclusions do not identify one
+    candidate. It remains present when later validation fails.
 
     ``verdict.manifest.assertions`` raises ``AttributeError`` on precisely the hostile
     inputs where a caller most needs their code not to crash, so check for ``None``."""
@@ -200,18 +182,8 @@ class Verdict:
     def __bool__(self) -> bool:
         """Always raises. A verdict is not a boolean.
 
-        Without this, ``if verify(text):`` is always true -- a frozen dataclass is
-        truthy -- so unmarked text silently reads as marked. Returning something
-        instead would be worse: ``requests.Response.__bool__`` returns ``self.ok``,
-        its own docstring needs a bolded disclaimer, its author called it a mistake
-        in psf/requests#2002, a removal was merged to a 3.0 branch in 2015 and never
-        shipped, and it was rejected again in 2022 as too breaking. Ten years of an
-        unfixable footgun because a truthiness answer was guessed.
-
-        numpy sets the precedent for refusing: ``bool()`` on an ambiguous array
-        raises rather than picking. Our case is strictly more ambiguous -- there is
-        no defensible default among four states -- so this raises ``TypeError``,
-        which is what Python raises for unsupported protocol use.
+        ``UNMARKED``, ``INVALID``, ``VALID``, and ``TRUSTED`` have no safe truth-value
+        mapping. Callers must branch on ``state`` or use ``at_least`` explicitly.
         """
         msg = (
             f"Verdict is not a boolean (state={self.state}). Unmarked text is not "
@@ -223,10 +195,13 @@ class Verdict:
     def at_least(self, minimum: Provenance) -> bool:
         """True if this verdict reaches ``minimum`` assurance.
 
-        Requires the caller to NAME a threshold, which is the point: there is no
-        universally right answer, and making the choice explicit is the only honest
-        way to collapse four states into one bit.
+        ``VALID`` and ``TRUSTED`` are assurance thresholds. ``UNMARKED`` describes
+        absence and ``INVALID`` describes a failed mark, so neither is accepted as a
+        threshold or ranked against the other.
         """
+        if minimum not in (Provenance.VALID, Provenance.TRUSTED):
+            msg = "minimum must be Provenance.VALID or Provenance.TRUSTED"
+            raise ValueError(msg)
         return _RANK[self.state] >= _RANK[minimum]
 
     def raise_for_state(self, minimum: Provenance = Provenance.VALID) -> None:
@@ -241,19 +216,40 @@ class Verdict:
             msg = f"provenance is {self.state}, required at least {minimum} ({codes})"
             raise ValueError(msg)
 
-    def _add(self, code: StatusCode, explanation: str | None = None) -> Verdict:
+    def _add(self, code: StatusCode, explanation: str | None = None, *, url: str | None = None) -> Verdict:
         """Return a copy with ``code`` filed into its specification bucket.
 
         Private: this is the verdict BUILDER, and a public mutator on a result type
         invites a caller to assemble a verdict that verification never produced.
         """
-        status = Status(code, explanation=explanation)
-        bucket = status.kind
+        return self._add_many((Status(code, url=url, explanation=explanation),))
+
+    def _add_many(self, statuses: Iterable[Status]) -> Verdict:
+        """File several statuses with one immutable result copy.
+
+        Verification can report one success for every authenticated claim link. Building
+        a new tuple for each link copies the whole prefix each time, so the verifier
+        batches that private construction and freezes the public tuples once.
+        """
+        success = list(self.success)
+        informational = list(self.informational)
+        failure = list(self.failure)
+        changed = False
+        for status in statuses:
+            changed = True
+            if status.kind is StatusKind.SUCCESS:
+                success.append(status)
+            elif status.kind is StatusKind.INFORMATIONAL:
+                informational.append(status)
+            else:
+                failure.append(status)
+        if not changed:
+            return self
         return dataclasses.replace(
             self,
-            success=(*self.success, status) if bucket is StatusKind.SUCCESS else self.success,
-            informational=(*self.informational, status) if bucket is StatusKind.INFORMATIONAL else self.informational,
-            failure=(*self.failure, status) if bucket is StatusKind.FAILURE else self.failure,
+            success=tuple(success),
+            informational=tuple(informational),
+            failure=tuple(failure),
         )
 
     def codes(self) -> tuple[StatusCode, ...]:

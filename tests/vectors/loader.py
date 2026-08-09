@@ -1,7 +1,7 @@
 """
 Reader for A8ConformanceTest-<version>.txt.
 
-The flat file is the normative artefact, not this module. A consuming
+The flat file is the canonical local fixture, not this module. A consuming
 implementation in any language should be able to parse it with a split on ';'
 and a strip of anything after '#'; this reader exists so our own suite does not
 reimplement that per test module.
@@ -21,7 +21,7 @@ __all__ = [
     "vector_id",
 ]
 
-VECTOR_FILE = pathlib.Path(__file__).parent / "A8ConformanceTest-1.2.1.txt"
+VECTOR_FILE = pathlib.Path(__file__).parent / "A8ConformanceTest-2.0.0.txt"
 
 _COLUMNS = 7
 

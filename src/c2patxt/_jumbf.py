@@ -1,26 +1,8 @@
-"""
-JUMBF, ISO/IEC 19566-5 as constrained by C2PA 2.4 clause 11.1.
+"""JUMBF, ISO/IEC 19566-5:2023 as constrained by C2PA 2.4 clause 11.1.
 
-SOURCING
---------
-The ISO standard is paywalled, so every constant below is corroborated across four
-independent sources rather than lifted from one implementation:
-
-1. ``contentauth/c2pa-rs`` (Rust) -- the implementation most projects copy.
-2. WG1 JUMBF Reference Implementation 1, ``org.mipams.jumbf`` (Java, BSD-3, UPC).
-3. WG1 JUMBF Reference Implementation 2, ``dbench`` (C++, BSD-3, YNM Systems).
-4. Real bytes: C2PA-signed assets and JPEGs parsed directly.
-
-Where they disagree, the WG1 conformance dataset decides. Two disagreements matter
-and are handled explicitly below: c2pa-rs requires both the Requestable and Label
-toggles before reading a label, where ISO needs only Label; and WG1 RI-2 reads 256
-bytes for a hash its own writer emits as 32.
-
-Clause 4.3 of the standard (LBox/XLBox/TBox semantics) is quoted verbatim in the free
-iTeh/SIST sample, so that part is normatively sourced.
-
-Every integer here is big-endian -- ``struct.pack(">I")`` and ``(">Q")`` throughout --
-which is C2PA 18.6, the clause A.8.2.2 omits for the wrapper's own header.
+The box layout follows ISO/IEC 19566-5; its public SIST preview includes the
+LBox/XLBox/TBox rules used here. C2PA 11.1 constrains the description boxes and content
+types. ISO BMFF/JUMBF box fields use big-endian byte order.
 """
 
 from __future__ import annotations
@@ -28,31 +10,12 @@ from __future__ import annotations
 import dataclasses
 import struct
 
-from c2patxt.constants import MAX_JUMBF_DEPTH
-
-__all__ = [
-    "DescriptionBox",
-    "JumbfBox",
-    "JumbfError",
-    "Toggle",
-    "content_type_uuid",
-    "parse_superbox",
-    "serialize_superbox",
-]
-
 # Box type codes (4CC), ISO 19566-5 Table A.1.
 TBOX_SUPERBOX = b"jumb"
 TBOX_DESCRIPTION = b"jumd"
-TBOX_PADDING = b"free"
-TBOX_PRIVATE = b"priv"
 
 # Content-type UUID suffix. Every type-derived UUID is the 4CC followed by this.
 _UUID_SUFFIX = bytes.fromhex("0011001080000 0AA00389B71".replace(" ", ""))
-
-# The two UUIDs that do NOT follow the pattern. Both confirmed in WG1 RI-1 source
-# and in real file bytes.
-UUID_EMBEDDED_FILE = bytes.fromhex("40CB0C32BB8A489DA70B2AD6F47F4369")
-UUID_CONTIGUOUS_CODESTREAM = bytes.fromhex("6579D6FBDBA2446BB2AC1B82FEEB89D1")
 
 _LBOX_SIZE = 4
 _TBOX_SIZE = 4
@@ -66,8 +29,7 @@ _LBOX_XLBOX_FOLLOWS = 1
 _LBOX_TO_END = 0
 _LBOX_RESERVED_MAX = 7
 
-# Characters forbidden in a label by C2PA 11.1.4.1.1. Of the implementations surveyed
-# in docs/known-divergences.md, none enforces these; we do.
+# Characters forbidden in a label by C2PA 11.1.4.1.1.
 _FORBIDDEN_LABEL_CHARS = frozenset("/;?#\ufeff\uffff")
 
 # C0 controls, DEL and the C1 range, plus the surrogate range. Named because the
@@ -82,12 +44,8 @@ _SURROGATE_MAX = 0xDFFF
 class Toggle:
     """jumd toggle bits, and the field each one gates.
 
-    Bits 0x04 and 0x08 are the weakest-evidenced part of the format: they rest on 4374/4374
-    against the WG1 conformance dataset's per-file ground truth, and independently
-    in both WG1 reference implementations.
-
-    Bit 0x10 is new in the 2023 edition; the ed.2 foreword lists the CBOR content
-    type, the Padding Box and the jumd Private entry as its additions.
+    Bit 0x10 is part of the 2023 edition; its foreword lists the CBOR content type,
+    Padding Box and private description entry among that edition's additions.
     """
 
     REQUESTABLE = 0x01
@@ -96,7 +54,7 @@ class Toggle:
     SIGNATURE = 0x08
     PRIVATE = 0x10
 
-    #: Bits 5-7 are never set in 4,374 conformance files or any C2PA asset.
+    #: Bits 5-7 are reserved by ISO/IEC 19566-5.
     RESERVED = 0xE0
 
 
@@ -108,17 +66,13 @@ class JumbfError(ValueError):
         self.pos = pos
         super().__init__(f"{msg} (at byte {pos})")
 
-    def __reduce__(self) -> tuple[type[JumbfError], tuple[str, int]]:
-        return (self.__class__, (self.msg, self.pos))
-
 
 def content_type_uuid(four_cc: bytes) -> bytes:
     """Build a content-type UUID from its 4CC.
 
     The pattern is ``<4 ASCII bytes> || 00 11 00 10 80 00 00 AA 00 38 9B 71``, e.g.
-    ``cbor`` gives ``63626F72-0011-0010-8000-00AA00389B71``. Two types break it and
-    are exposed as constants instead: the embedded-file superbox and the contiguous
-    codestream box.
+    ``cbor`` gives ``63626F72-0011-0010-8000-00AA00389B71``. This helper applies only
+    to type-derived UUIDs; fixed UUIDs such as Embedded File are declared separately.
     """
     if len(four_cc) != _TBOX_SIZE:
         msg = f"a 4CC is four bytes, got {len(four_cc)}"
@@ -128,15 +82,13 @@ def content_type_uuid(four_cc: bytes) -> bytes:
 
 UUID_CBOR = content_type_uuid(b"cbor")
 UUID_JSON = content_type_uuid(b"json")
-UUID_XML = content_type_uuid(b"xml ")  # note the trailing space
-UUID_UUID = content_type_uuid(b"uuid")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class DescriptionBox:
     """A ``jumd`` description box (ISO 19566-5 A.3).
 
-    Field order and sizes, agreed by all four sources::
+    Field order and sizes::
 
         uuid(16) | toggles(1) | label(var, NUL-terminated) | id(4) | sha256(32) | private
     """
@@ -149,22 +101,12 @@ class DescriptionBox:
     private: bytes | None = None
 
     def __post_init__(self) -> None:
-        """Validate the box. Raises JumbfError, NEVER a bare ValueError.
-
-        The distinction is load-bearing: ``_extract.parse_manifest_store`` catches
-        ``(JumbfError, CborDecodeError)``, and both subclass ValueError -- but a bare
-        ValueError is an instance of neither, so it propagated straight out of
-        ``verify()``, which documents that it never raises for corrupt or invalid
-        marks. A forbidden character in an attacker-supplied label was therefore a
-        denial of service on any endpoint catching only ``C2paTextError``.
-        """
+        """Validate the box, raising :class:`JumbfError` for invalid fields."""
         if len(self.uuid) != _UUID_SIZE:
             msg = f"a JUMBF UUID is 16 bytes, got {len(self.uuid)}"
             raise JumbfError(msg, 0)
         if self.requestable and not self.label:
-            # WG1 RI-1 enforces this: "A requestable Description Box must have a
-            # non-empty Label". Requestable boxes are referenced by JUMBF URI, and a
-            # URI needs a label to point at.
+            # A requestable box must have a label so a JUMBF URI can name it.
             msg = "a requestable description box must carry a non-empty label"
             raise JumbfError(msg, 0)
         if self.label is not None:
@@ -190,7 +132,7 @@ class DescriptionBox:
 
 
 def _validate_label(label: str) -> None:
-    """C2PA 11.1.4.1.1 label rules, which no surveyed implementation enforces."""
+    """Apply the C2PA 11.1.4.1.1 label rules."""
     if "\x00" in label:
         msg = "a label is NUL-terminated and cannot contain NUL"
         raise JumbfError(msg, 0)
@@ -239,9 +181,12 @@ def _serialize_description(description: DescriptionBox) -> bytes:
 
 def serialize_superbox(box: JumbfBox) -> bytes:
     """Serialize a superbox and its contents."""
-    body = _serialize_description(box.description)
-    for tbox, payload in box.content:
-        body += _box(tbox, payload)
+    body = b"".join(
+        (
+            _serialize_description(box.description),
+            *(_box(tbox, payload) for tbox, payload in box.content),
+        )
+    )
     return _box(TBOX_SUPERBOX, body)
 
 
@@ -278,8 +223,6 @@ def _read_header(data: bytes, offset: int) -> tuple[int, bytes, int]:
     if lbox == _LBOX_TO_END:
         return len(data) - offset, tbox, payload_offset
     if lbox <= _LBOX_RESERVED_MAX:
-        # Reserved by the standard. MediaInfo guesses read-to-EOF here and dbench
-        # takes the value literally; both are guesses at undefined behaviour.
         msg = f"LBox value {lbox} is reserved by ISO 19566-5 clause 4.3"
         raise JumbfError(msg, offset)
     # 0 and 1 are handled above and 2-7 are reserved, so a plain LBox reaching this
@@ -303,9 +246,8 @@ def _parse_description(payload: bytes, base: int) -> DescriptionBox:
 
     label: str | None = None
     if toggles & Toggle.LABEL:
-        # Bit 0x02 ALONE is sufficient. c2pa-rs requires (toggles & 0x03) == 0x03
-        # here and so fails on a legal toggles=0x02 box; five independent
-        # implementations test 0x02 only, and real files carry such boxes.
+        # ISO/IEC 19566-5 assigns the label field to bit 0x02. The requestable bit is
+        # independent, so a label does not require it.
         end = payload.find(b"\x00", pos)
         if end < 0:
             msg = "label is not NUL-terminated"
@@ -326,20 +268,15 @@ def _parse_description(payload: bytes, base: int) -> DescriptionBox:
 
     signature: bytes | None = None
     if toggles & Toggle.SIGNATURE:
-        # 32 bytes, not 256. WG1 RI-2's deserialize() reads 256 while its own
-        # serialize() writes 32; the conformance dataset proves 32 correct.
+        # ISO/IEC 19566-5 defines this field as a 256-bit hash: 32 bytes.
         if pos + _HASH_SIZE > len(payload):
             msg = "truncated signature field"
             raise JumbfError(msg, base + pos)
         signature = payload[pos : pos + _HASH_SIZE]
         pos += _HASH_SIZE
 
-    # The private field is one or more complete boxes and is kept OPAQUE. Real Adobe
-    # assets carry toggles=0x13 with a 24-byte 'c2sh' assertion salt box here (C2PA
-    # 6.6), so a parser that stops after the signature mis-reads genuine output. This
-    # is the READ half of 6.6; _embed.py holds the other half, which is that we never
-    # emit one. Modelled generically, as WG1 RI-1, dbench, jumbf-rs and MediaInfo do,
-    # rather than hard-coding 'c2sh'.
+    # The private field is one or more complete boxes and is kept opaque. C2PA 6.6 can
+    # place a ``c2sh`` assertion salt box here; the producer emits no private entry.
     private = payload[pos:] if toggles & Toggle.PRIVATE else None
     if private is None and pos != len(payload):
         msg = f"{len(payload) - pos} unexpected trailing byte(s) in description box"
@@ -355,17 +292,12 @@ def _parse_description(payload: bytes, base: int) -> DescriptionBox:
     )
 
 
-def parse_superbox(data: bytes, offset: int = 0, depth: int = 0) -> tuple[JumbfBox, int]:
+def parse_superbox(data: bytes, offset: int = 0) -> tuple[JumbfBox, int]:
     """Parse one superbox. Returns the box and the offset just past it.
 
     Raises:
-        JumbfError: on any malformed structure, including nesting beyond
-            ``MAX_JUMBF_DEPTH``.
+        JumbfError: on any malformed structure.
     """
-    if depth > MAX_JUMBF_DEPTH:
-        msg = f"nesting deeper than {MAX_JUMBF_DEPTH}"
-        raise JumbfError(msg, offset)
-
     length, tbox, payload_offset = _read_header(data, offset)
     if tbox != TBOX_SUPERBOX:
         msg = f"expected a {TBOX_SUPERBOX.decode()} superbox, got {tbox!r}"

@@ -1,88 +1,53 @@
-"""
-``embed``: append a signed Content Credential to plain text.
+"""Append a signed C2PA Annex A.8 Content Credential to plain text.
 
-WHY THE WRAPPER IS ALWAYS A SUFFIX, AND THE TEXT IS ALWAYS NFC
---------------------------------------------------------------
-A.8 leaves both open -- A.8.4.1's placement "at the end" is a SHOULD, and A.8.7.2
-requires NFC for HASHING without saying anything about embedding. (A.8.6.1 states the
-validation requirement those two serve; the procedure is 15.12.1.3.1's.) Left open, they produce the two
-divergence classes this format has:
+The producer first normalizes the visible text to NFC, then appends the wrapper as a
+suffix. This makes the hard-binding offsets and the bytes hashed by the validator refer
+to the same normalized text.
 
-* 15.12.1.3.1 removes the wrapper and then normalizes; A.8.7.3 normalizes first. The
-  orders differ whenever the wrapper is not a suffix, because U+FEFF is a starter and
-  blocks composition across it. Forcing a suffix makes both orders identical BY
-  CONSTRUCTION, so a verifier that reads the clause the other way still agrees.
-* Marking text that is not already NFC would mean the producer's offsets and a
-  verifier's offsets are computed over different byte strings.
+With a fixed signer, disclosure, normalized input and fully resolved
+:class:`EmbedContext`, Ed25519 produces stable signed bytes. Context fields left unset
+generate a new manifest UUID, instance ID or creation time.
 
-So we normalize before marking and we always append. The cost is stated plainly in
-``embed``'s docstring: the returned visible text is the NFC form of the input, which
-for already-NFC text -- effectively all of it -- is the input unchanged.
-
-DETERMINISM IS A DESIGN REQUIREMENT, NOT A TEST CONVENIENCE
------------------------------------------------------------
-Every varying input is injected through :class:`EmbedContext`, so marking the same
-text twice with the same context yields the same bytes. Without that, "re-marking is
-byte-stable" is not a testable claim, and a producer cannot be diffed against a
-reference implementation at all.
-
-Ed25519 is what makes this free: RFC 8032 5.1.6 derives the nonce deterministically
-as ``r = SHA-512(dom2(F,C) || prefix || PH(M))``, with no randomness anywhere, and
-COSE ``EdDSA`` (alg -8) is pure EdDSA per RFC 9053 2.2. Cite the RFC, not the
-library: pyca/cryptography's Ed25519 documentation never states determinism. If
-ES256 is ever added, byte-stability disappears -- ECDSA is randomized -- and the
-determinism tests must be skipped for it rather than quietly relaxed.
-
-Exercising this under ``pytest-repeat`` was proposed, on the grounds that "a
-determinism test that runs once tests nothing". We do not take that
-dependency. Repetition samples for instability; :class:`EmbedContext` REMOVES the
-sources of it, which is the stronger move, and the residual risk -- a seed we forgot
-to pin -- is covered instead by a Hypothesis property that re-marks arbitrary text
-(``test_the_full_remark_cycle_is_byte_stable``) and by having pinned every RNG in the
-test suite after one such seed produced an intermittent failure.
-
-The remaining sources of variation are the ones the context names: the manifest UUID,
-the instance ID, and the signing time. We deliberately do NOT emit ``c2sh`` salt
-boxes (6.6): they exist for secure redaction, which needs per-assertion randomness,
-and we have nothing to redact -- a mark carries no payload to hide.
-
-WHAT THE MANIFEST MAY NOT CONTAIN
----------------------------------
-No tenant, agent, account, end-user, author, prompt or conversation content, ever.
-The mark says "a model generated this" and nothing else. There is a test that asserts
-the emitted bytes contain none of it, because this is a property of the output, not
-an intention of the author.
+``embed`` accepts a :class:`Disclosure` rather than arbitrary assertions, so every
+field this producer emits remains part of its explicit schema.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import datetime
-import unicodedata
 import uuid
+from collections.abc import Callable
 
-from c2patxt import _cose
+from c2patxt._cose import (
+    _prepare_signed_claim,  # pyright: ignore[reportPrivateUsage] -- producer-internal handoff
+    _serialize_signed_claim,  # pyright: ignore[reportPrivateUsage] -- same handoff
+)
 from c2patxt._fixpoint import solve
 from c2patxt._locate import find_wrappers
+from c2patxt._normalization import normalize_nfc
 from c2patxt._selectors import build_wrapper
 from c2patxt.exceptions import C2paTextError
-from c2patxt.manifest import DEFAULT_HASH_ALGORITHM, HASH_ALGORITHMS, build_manifest_store, claim_payload_bytes
+from c2patxt.manifest import (
+    DEFAULT_HASH_ALGORITHM,
+    HASH_ALGORITHMS,
+    _prepare_manifest,  # pyright: ignore[reportPrivateUsage] -- both modules are producer internals
+    _serialize_prepared_manifest,  # pyright: ignore[reportPrivateUsage] -- same producer boundary
+)
 from c2patxt.signing import Disclosure, Signer
 
-__all__ = [
-    "AlreadyMarkedError",
-    "EmbedContext",
-    "embed",
-]
+# ``max-tstr-length`` in the C2PA 2.4 CDDL schemas. CDDL ``.size`` on a text
+# string counts its UTF-8 bytes (RFC 8610 3.8.1), not Python code points.
+_MAX_TSTR_LENGTH = 1_000_000
+_UUID_VERSION = 4
 
 
 class AlreadyMarkedError(C2paTextError, ValueError):
     """``embed`` was called on text that already carries a wrapper.
 
-    A hard error rather than a silent replace or a second append. Appending would
-    produce two wrappers, which 15.5.2.1 makes invalid -- so the failure would only
-    surface at the consumer, in someone else's system. Replacing would silently
-    discard another producer's signed claim.
+    This is a producer policy: appending could introduce an ambiguous second matching
+    wrapper, while replacing would discard another producer's signed claim. Validation
+    rejects multiple wrappers only when more than one matches the declared exclusion.
 
     Attributes:
         span: byte range of the wrapper already present. Use :func:`strip` to remove
@@ -97,6 +62,9 @@ class AlreadyMarkedError(C2paTextError, ValueError):
             "call strip() first if you mean to re-mark it, or leave it alone"
         )
 
+    def __reduce__(self) -> tuple[type[AlreadyMarkedError], tuple[int, int]]:
+        return (self.__class__, self.span)
+
 
 def _default_when() -> datetime.datetime:
     return datetime.datetime.now(tz=datetime.timezone.utc)
@@ -104,12 +72,12 @@ def _default_when() -> datetime.datetime:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class EmbedContext:
-    """Every non-deterministic input to :func:`embed`, made explicit.
+    """Manifest identity, time and hard-binding choices for :func:`embed`.
 
     The defaults do the normal thing -- a fresh UUID, a fresh instance ID, the
-    current time -- so ordinary callers never touch this. Pin all three and marking
-    becomes a pure function, which is what makes byte-stability testable and what a
-    reproducible build needs.
+    current time -- so ordinary callers never touch this. Pin all three to make context
+    resolution stable; reproducible output also requires the same text, signer and
+    disclosure.
     """
 
     manifest_uuid: uuid.UUID | None = None
@@ -120,12 +88,12 @@ class EmbedContext:
     """The claim's required ``instanceID``. Defaults to a fresh ``xmp:iid:`` URN."""
 
     when: datetime.datetime | None = None
-    """Signing time, recorded in the ``c2pa.created`` action. Defaults to now, UTC.
-    A naive datetime is rejected rather than assumed to be UTC."""
+    """Claimed creation time, recorded in ``c2pa.created``. Defaults to now, UTC.
+    Pin it only when replaying a known event or building a deterministic fixture. A
+    naive datetime is rejected rather than assumed to be UTC."""
 
     generator_name: str = "c2patxt"
-    """``claim_generator_info.name``. Names the SOFTWARE, never the operator: a
-    tenant or account name here would be exactly the payload that must not ship."""
+    """Value for ``claim_generator_info.name``. Intended to name the software."""
 
     generator_version: str | None = None
     """Optional generator version. Left unset by default -- it is not needed for
@@ -136,12 +104,27 @@ class EmbedContext:
     """Hash algorithm for the hard binding. 13.1 permits sha256, sha384 and sha512
     and states implementations "shall not support additional algorithms"."""
 
+    def __post_init__(self) -> None:
+        if self.manifest_uuid is not None and (
+            self.manifest_uuid.variant != uuid.RFC_4122 or self.manifest_uuid.version != _UUID_VERSION
+        ):
+            msg = "EmbedContext.manifest_uuid must be an RFC 4122 variant UUID version 4 (C2PA 8.1)"
+            raise ValueError(msg)
+        try:
+            generator_name_size = len(self.generator_name.encode("utf-8"))
+        except (AttributeError, UnicodeEncodeError) as exc:
+            msg = "EmbedContext.generator_name must be a UTF-8 text string"
+            raise ValueError(msg) from exc
+        if not 1 <= generator_name_size <= _MAX_TSTR_LENGTH:
+            msg = "EmbedContext.generator_name must contain 1 to 1,000,000 UTF-8 bytes (C2PA generator-info-map)"
+            raise ValueError(msg)
+
     def resolve(self) -> tuple[uuid.UUID, str, datetime.datetime]:
         """Fill in the defaults, once, so a single embed uses consistent values."""
         manifest_uuid = self.manifest_uuid or uuid.uuid4()
         instance_id = self.instance_id or f"xmp:iid:{uuid.uuid4()}"
         when = self.when or _default_when()
-        if when.tzinfo is None:
+        if when.tzinfo is None or when.utcoffset() is None:
             msg = "EmbedContext.when must be timezone-aware; a naive datetime has no defined instant"
             raise ValueError(msg)
         return manifest_uuid, instance_id, when
@@ -151,31 +134,31 @@ def embed(text: str, signer: Signer, disclosure: Disclosure, *, context: EmbedCo
     """Return ``text`` with a signed Content Credential appended.
 
     The visible text is returned in NFC form and the mark is appended after it as one
-    contiguous run of variation selectors preceded by U+FEFF. For text that is
-    already NFC -- effectively all text in practice -- the visible portion is
-    byte-identical to the input. See the module docstring for why both are forced.
+    contiguous run of variation selectors preceded by U+FEFF. The selectors are
+    designed not to render, but rendering behavior belongs to the consuming text
+    system rather than this codec.
 
     Args:
         text: the text to mark. Must not already carry a wrapper.
         signer: the Ed25519 key and its certificate chain.
         disclosure: what the AI-disclosure assertion states about the generating
             model. Carries no information about who ran it.
-        context: pins the manifest UUID, instance ID and signing time. Omit for
-            normal use; supply it for reproducible output.
+        context: pins the manifest UUID, instance ID and claimed creation time. Omit
+            for normal use; supply it for reproducible output.
 
     Returns:
-        The marked text. Rendering is unaffected: variation selectors are
-        zero-width, so the string displays exactly as ``unicodedata.normalize("NFC",
-        text)`` does.
+        ``unicodedata.normalize("NFC", text)`` followed by the A.8 wrapper.
 
     Raises:
-        FixpointError: the padding search could not settle on a length. Never expected
-            in practice; a subclass of ``C2paTextError`` and ``RuntimeError``.
-        ValueError: the signing certificate's validity period does not contain
-            ``EmbedContext.when``, so the mark would be invalid the moment it was made.
+        FixpointError: the bounded padding search found no exact wrapper length. A
+            subclass of ``C2paTextError`` and ``RuntimeError``.
+        ValueError: one certificate's validity period does not contain
+            ``EmbedContext.when``.
         AlreadyMarkedError: ``text`` already carries a Content Credential.
         MarkCorruptError: ``text`` carries something that looks like a wrapper but is
             malformed. Marking on top of it would bury the damage.
+        TextNormalizationError: ``text`` exceeds the 30-nonstarter normalization
+            resource limit.
         UnencodableTextError: ``text`` holds an unpaired surrogate and cannot be
             encoded as UTF-8.
         ValueError: the algorithm is not one 13.1 permits, or ``context.when`` is
@@ -189,21 +172,18 @@ def embed(text: str, signer: Signer, disclosure: Disclosure, *, context: EmbedCo
 
     manifest_uuid, instance_id, when = context.resolve()
 
-    # A MARK SIGNED WITH AN OUT-OF-WINDOW CREDENTIAL IS BORN INVALID, and signed bytes
-    # cannot be recalled. Signer checks the 14.5.1.1 profile at construction but not the
-    # dates -- the one property that changes without anyone touching the deployment --
-    # so a service holding a Signer past its leaf's notAfter emitted invalid marks
-    # silently. Checked HERE rather than in Signer because nothing reconstructs a Signer,
-    # and against `when` rather than the clock so embed stays a pure function of its
-    # arguments. It cannot promise the mark will still be valid when READ: verification
-    # judges against its own clock (15.8). It promises the credential was usable when the
-    # mark was made.
-    leaf = signer.certificates[0]
-    if not leaf.not_valid_before_utc <= when <= leaf.not_valid_after_utc:
+    # Signer checks the static 14.5.1.1 profile at construction. Validity is checked on
+    # every embed against the supplied claimed creation instant; the default is the
+    # current clock, while pinned contexts support deterministic replay. Verification
+    # still judges the mark against its own validation clock under 15.8.
+    for index, certificate in enumerate(signer.certificates):
+        if certificate.not_valid_before_utc <= when <= certificate.not_valid_after_utc:
+            continue
+        role = "signing certificate" if index == 0 else f"x5chain[{index}] carried CA"
         msg = (
-            f"the signing certificate's validity period "
-            f"({leaf.not_valid_before_utc.isoformat()} to {leaf.not_valid_after_utc.isoformat()}) "
-            f"does not contain {when.isoformat()}; the mark would be invalid the moment it was made"
+            f"the {role}'s validity period "
+            f"({certificate.not_valid_before_utc.isoformat()} to {certificate.not_valid_after_utc.isoformat()}) "
+            f"does not contain the claimed creation time {when.isoformat()}"
         )
         raise ValueError(msg)
 
@@ -213,7 +193,7 @@ def embed(text: str, signer: Signer, disclosure: Disclosure, *, context: EmbedCo
     if existing:
         raise AlreadyMarkedError(existing[0].span.utf8_start, existing[0].span.utf8_stop)
 
-    normalized = unicodedata.normalize("NFC", text)
+    normalized = normalize_nfc(text)
     encoded = normalized.encode("utf-8")
     # The mark is a suffix, so the bytes covered by the hash are exactly the visible
     # text -- 15.12.1.3.1's "remove the exclusions, then normalize" is a no-op here,
@@ -221,8 +201,8 @@ def embed(text: str, signer: Signer, disclosure: Disclosure, *, context: EmbedCo
     digest = HASH_ALGORITHMS[context.algorithm](encoded).digest()
     exclusion_start = len(encoded)
 
-    def build(exclusion_length: int, pad: bytes) -> str:
-        claim = claim_payload_bytes(
+    def prepare(exclusion_length: int) -> Callable[[int], str]:
+        prepared = _prepare_manifest(
             disclosure=disclosure,
             digest=digest,
             exclusion_start=exclusion_start,
@@ -232,26 +212,23 @@ def embed(text: str, signer: Signer, disclosure: Disclosure, *, context: EmbedCo
             generator_name=context.generator_name,
             generator_version=context.generator_version,
             algorithm=context.algorithm,
-            pad=pad,
+            pad=b"",
         )
-        return build_wrapper(
-            build_manifest_store(
-                disclosure=disclosure,
-                digest=digest,
-                exclusion_start=exclusion_start,
-                exclusion_length=exclusion_length,
-                signature=_cose.sign_claim(signer, claim),
-                instance_id=instance_id,
-                manifest_uuid=manifest_uuid,
-                when=when,
-                generator_name=context.generator_name,
-                generator_version=context.generator_version,
-                algorithm=context.algorithm,
-                pad=pad,
+        signed = _prepare_signed_claim(signer, prepared.claim_bytes)
+
+        def build(pad: int) -> str:
+            signature = _serialize_signed_claim(signed, pad=pad)
+            return build_wrapper(
+                _serialize_prepared_manifest(
+                    prepared,
+                    signature=signature,
+                    manifest_uuid=manifest_uuid,
+                )
             )
-        )
+
+        return build
 
     # The exclusion range names the wrapper, whose length depends on the manifest,
-    # which contains the range. See c2patxt._fixpoint for why this does not iterate.
-    wrapper, _ = solve(build)
+    # which contains the range. c2patxt._fixpoint performs the bounded search.
+    wrapper, _ = solve(prepare)
     return normalized + wrapper

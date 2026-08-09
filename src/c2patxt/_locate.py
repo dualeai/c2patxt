@@ -17,9 +17,9 @@ A.8.7.3 says the opposite -- "perform normalization before calculating offsets" 
 and the two disagree whenever the stored text is not already NFC. For
 ``"cafe" + U+0301`` followed by a wrapper, the wrapper starts at byte 6 as stored
 but byte 5 in NFC. A.8.5 delegates normativity to the Validation clause explicitly
-("refer to the Validation clause for the normative procedure"), so 15.12.1.3.1 wins,
-and both other public A.8 implementations independently chose the same. The
-contradiction is recorded in the deviations document.
+("refer to the Validation clause for the normative procedure"), so 15.12.1.3.1
+controls this implementation. The contradiction is recorded in the deviations
+document.
 
 Our own encoder normalizes before appending, so for text this package produced the
 two frames coincide. The divergence only reaches us via foreign input.
@@ -43,16 +43,6 @@ from c2patxt.constants import (
 )
 from c2patxt.exceptions import MarkCorruptError, UnencodableTextError
 
-__all__ = [
-    "Span",
-    "WrapperMatch",
-    "find_wrappers",
-    "locate",
-    "payload_at",
-    "require_encodable",
-    "strip",
-]
-
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class Span:
@@ -67,8 +57,8 @@ class Span:
     ``c2pa.hash.data`` assertion, and it INCLUDES the U+FEFF marker. Whether the
     marker falls inside the exclusion is undefined in A.8 -- A.8.2.2 does not make it
     part of the wrapper structure while A.8.4.1 says the wrapper is "prefixed with"
-    it -- but both public implementations include it, and a 3-byte disagreement here
-    silently breaks interoperability.
+    it. This implementation includes it consistently in producer and validator paths;
+    a different boundary changes the digest by three UTF-8 bytes.
     """
 
     utf8_start: int
@@ -116,46 +106,23 @@ def _decode_run(text: str, start: int) -> tuple[bytes, int]:
     ``MAX_SELECTOR_RUN`` so a long run of selectors carrying no valid header cannot
     make us walk an arbitrarily long span.
 
-    THE RUN IS FOUND AND DECODED IN C, not in a Python loop over ``ord``. Written as
-    that loop this was the single largest term in verifying a short document: it cost
-    185-197 ms per MB of manifest payload, against 32 ms per MB for the form that ships.
-
-    THE COMPARISON AGAINST DOCUMENT TEXT NEEDS ITS DENOMINATOR NAMED, and this sentence
-    gave a figure -- "1.8 ms per MB of document text ... 110x" -- that matches neither
-    available reading. Re-measured 2026-08-06 at 1, 2 and 4 MB, 9 repetitions: scanning
-    plain text for a marker costs 0.017-0.031 ms/MB, and a whole ``verify`` of marked
-    text costs 3.76-3.96 ms/MB of document.
-
-    SO THE RATIO DEPENDS ON WHICH IMPLEMENTATION AND WHICH DENOMINATOR, and a first
-    correction here got that wrong in the same way the original did -- it quoted
-    "roughly 50x" and "several thousand", both computed from the REPLACED decoder.
-    From the three figures above: as shipped, 32/3.96 to 32/3.76 is 8.1-8.5x against a
-    whole verify, and 32/0.031 to 32/0.017 is one to two thousand times against the
-    scan alone. The replaced form is where 50x comes from (190/3.86). Our own manifests
-    are ~1 800
-    bytes, but A.8 permits 2 MiB, and 2.4 replaced data boxes with embedded-data
-    assertions, so a third-party manifest carrying an icon reaches the 100 KB range as
-    ORDINARY input rather than adversarial input.
-
-    Latin-1 is the round trip that maps code point N to byte N for all 256 values,
-    which is what lets ``translate`` do the mapping and ``encode`` do the packing.
+    The regular expression and translation table keep the scan in native string
+    operations. Latin-1 maps code point N back to byte N for all 256 selector values.
     """
     run = _RUN.match(text, start)
-    if run is None:  # pragma: no cover -- the pattern matches the empty string, so this cannot happen
-        return b"", start
+    assert run is not None  # noqa: S101 -- _RUN accepts empty at every valid start.
     return run.group().translate(_DECODE_TABLE).encode("latin-1"), run.end()
 
 
-def require_encodable(text: str) -> None:
-    """Reject text UTF-8 cannot represent, before any offset arithmetic runs.
+def require_encodable(text: str) -> int:
+    """Return the UTF-8 length, rejecting text UTF-8 cannot represent.
 
-    Called at every public entry point. Cheap on the common path -- the check is a
-    single encode attempt, and CPython encodes ASCII at memory speed -- and it turns
-    a confusing codec error raised from deep inside the scan into one documented
-    exception naming the offending index.
+    Called at every public entry point. The single encode attempt turns a codec error
+    raised from deeper in the scan into one documented exception naming the offending
+    index.
     """
     try:
-        text.encode("utf-8")
+        return len(text.encode("utf-8"))
     except UnicodeEncodeError as exc:
         raise UnencodableTextError(exc.start) from exc
 
@@ -185,17 +152,15 @@ def find_wrappers(text: str) -> list[WrapperMatch]:
             malformed. A matched magic is a positive assertion that a wrapper was
             intended, so unlike (1) above this is a real failure.
     """
-    require_encodable(text)
+    document_length = require_encodable(text)
 
     matches: list[WrapperMatch] = []
     corrupt: MarkCorruptError | None = None
     marker_bytes = len(MARKER.encode("utf-8"))
 
     index = 0
-    # Running byte offset, advanced alongside `index`. Re-encoding text[:index] on
-    # every match made this quadratic: 32,000 wrappers in 1.5 MB of text cost 8.3 s
-    # seconds and tens of gigabytes of transient allocation. Allocation was bounded;
-    # CPU was not, which is the same denial of service by another route.
+    # Advance a running byte offset with the character index; repeatedly encoding the
+    # entire prefix would make a document containing many candidates quadratic.
     prefix_bytes = 0
     consumed_index = 0
 
@@ -217,7 +182,11 @@ def find_wrappers(text: str) -> list[WrapperMatch]:
             continue
 
         try:
-            payload = parse_wrapper_body(run, doc=text, offset=prefix_bytes + marker_bytes)
+            payload = parse_wrapper_body(
+                run,
+                document_length=document_length,
+                offset=prefix_bytes + marker_bytes,
+            )
         except MarkCorruptError as exc:
             # A corrupt candidate must NOT discard wrappers already found. Otherwise
             # appending twenty-odd characters of malformed run to a document makes a
@@ -263,16 +232,9 @@ def locate(text: str) -> Span | None:
 def strip(text: str) -> str:
     """Return ``text`` with every Content Credential removed.
 
-    THE REASON THIS EXISTS: :class:`Span` holds BYTE offsets, and slicing a ``str``
-    with them silently produces the wrong result for any non-ASCII text. Without a
-    shipped helper, every caller who wants to re-mark a document hand-rolls the
-    encode/splice/decode dance, and the ones who do not notice the byte-versus-
-    character distinction leave a residue of the old mark behind.
-
-    That failure is triple-invisible. The residue is zero-width, so the text looks
-    identical on screen. It is shorter than the magic number, so ``verify()`` reports
-    UNMARKED rather than corrupt. And ``embed()`` then accepts it and bakes it
-    permanently inside the newly hashed visible text.
+    :class:`Span` uses UTF-8 byte offsets, so removal encodes, splices, and decodes
+    rather than slicing Python character indexes. This avoids leaving part of a
+    selector run in non-ASCII text.
 
     Unmarked text is returned unchanged. All wrappers are removed, not just the
     first: a document carrying several is already invalid, and leaving one behind
@@ -296,9 +258,3 @@ def strip(text: str) -> str:
         cursor = match.span.utf8_stop
     kept.append(encoded[cursor:])
     return b"".join(kept).decode("utf-8")
-
-
-def payload_at(text: str) -> bytes | None:
-    """Return the JUMBF payload of the first wrapper, or ``None`` if unmarked."""
-    matches = find_wrappers(text)
-    return matches[0].payload if matches else None

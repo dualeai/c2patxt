@@ -15,10 +15,10 @@ __all__ = [
     "HEADER_SIZE",
     "MAGIC",
     "MARKER",
-    "MAX_JUMBF_DEPTH",
+    "MAX_CBOR_DEPTH",
     "MAX_MANIFEST_LENGTH",
+    "MAX_NONSTARTERS",
     "MAX_SELECTOR_RUN",
-    "UTF8_BYTES_PER_MANIFEST_BYTE",
     "VERSION",
     "VS_HIGH_BASE",
     "VS_HIGH_MAX",
@@ -63,10 +63,7 @@ scanned as a wrapper candidate; it is rejected on the magic check, not specially
 """
 
 # manifestLength is a big-endian unsigned 32-bit integer. A.8.2.2 declares it in
-# ISO-BMFF class syntax and the prose never states endianness -- the only clause in
-# the specification that omits it, where clause 11, clause 18.6 and A.3.x all state
-# it. Big-endian is confirmed by both public implementations and by re-deriving
-# their published vectors; see tests/vectors/A8ConformanceTest-1.2.1.txt note 1.
+# ISO-BMFF class syntax; the local A.8 fixture pins that chosen reading of the wire.
 LENGTH_STRUCT_FORMAT: Final = ">I"
 
 # =============================================================================
@@ -85,24 +82,14 @@ VS_HIGH_BASE: Final = 0xE0100
 VS_HIGH_MAX: Final = 0xE01EF
 """Last code point of the high block. Encodes to 4 UTF-8 bytes."""
 
-UTF8_BYTES_PER_MANIFEST_BYTE: Final = 3.9375
-"""Theoretical worst-case UTF-8 cost per manifest byte: (16*3 + 240*4) / 256.
-
-Measured on real manifests it lands at 3.88-3.91, because length prefixes, zero
-padding and hash high-nibbles put more bytes in the cheap 3-byte band. The asymmetry
-is a property of the specification and is not optimisable.
-
-(Re-measure after any change to what is emitted; see
-``tests/test_embed.py::test_the_published_size_figures_are_still_true``.)
-"""
-
 # =============================================================================
 # DoS protection limits
 # =============================================================================
 #
 # This library parses untrusted text and an untrusted length-prefixed binary
 # structure, and is expected to run on a public, unauthenticated verification
-# surface. A.8 specifies NO bounds of any kind, so every bound below is ours.
+# surface. A.8's uint32 length permits up to 2^32-1 and specifies no smaller
+# operational resource cap, so the smaller bounds below are ours.
 #
 # Scope note: there is deliberately no maximum input length. A body-size cap belongs
 # to the service that accepts the request, not to a codec whose caller has already
@@ -112,40 +99,31 @@ is a property of the specification and is not optimisable.
 MAX_MANIFEST_LENGTH: Final = 1 << 21
 """Largest accepted ``manifestLength``, 2 MiB.
 
-THE MOST IMPORTANT LIMIT HERE. ``manifestLength`` is a 32-bit field read from
-attacker-controlled input, so an unbounded reader can be told to allocate 4 GiB by a
-13-byte header -- `HEADER_SIZE` below, and nothing longer is needed to ask. The
-bound must be applied BEFORE allocating, not after reading.
-
-2 MiB is roughly three orders of magnitude above a realistic manifest: measured
-Ed25519 manifest stores are 1,797 bytes self-signed and 2,120 bytes with a leaf and
-CA. Both are held by `tests/test_embed.py`, and the leaf+CA row NAMES ITS CONSTRUCTION
-there -- without that the number is not reproducible, which is how this file came to
-publish 2,102 while another document published 2,090 a day apart, with nothing
-asserting either. Even an RSA-4096 chain
-lands near 4 KB. The headroom costs nothing and avoids
-rejecting a legitimate manifest carrying an unusually long certificate chain.
+The limit is checked before a declared payload is accepted. It leaves room for
+certificate chains and embedded assertion data while keeping the accepted manifest
+finite. Python slicing would not allocate the declared length when the bytes are
+absent; this is a payload-policy bound, not a claim about such an allocation and not a
+C2PA limit.
 """
 
 MAX_SELECTOR_RUN: Final = MAX_MANIFEST_LENGTH + HEADER_SIZE
-"""Largest contiguous variation-selector run decoded from a single candidate.
+"""Maximum selector code points decoded after one marker candidate.
 
-Bounds the scan itself, independently of what ``manifestLength`` claims, so a run of
-selectors with no valid header cannot make us walk an arbitrarily long span.
+The locator reads only this prefix of a longer contiguous run, independently of what
+``manifestLength`` claims.
 """
 
-MAX_JUMBF_DEPTH: Final = 32
-"""Maximum nesting depth, for JUMBF superboxes AND for CBOR.
+MAX_CBOR_DEPTH: Final = 32
+"""Maximum CBOR nesting depth accepted by both encoder and decoder.
 
-TWO SUBSYSTEMS, ONE CONSTANT, and the name says only the first. ``_jumbf`` bounds
-superbox recursion with it; ``_cbor`` bounds BOTH encode and decode with it. Raising it
-for a deeply nested manifest would silently widen what the CBOR decoder accepts from
-attacker-controlled bytes, which is the decision this docstring exists to stop someone
-taking by accident.
+A short byte string can otherwise drive recursion through nested arrays, maps or
+tags. The bound applies only to CBOR. JUMBF child boxes are kept as opaque payloads
+and parsed one level at a time, so the JUMBF codec does not recurse.
+"""
 
-JUMBF superboxes nest arbitrarily, so a small input can describe unbounded recursion.
-cbor2 shipped CVE-2026-26209 for exactly this class of bug in a neighbouring format
-and settled on a default of 400; c2pa-rs independently chose 32 for JUMBF. We take
-the tighter of the two, since real C2PA manifests nest four levels deep
-(store > manifest > assertion store > assertion).
+MAX_NONSTARTERS: Final = 30
+"""Largest NFKD nonstarter sequence accepted for NFC normalization.
+
+UAX #15 D3 defines this as the Stream-Safe Text Format boundary. C2PA requires NFC
+but sets no resource limit for canonical ordering, so this is package policy.
 """

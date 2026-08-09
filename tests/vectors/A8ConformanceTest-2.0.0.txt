@@ -1,10 +1,10 @@
-# A8ConformanceTest-1.2.1.txt
-# Date: 2026-08-06
+# A8ConformanceTest-2.0.0.txt
+# Date: 2026-08-08
 # C2PA Technical Specification 2.4 (2026-04-01), HTML build c7e55d5a,
 # Annex A.8 "Embedding Manifests into Unstructured Text".
 #
 # Conformance vectors for the C2PATextManifestWrapper wire format. This file is the
-# normative artefact; any JSON mirror is generated from it and must agree.
+# canonical local fixture; any JSON mirror is generated from it and must agree.
 #
 # FORMAT
 #   Columns are separated by semicolons:
@@ -24,7 +24,7 @@
 #   Database applies the same discipline -- NormalizationTest.txt has zero non-ASCII
 #   bytes before the '#' on any of its 20,034 data lines.
 #
-# CONFORMANCE
+# C2PA WIRE RULES
 #
 # 1. WIRE FORMAT (A.8.2.2, A.8.3.1, A.8.4.1). The wrapper body is
 #      magic(8) || version(1) || manifestLength(4) || jumbfContainer[manifestLength]
@@ -52,8 +52,8 @@
 #      extract(text_hex) == (expect_hex, OK)
 #
 # 4. FAILURE. For op=extract with a status naming a C2PA failure code, an
-#    implementation shall report exactly that code, shall return no manifest, shall
-#    not raise an unhandled error, and shall not consume unbounded time or memory.
+#    implementation reports exactly that code and returns no manifest. A parser also
+#    must not let malformed input escape as an unrelated exception.
 #
 # 5. ABSENCE IS NOT FAILURE. For op=extract with status=NONE, extract(text_hex)
 #    returns no manifest and reports no failure code. Unmarked text is the normal
@@ -65,37 +65,26 @@
 # 7. WRAPPER EXTENT. A wrapper ends at 13 + manifestLength decoded bytes, never at
 #    the end of the contiguous selector run. Variation selectors authored by the
 #    user immediately after a wrapper are not part of it.
-#    Records X0017 and X0018 cover this. It is the rule
-#    encypherai/c2pa-conformance-suite gets wrong -- it takes a wrapper's end as the
-#    start of the next wrapper or EOF -- so it is the discriminating case.
-#
-#    On rule 4's cost clause: records X0019 and X0020 carry inputs SHAPED to be
-#    expensive rather than large enough to be slow, because a text file cannot carry
-#    a multi-megabyte input and wall-clock time is not portably assertable. X0019 is
-#    16 magic-matching but malformed candidates; REPEAT THE 34-BYTE UNIT to whatever
-#    length your harness needs, and confirm the time grows linearly, not
-#    quadratically. A real implementation was quadratic here -- it re-encoded the
-#    whole document once per candidate, so 1.09 MB took 9.91 s.
+#    Records X0017 and X0018 cover this. A decoder that instead consumes to the next
+#    wrapper or EOF changes the signed exclusion range, so this is a discriminating
+#    case rather than a round-trip duplicate.
 #
 # 8. CLOSED WORLD. For any text T containing no U+FEFF followed by a
 #    magic-matching variation-selector run, extract(T) == (none, NONE).
 #
-# 9. A CORRUPT CANDIDATE SHALL NOT DISCARD A GENUINE WRAPPER. Rule 4 says a
-#    magic-matching malformed candidate reports corruptedWrapper, and rule 1's
-#    hazard notes say a non-matching run is skipped. Neither says what to do when
-#    BOTH appear in one text. Report the failure only if no valid wrapper was
-#    found; otherwise return the valid one. The alternative hands a denial of
-#    service to anyone able to prepend twenty characters to a document. X0021 is
-#    the discriminating record: an implementation that raises on the first corrupt
-#    candidate and one that returns the wrapper pass every other record alike.
+# LOCAL SECURITY POLICY
+#
+# 9. A corrupt candidate does not discard a later genuine wrapper. C2PA A.8 does not
+#    specify this mixed-input selection rule. This corpus requires a failure only when
+#    no valid wrapper is found, so a short corrupt prefix cannot hide a valid wrapper.
+#    X0021 distinguishes that local policy.
 #
 # Note 1: A.8.2.2 declares manifestLength in ISO-BMFF class syntax and the prose
 #    never states endianness -- the only place in the specification that omits it,
-#    where clause 11, clause 18.6 and A.3.x all state it explicitly. Big-endian is
-#    confirmed three ways: by decoding EncypherAI's published golden vector, by
-#    re-deriving writerslogic's vector from the formula above, and by both
-#    implementations' source (struct.Struct("!8sBI"); len.to_be_bytes()).
-#    Record E0001 below reproduces EncypherAI's "ascii_small" vector byte for byte.
+#    where clause 11, clause 18.6 and A.3.x all state it explicitly. We follow the
+#    big-endian convention of ISO/IEC 14496-12, whose box layout JUMBF uses. The magic
+#    also resolves itself: its stated value is the ASCII sequence "C2PATXT\0"; reading
+#    that integer little-endian would put the NUL first.
 #
 # FLAGS
 #   ascii        input text is pure ASCII
@@ -121,13 +110,13 @@
 #   bad-version    wrapper version field is not 1
 #   length-overrun declared manifestLength exceeds the bytes available
 #   trailing-vs    user variation selectors follow the wrapper and are not part of it
-#   pathological   input shaped to cost a naive implementation more than it should
+#   pathological   structurally hostile input
 #   corrupt-prefix a magic-MATCHING but malformed candidate precedes a genuine wrapper
 #   empty-manifest declared manifestLength is 0: well formed, carrying no manifest
 #   boundary       payload straddles the 0x0F/0x10 mapping boundary on extract
 #
 @Part0 # Embed: canonical cases
-E0001;embed;68656c6c6f20776f726c64;deadbeef;68656c6c6f20776f726c64efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884f3a0878ef3a0869df3a086aef3a0879f;OK;ascii,minimal # "hello world" + 4-byte payload deadbeef; reproduces EncypherAI golden vector ascii_small
+E0001;embed;68656c6c6f20776f726c64;deadbeef;68656c6c6f20776f726c64efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884f3a0878ef3a0869df3a086aef3a0879f;OK;ascii,minimal # "hello world" + 4-byte payload deadbeef
 #
 @Part1 # Extract: success
 X0001;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884f3a0878ef3a0869df3a086aef3a0879f;;deadbeef;OK;roundtrip # "Doc." + wrapper
@@ -161,7 +150,7 @@ X0013;extract;446f6320efbbbfefb880efb881efb882efb883f3a084b7f3a084b1f3a08582f3a0
 @Part2c # Extract: malformed wrappers
 X0014;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb882efb880efb880efb880efb884f3a0878ef3a0869df3a086aef3a0879f;;;manifest.text.corruptedWrapper;bad-version # version != 1; A.8.2.2 fixes version = 1
 X0015;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880;;;manifest.text.corruptedWrapper;short-run # selector run shorter than the 13-byte header: magic and version present, manifestLength truncated
-X0016;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880f3a087aff3a087aff3a0878ef3a0869df3a086aef3a0879f;;;manifest.text.corruptedWrapper;length-overrun # declared manifestLength 65535 far exceeds the bytes available; must be rejected before allocating
+X0016;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880f3a087aff3a087aff3a0878ef3a0869df3a086aef3a0879f;;;manifest.text.corruptedWrapper;length-overrun # declared manifestLength 65535 far exceeds the bytes available; reject before payload extraction
 #
 
 @Part2e # Extract: rule 9, and two shapes the embed side reaches but extract does not
@@ -169,10 +158,10 @@ X0021;extract;446f6320efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a0
 X0022;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb880;;;OK;empty-manifest # manifestLength 0: well formed at the wire level, carrying nothing. Not corrupt and not absent. expect_hex is empty because the manifest is
 X0023;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884efb88eefb88ff3a08480f3a08481;;0e0f1011;OK;boundary # 0x0e,0x0f,0x10,0x11 -- the last U+FE00-block byte beside the first U+E0100-block byte. E0006 crosses the boundary on embed only
 #
-@Part2d # Wrapper extent (rule 7) and cost (rule 4)
+@Part2d # Wrapper extent (rule 7) and structurally hostile inputs
 X0017;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb884f3a0878ef3a0869df3a086aef3a0879fefb88fefb88e;;deadbeef;OK;trailing-vs # U+FE0F and U+FE0E follow the wrapper: emoji presentation selectors the user typed. The wrapper ends at 13 + manifestLength, so they are NOT payload
 X0018;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881efb880efb880efb880efb883efb880f3a087aff3a08480f3a08480f3a08481;;00ff10;OK;trailing-vs # the same rule with SUPPLEMENTARY-plane selectors, which decode to bytes 0x10 and 0x11. An implementation that runs to the end of the selector run returns 5 bytes instead of 3
-X0019;extract;efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880;;;manifest.text.corruptedWrapper;pathological # 16 magic-matching but malformed candidates. Repeat the 34-byte unit to scale; time must grow LINEARLY
-X0020;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881f3a087aff3a087aff3a087aff3a087af;;;manifest.text.corruptedWrapper;pathological # manifestLength = 0xFFFFFFFF with nothing behind it: refuse by inspecting the declared value, never by attempting the allocation
+X0019;extract;efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880;;;manifest.text.corruptedWrapper;pathological # 16 magic-matching malformed candidates
+X0020;extract;446f632eefbbbff3a084b3f3a084a2f3a08580f3a084b1f3a08584f3a08588f3a08584efb880efb881f3a087aff3a087aff3a087aff3a087af;;;manifest.text.corruptedWrapper;pathological # manifestLength = 0xFFFFFFFF with nothing behind it: reject against the accepted payload cap
 
 # EOF

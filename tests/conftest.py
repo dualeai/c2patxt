@@ -6,11 +6,9 @@ material and nothing expires. Generation is cheap for Ed25519.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime
-import hashlib
-import unicodedata
 import uuid
-from collections.abc import Callable
 
 import pytest
 from cryptography import x509
@@ -18,12 +16,10 @@ from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PrivateKey
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.asymmetric.types import CertificateIssuerPrivateKeyTypes
 from cryptography.hazmat.primitives.hashes import SHA256
+from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509.oid import NameOID
 
-from c2patxt._cose import sign_claim
-from c2patxt._fixpoint import solve
-from c2patxt._selectors import build_wrapper
-from c2patxt.manifest import build_manifest_store, claim_payload_bytes
+from c2patxt import EmbedContext, embed
 from c2patxt.signing import C2PA_CLAIM_SIGNING_EKU, Disclosure, ModelType, Signer
 
 # Fixed so certificates are byte-stable across runs; nothing here is time-sensitive.
@@ -31,8 +27,29 @@ _NOT_BEFORE = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
 _NOT_AFTER = datetime.datetime(2046, 1, 1, tzinfo=datetime.timezone.utc)
 
 
-def _name(common_name: str) -> x509.Name:
-    return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
+class RecordingTrustEvaluator:
+    """Fixed-answer test double, not a path validator; snapshot each handoff as DER."""
+
+    def __init__(self, *, trusted: bool) -> None:
+        self.trusted = trusted
+        self.calls: list[tuple[tuple[bytes, ...], tuple[bytes, ...]]] = []
+
+    def is_trusted(self, chain: list[x509.Certificate], anchors: list[x509.Certificate]) -> bool:
+        self.calls.append(
+            (
+                tuple(certificate.public_bytes(Encoding.DER) for certificate in chain),
+                tuple(certificate.public_bytes(Encoding.DER) for certificate in anchors),
+            )
+        )
+        return self.trusted
+
+
+def _name(common_name: str, organization_name: str | None = None) -> x509.Name:
+    attributes: list[x509.NameAttribute[str]] = []
+    if organization_name is not None:
+        attributes.append(x509.NameAttribute(NameOID.ORGANIZATION_NAME, organization_name))
+    attributes.append(x509.NameAttribute(NameOID.COMMON_NAME, common_name))
+    return x509.Name(attributes)
 
 
 def build_certificate(
@@ -50,6 +67,7 @@ def build_certificate(
     extended_key_usage: tuple[str, ...] | None = None,
     issuer_name: str | None = None,
     authority_key_identifier: bool = False,
+    organization_name: str | None = None,
 ) -> x509.Certificate:
     """Build a self-signed Ed25519 certificate.
 
@@ -63,7 +81,6 @@ def build_certificate(
     ``cA`` asserted and no EKU at all. That combination yields
     ``signingCredential.invalid``, a hard reject, rather than the
     ``signingCredential.untrusted`` a self-signed credential is supposed to produce.
-    It is the exact misconfiguration the Terraform credential is at risk of.
 
     The remaining keywords each vary ONE property of an otherwise conformant leaf, so
     a 14.5.1.1 test names the rule it violates and nothing else:
@@ -89,20 +106,19 @@ def build_certificate(
         therefore obliged to carry an Authority Key Identifier. The key is unchanged,
         so the signature still verifies -- the point is the profile check, not a chain.
     ``authority_key_identifier=True``
-        add the AKI, which only matters alongside ``issuer_name``.
+        add an AKI derived from the signing key. Issued certificates require it;
+        self-signed certificates may carry it.
+    ``organization_name``
+        add an Organization to the subject and, when self-signed, the issuer.
     """
     builder = (
         x509.CertificateBuilder()
-        .subject_name(_name(common_name))
-        .issuer_name(_name(issuer_name or common_name))
+        .subject_name(_name(common_name, organization_name))
+        .issuer_name(_name(issuer_name) if issuer_name is not None else _name(common_name, organization_name))
         .public_key(private_key.public_key())
         # PINNED, not random. x509.random_serial_number() made every test certificate
-        # differ between runs, so the signature bytes differed, so the UTF-8 cost of
-        # the encoded manifest differed -- and the fixpoint's padding search cost
-        # varied run to run. That surfaced as an intermittent failure of
-        # test_the_search_settles_in_a_modest_number_of_builds (553 builds against a
-        # bound of 400 on one run, ~200 on another) which looked like a Python-version
-        # difference and was not. A test suite that claims byte-stability cannot seed
+        # and signature differ between runs, so exact wire assertions described a new
+        # fixture on every invocation. A suite that claims byte stability cannot seed
         # itself from an RNG.
         #
         # Uniqueness does not matter here: nothing in this suite builds a CA, and no
@@ -161,9 +177,8 @@ def build_certificate(
     else:
         builder = builder.add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
 
-    # Edwards curves sign without a separate hash (RFC 8032 prehashes internally), so
-    # cryptography requires None there and a real hash for everything else. Passing
-    # the wrong one is a TypeError, not a silent weakening.
+    # Edwards certificate signatures take no separately selected hash in cryptography;
+    # the other fixture keys use SHA-256.
     algorithm = None if isinstance(private_key, (Ed25519PrivateKey, Ed448PrivateKey)) else SHA256()
     return builder.sign(private_key, algorithm)
 
@@ -182,8 +197,7 @@ def signing_key() -> Ed25519PrivateKey:
 def signer(signing_key: Ed25519PrivateKey, signing_certificate: x509.Certificate) -> Signer:
     """The signer every end-to-end test marks with.
 
-    Here rather than in one test module because ``mark`` -- which also lives here --
-    takes one, so any module producing genuinely marked text needs it.
+    Here rather than in one test module because any public producer test needs it.
     """
     return Signer(private_key=signing_key, certificates=(signing_certificate,))
 
@@ -202,56 +216,21 @@ DISCLOSURE = Disclosure(
 
 #: Fixed so the whole suite is byte-reproducible; nothing here is time-sensitive.
 WHEN = datetime.datetime(2026, 6, 1, 12, 0, tzinfo=datetime.timezone.utc)
+PINNED_EMBED_CONTEXT = EmbedContext(
+    manifest_uuid=uuid.UUID("00000000-0000-4000-8000-000000000007"),
+    instance_id="xmp:iid:1",
+    when=WHEN,
+)
 
 
-def wrapper_builder(text: str, signer: Signer) -> Callable[[int, bytes], str]:
-    """Return the ``build`` callable :func:`c2patxt._fixpoint.solve` expects.
+class FloatingTimezone(datetime.tzinfo):
+    """A ``tzinfo`` object that still makes a datetime naive by Python's rules."""
 
-    Shared by the fixpoint tests and the end-to-end verify tests so there is ONE
-    producer under test. Two copies would drift, and the copy the verify suite used
-    would silently stop being the thing the fixpoint suite proved correct.
-    """
-    normalized = unicodedata.normalize("NFC", text)
-    start = len(normalized.encode("utf-8"))
-    digest = hashlib.sha256(normalized.encode("utf-8")).digest()
-
-    def build(exclusion_length: int, pad: bytes) -> str:
-        claim = claim_payload_bytes(
-            disclosure=DISCLOSURE,
-            digest=digest,
-            exclusion_start=start,
-            exclusion_length=exclusion_length,
-            instance_id="xmp:iid:1",
-            when=WHEN,
-            generator_name="c2patxt",
-            pad=pad,
-        )
-        return build_wrapper(
-            build_manifest_store(
-                disclosure=DISCLOSURE,
-                digest=digest,
-                exclusion_start=start,
-                exclusion_length=exclusion_length,
-                signature=sign_claim(signer, claim),
-                instance_id="xmp:iid:1",
-                manifest_uuid=uuid.UUID(int=7),
-                when=WHEN,
-                generator_name="c2patxt",
-                pad=pad,
-            )
-        )
-
-    return build
+    def utcoffset(self, dt: datetime.datetime | None) -> None:
+        del dt
 
 
-def mark(text: str, signer: Signer) -> str:
-    """Produce genuinely marked text: hash, sign, embed, with real offsets.
-
-    embed() in miniature, so verify() can be tested against bytes that actually
-    satisfy the binding before embed() exists. Uses the real fixpoint rather than a
-    test-only shortcut, so a bug in the fixpoint shows up as a failed verification
-    rather than being papered over here.
-    """
-    normalized = unicodedata.normalize("NFC", text)
-    wrapper, _ = solve(wrapper_builder(text, signer))
-    return normalized + wrapper
+def mark(text: str, signer: Signer, *, when: datetime.datetime = WHEN) -> str:
+    """Produce a byte-stable fixture through the public producer."""
+    context = dataclasses.replace(PINNED_EMBED_CONTEXT, when=when)
+    return embed(text, signer, DISCLOSURE, context=context)

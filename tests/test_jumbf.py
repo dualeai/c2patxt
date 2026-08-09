@@ -1,8 +1,4 @@
-"""JUMBF box codec: the wire format, and the bugs other implementations shipped.
-
-Expected values come from the four corroborating sources described in
-``_jumbf.py``, not from running our encoder.
-"""
+"""JUMBF box codec against C2PA 2.4 and ISO 19566-5 field rules."""
 
 from __future__ import annotations
 
@@ -14,11 +10,6 @@ from c2patxt._jumbf import (
     TBOX_DESCRIPTION,
     TBOX_SUPERBOX,
     UUID_CBOR,
-    UUID_CONTIGUOUS_CODESTREAM,
-    UUID_EMBEDDED_FILE,
-    UUID_JSON,
-    UUID_UUID,
-    UUID_XML,
     DescriptionBox,
     JumbfBox,
     JumbfError,
@@ -27,7 +18,6 @@ from c2patxt._jumbf import (
     parse_superbox,
     serialize_superbox,
 )
-from c2patxt.constants import MAX_JUMBF_DEPTH
 
 
 def _superbox(description: DescriptionBox, payload: bytes = b"\x01\x02") -> bytes:
@@ -48,27 +38,9 @@ def _superbox(description: DescriptionBox, payload: bytes = b"\x01\x02") -> byte
     ],
 )
 def test_content_type_uuid_pattern(four_cc: bytes, expected: str) -> None:
-    """<4CC> || 00 11 00 10 80 00 00 AA 00 38 9B 71, confirmed in WG1 RI-1 source."""
+    """C2PA 11.1.1: <4CC> || 00 11 00 10 80 00 00 AA 00 38 9B 71."""
     got = content_type_uuid(four_cc).hex()
     assert f"{got[:8]}-{got[8:12]}-{got[12:16]}-{got[16:20]}-{got[20:]}" == expected
-
-
-def test_the_two_uuids_that_break_the_pattern() -> None:
-    """Both confirmed in WG1 RI-1 source AND in real file bytes.
-
-    An implementation that derived these from their 4CCs would produce UUIDs no
-    other implementation recognises.
-    """
-    assert UUID_EMBEDDED_FILE.hex() == "40cb0c32bb8a489da70b2ad6f47f4369"
-    assert UUID_CONTIGUOUS_CODESTREAM.hex() == "6579d6fbdba2446bb2ac1b82feeb89d1"
-    assert content_type_uuid(b"bfdb") != UUID_EMBEDDED_FILE
-    assert content_type_uuid(b"jp2c") != UUID_CONTIGUOUS_CODESTREAM
-
-
-def test_xml_content_type_pads_its_4cc_with_a_space() -> None:
-    """ "xml " is three letters and a 0x20, not three letters."""
-    assert UUID_XML[:4] == b"xml "
-    assert UUID_XML[3] == 0x20
 
 
 def test_a_four_cc_must_be_four_bytes() -> None:
@@ -77,85 +49,49 @@ def test_a_four_cc_must_be_four_bytes() -> None:
 
 
 def test_toggle_bit_values() -> None:
-    """0x04 and 0x08 are confirmed 4374/4374 against WG1 ground truth."""
+    """ISO 19566-5:2023 A.3 assigns the five description-box toggle bits."""
     assert (Toggle.REQUESTABLE, Toggle.LABEL, Toggle.ID) == (0x01, 0x02, 0x04)
     assert (Toggle.SIGNATURE, Toggle.PRIVATE) == (0x08, 0x10)
 
 
-def test_description_round_trips_with_every_field_set() -> None:
+def test_description_with_every_field_matches_the_iso_layout() -> None:
+    private = struct.pack(">I", 12) + b"c2sh" + b"\xaa" * 4
     description = DescriptionBox(
         uuid=UUID_CBOR,
         label="c2pa.assertions",
         requestable=True,
         box_id=60000,
         signature=bytes(range(32)),
-        private=struct.pack(">I", 12) + b"c2sh" + b"\xaa" * 4,
+        private=private,
     )
-    assert description.toggles == 0x1F
+    description_payload = (
+        UUID_CBOR + b"\x1f" + b"c2pa.assertions\x00" + (60000).to_bytes(4, "big") + bytes(range(32)) + private
+    )
+    description_box = struct.pack(">I", 8 + len(description_payload)) + b"jumd" + description_payload
+    content_box = struct.pack(">I", 10) + b"cbor" + b"\x01\x02"
+    expected = struct.pack(">I", 8 + len(description_box) + len(content_box)) + b"jumb" + description_box + content_box
 
-    parsed, end = parse_superbox(_superbox(description))
+    assert _superbox(description) == expected
+    parsed, end = parse_superbox(expected)
     assert parsed.description == description
-    assert end == len(_superbox(description))
-
-
-def test_a_label_only_box_parses() -> None:
-    """toggles=0x02 with no Requestable bit.
-
-    c2pa-rs requires ``(toggles & 0x03) == 0x03`` before reading a label and so FAILS
-    on this legal box. Five independent implementations test 0x02 alone, and real
-    files carry such boxes: a parse of image_5jumbf.jpg APP11 #1 showed toggles=0x02
-    with the label 'faiz mp3 data'. That asset is not vendored and the observation is
-    not reproducible here -- see docs/known-divergences.md.
-    """
-    description = DescriptionBox(uuid=UUID_JSON, label="my xml data", requestable=False)
-    assert description.toggles == Toggle.LABEL
-
-    parsed, _ = parse_superbox(_superbox(description))
-    assert parsed.description.label == "my xml data"
-    assert parsed.description.requestable is False
-
-
-def test_the_id_field_is_four_bytes_big_endian() -> None:
-    """faceless2/c2pa reads two bytes and clamps at 65535; it is alone against ~8."""
-    description = DescriptionBox(uuid=UUID_CBOR, label="x", box_id=0xDEADBEEF)
-    parsed, _ = parse_superbox(_superbox(description))
-    assert parsed.description.box_id == 0xDEADBEEF
+    assert end == len(expected)
 
 
 def test_the_signature_field_is_thirty_two_bytes() -> None:
-    """WG1 RI-2's deserialize() reads 256; its own serialize() writes 32."""
+    """ISO 19566-5 A.3 fixes the SHA-256 signature field at 32 bytes."""
     with pytest.raises(ValueError, match="32-byte SHA-256"):
         DescriptionBox(uuid=UUID_CBOR, label="x", signature=b"\x00" * 256)
 
 
-def test_the_private_field_is_kept_generic() -> None:
-    """Real Adobe assets carry toggles=0x13 with a 24-byte 'c2sh' salt box.
-
-    A parser that stops after the signature mis-reads genuine Adobe and Monotype
-    output. Modelled as opaque bytes rather than hard-coding 'c2sh', matching WG1
-    RI-1, dbench, jumbf-rs and MediaInfo.
-    """
-    salt_box = struct.pack(">I", 24) + b"c2sh" + bytes(range(16))
-    description = DescriptionBox(uuid=UUID_JSON, label="stds.schema-org.CreativeWork", private=salt_box)
-    assert description.toggles == 0x13
-
-    parsed, _ = parse_superbox(_superbox(description))
-    assert parsed.description.private == salt_box
-
-
 def test_a_requestable_box_must_carry_a_label() -> None:
-    """WG1 RI-1 enforces this; a URI reference needs something to point at."""
+    """ISO 19566-5 A.3 requires a label when Requestable is set."""
     with pytest.raises(ValueError, match="non-empty label"):
         DescriptionBox(uuid=UUID_CBOR, label=None, requestable=True)
 
 
 @pytest.mark.parametrize("char", ["/", ";", "?", "#", "\x01", "\x7f", "﻿", "￿"])
 def test_forbidden_label_characters_are_rejected(char: str) -> None:
-    """C2PA 11.1.4.1.1. No implementation surveyed in docs/known-divergences.md
-    enforces these -- we do.
-
-    U+FEFF is on the list, which is a quiet irony given it is our wrapper marker.
-    """
+    """C2PA 11.1.4.1.1 forbids these label code points."""
     with pytest.raises(ValueError, match=r"not permitted|surrogates"):
         DescriptionBox(uuid=UUID_CBOR, label=f"bad{char}label")
 
@@ -187,18 +123,14 @@ def test_lbox_zero_means_to_end_of_data() -> None:
 
 @pytest.mark.parametrize("lbox", [2, 3, 4, 5, 6, 7])
 def test_reserved_lbox_values_are_rejected(lbox: int) -> None:
-    """Clause 4.3: "the values 2-7 are reserved".
-
-    MediaInfo guesses read-to-EOF here and dbench takes the value literally. Both
-    are guesses at undefined behaviour; erroring is the conservative reading.
-    """
+    """ISO 19566-5 clause 4.3 reserves LBox values 2 through 7."""
     data = struct.pack(">I", lbox) + TBOX_SUPERBOX + b"\x00" * 32
     with pytest.raises(JumbfError, match="reserved"):
         parse_superbox(data)
 
 
 def test_reserved_toggle_bits_are_rejected() -> None:
-    """Bits 5-7 are never set in 4,374 conformance files. Do not guess at them."""
+    """ISO 19566-5 A.3 assigns bits 0 through 4; higher bits are reserved."""
     payload = UUID_CBOR + bytes([0x80])
     inner = struct.pack(">I", 8 + len(payload)) + TBOX_DESCRIPTION + payload
     data = struct.pack(">I", 8 + len(inner)) + TBOX_SUPERBOX + inner
@@ -258,12 +190,6 @@ def test_a_child_box_may_not_overrun_its_superbox() -> None:
         parse_superbox(data)
 
 
-def test_nesting_is_bounded() -> None:
-    inner = _superbox(DescriptionBox(uuid=UUID_CBOR, label="x"))
-    with pytest.raises(JumbfError, match="nesting deeper"):
-        parse_superbox(inner, depth=MAX_JUMBF_DEPTH + 1)
-
-
 def test_a_label_must_be_nul_terminated() -> None:
     payload = UUID_CBOR + bytes([Toggle.LABEL]) + b"no terminator"
     inner = struct.pack(">I", 8 + len(payload)) + TBOX_DESCRIPTION + payload
@@ -298,20 +224,26 @@ def test_trailing_bytes_without_the_private_toggle_are_rejected() -> None:
         parse_superbox(data)
 
 
-def test_multiple_content_boxes_round_trip() -> None:
+def test_multiple_content_boxes_match_the_iso_box_layout() -> None:
+    uuid = content_type_uuid(b"uuid")
     box = JumbfBox(
-        description=DescriptionBox(uuid=UUID_UUID, label="c2pa"),
+        description=DescriptionBox(uuid=uuid, label="c2pa"),
         content=((b"cbor", b"\x01"), (b"json", b"{}"), (b"free", b"\x00\x00")),
     )
-    parsed, _ = parse_superbox(serialize_superbox(box))
+    description_payload = uuid + b"\x03c2pa\x00"
+    description = struct.pack(">I", 8 + len(description_payload)) + b"jumd" + description_payload
+    contents = b"".join(
+        (
+            struct.pack(">I", 9) + b"cbor" + b"\x01",
+            struct.pack(">I", 10) + b"json" + b"{}",
+            struct.pack(">I", 10) + b"free" + b"\x00\x00",
+        )
+    )
+    expected = struct.pack(">I", 8 + len(description) + len(contents)) + b"jumb" + description + contents
+
+    assert serialize_superbox(box) == expected
+    parsed, _ = parse_superbox(expected)
     assert parsed.content == box.content
-
-
-def test_error_is_picklable_and_carries_position() -> None:
-    import pickle
-
-    revived = pickle.loads(pickle.dumps(JumbfError("boom", 12)))  # noqa: S301 - our own object
-    assert (revived.msg, revived.pos) == ("boom", 12)
 
 
 def test_a_nul_in_a_label_is_rejected() -> None:

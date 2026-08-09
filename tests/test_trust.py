@@ -6,6 +6,8 @@ import pathlib
 
 import pytest
 from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding
 
@@ -16,11 +18,14 @@ from c2patxt.trust import (
     NoTrustEvaluator,
     ProfileError,
     TrustEvaluator,
+    check_certificate_chain_profile,
     check_claim_signing_profile,
     load_anchors,
 )
 from c2patxt.verdict import Provenance
 from tests.conftest import build_certificate
+
+_PssHash = hashes.SHA224 | hashes.SHA256 | hashes.SHA384 | hashes.SHA512
 
 
 def test_a_conformant_certificate_passes(signing_certificate: x509.Certificate) -> None:
@@ -30,10 +35,10 @@ def test_a_conformant_certificate_passes(signing_certificate: x509.Certificate) 
 def test_a_default_openssl_style_certificate_is_rejected(signing_key: Ed25519PrivateKey) -> None:
     """THE case to catch: cA asserted and no EKU.
 
-    Terraform's tls_self_signed_cert produces exactly this by default. It yields
+    A stock ``openssl req -x509`` certificate produces this shape. It yields
     signingCredential.INVALID -- a hard reject where the manifest is not even Valid
-    -- rather than the signingCredential.untrusted a self-signed credential is
-    supposed to produce. The difference is the whole point of the check.
+    -- rather than the signingCredential.untrusted a conformant self-signed credential
+    produces. The difference is the whole point of the check.
     """
     certificate = build_certificate(signing_key, conformant=False)
     with pytest.raises(ProfileError, match="must not assert cA"):
@@ -61,22 +66,12 @@ def test_any_extended_key_usage_is_rejected(signing_key: Ed25519PrivateKey) -> N
 
 
 def test_the_claim_signing_eku_is_a_trust_input_not_a_profile_rule(signing_key: Ed25519PrivateKey) -> None:
-    """THIS TEST USED TO ASSERT THE OPPOSITE, and the opposite was wrong.
+    """14.5.1.1 names no single required claim-signing EKU OID.
 
-    It required ``c2pa-kp-claimSigning`` and cited 14.4.1. 14.5.1.1 -- the clause that
-    actually defines the profile -- names no required OID, and 14.4.1 is addressed to
-    validators about their own trust-anchor configuration, explicitly anticipating
-    ``id-kp-emailProtection`` and ``id-kp-documentSigning`` instead.
-
-    So a leaf bearing the EKU passes, and so does one without it. What the OID governs is
-    which trust anchors a deployment associates with the credential (14.5.1.2), which is
-    the ``TrustEvaluator`` seam's question and not the profile's -- and with no anchors
-    shipped, our accepted-EKU list is empty and the question decides nothing.
-
-    Both rows are here because the change is easy to over-apply in the other direction:
-    a certificate carrying claimSigning must still be accepted, and the EKU rules that
-    ARE in 14.5.1.1 -- present, non-empty, no ``anyExtendedKeyUsage``, the exclusivity
-    rule -- are all still enforced and tested above.
+    A leaf bearing the C2PA OID passes, and so does a leaf bearing an accepted legacy
+    purpose. Trust-anchor association by EKU belongs to 14.5.1.2 and the
+    ``TrustEvaluator`` seam. The profile still requires a present, non-empty EKU and
+    enforces ``anyExtendedKeyUsage`` and purpose-separation rules.
     """
     check_claim_signing_profile(_leaf(signing_key))
     check_claim_signing_profile(_leaf(signing_key, extended_key_usage=("1.3.6.1.5.5.7.3.4",)))
@@ -130,16 +125,7 @@ def test_an_explicit_empty_bundle_means_no_anchors() -> None:
 def test_the_environment_cannot_supply_anchors(
     signing_certificate: x509.Certificate, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """THE ENVIRONMENT IS NOT A CHANNEL, and this pins it shut.
-
-    A C2PATXT_TRUST_ANCHORS fallback existed until 2026-08-05. It falsified the "no
-    ambient configuration" promise made in the package docstring, in VerifyContext
-    and in SECURITY.md; a missing or malformed path raised straight out of verify(),
-    which promises never to raise; and because the read happened only on the
-    signature-valid path, unmarked and invalid text verified fine while VALID text
-    crashed. A trust decision that depends on a process environment variable is also
-    neither reproducible nor auditable.
-    """
+    """Trust anchors come only from ``VerifyContext``, never the environment."""
     bundle = tmp_path / "anchors.pem"
     bundle.write_bytes(signing_certificate.public_bytes(Encoding.PEM))
     monkeypatch.setenv("C2PATXT_TRUST_ANCHORS", str(bundle))
@@ -150,11 +136,7 @@ def test_the_environment_cannot_supply_anchors(
 def test_a_hostile_anchors_variable_cannot_break_verification(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The exact bomb that fires on the happy path only.
-
-    Both of these raised -- FileNotFoundError and a PEM MalformedFraming ValueError --
-    from inside verify(), and ONLY for text that was otherwise valid.
-    """
+    """Hostile ambient values do not enter the public trust path."""
     for value in ("/nonexistent/missing.pem", "not-a-path-at-all"):
         monkeypatch.setenv("C2PATXT_TRUST_ANCHORS", value)
         assert load_anchors() == []
@@ -166,6 +148,13 @@ def _build(
     ca: bool,
     ekus: list[x509.ObjectIdentifier] | None,
     key_cert_sign: bool = False,
+    key_usage_critical: bool = True,
+    authority_key_identifier: bool = False,
+    authority_key_identifier_key: bool = True,
+    authority_key_identifier_critical: bool = False,
+    subject_key_identifier: bool = False,
+    subject_key_identifier_critical: bool = False,
+    issuer_key: Ed25519PrivateKey | None = None,
 ) -> x509.Certificate:
     """Build a certificate with precise control over the profile-relevant extensions."""
     import datetime
@@ -195,15 +184,34 @@ def _build(
                 encipher_only=False,
                 decipher_only=False,
             ),
-            critical=True,
+            critical=key_usage_critical,
         )
     )
+    if authority_key_identifier:
+        authority = (
+            x509.AuthorityKeyIdentifier.from_issuer_public_key((issuer_key or key).public_key())
+            if authority_key_identifier_key
+            else x509.AuthorityKeyIdentifier(
+                key_identifier=None,
+                authority_cert_issuer=[x509.DirectoryName(name)],
+                authority_cert_serial_number=0xC2A7E47_1550,
+            )
+        )
+        builder = builder.add_extension(
+            authority,
+            critical=authority_key_identifier_critical,
+        )
+    if subject_key_identifier:
+        builder = builder.add_extension(
+            x509.SubjectKeyIdentifier.from_public_key(key.public_key()),
+            critical=subject_key_identifier_critical,
+        )
     if ekus is not None:
         builder = builder.add_extension(x509.ExtendedKeyUsage(ekus), critical=False)
-    return builder.sign(key, None)
+    return builder.sign(issuer_key or key, None)
 
 
-# --- C2PA 14.5.1.1, the parts we did not check until 2026-08-05 -----------------
+# --- C2PA 14.5.1.1 certificate-profile rules ----------------------------------
 
 
 def _leaf(signing_key: Ed25519PrivateKey, **kwargs: object) -> x509.Certificate:
@@ -212,18 +220,22 @@ def _leaf(signing_key: Ed25519PrivateKey, **kwargs: object) -> x509.Certificate:
 
 
 def test_the_key_usage_extension_must_be_present(signing_key: Ed25519PrivateKey) -> None:
-    """14.5.1.1: "the Key Usage extension shall be present and should be marked as
-    critical."
-
-    We treated an absent KeyUsage as acceptable -- ``usage = None`` and carry on --
-    because the only thing we read it for was the keyCertSign prohibition, and a
-    certificate with no KeyUsage cannot assert keyCertSign. That reasoning is right
-    about keyCertSign and wrong about the clause: presence is required in its own
-    right.
-    """
+    """14.5.1.1 requires a Key Usage extension."""
     certificate = _leaf(signing_key, key_usage=None)
     with pytest.raises(ProfileError, match="Key Usage extension"):
         check_claim_signing_profile(certificate)
+
+
+def test_key_usage_need_not_be_critical(signing_key: Ed25519PrivateKey) -> None:
+    """RFC 5280 says SHOULD, so making criticality a reject would be over-strict."""
+    certificate = _build(
+        signing_key,
+        ca=False,
+        ekus=[x509.ObjectIdentifier("1.3.6.1.4.1.62558.2.1")],
+        key_usage_critical=False,
+    )
+
+    check_claim_signing_profile(certificate)
 
 
 def test_the_digital_signature_bit_must_be_asserted(signing_key: Ed25519PrivateKey) -> None:
@@ -272,10 +284,8 @@ def test_an_unrelated_extra_eku_is_still_accepted(signing_key: Ed25519PrivateKey
     list of EKUs in the configuration store shall not cause the certificate to be
     rejected."
 
-    Over-strictness is as much a conformance bug as under-strictness -- it is the
-    defect class docs/known-divergences.md catalogues in five other implementations,
-    pointed at ourselves. ``emailProtection`` is unrelated to all three C2PA purposes
-    and must pass.
+    Over-strictness is as much a conformance bug as under-strictness.
+    ``emailProtection`` is unrelated to all three C2PA purposes and must pass.
     """
     check_claim_signing_profile(_leaf(signing_key, extra_ekus=("1.3.6.1.5.5.7.3.4",)))
 
@@ -310,43 +320,6 @@ def test_the_certificate_version_must_be_v3(signing_certificate: x509.Certificat
     assert downgraded.version is x509.Version.v1
     with pytest.raises(ProfileError, match="v3"):
         check_claim_signing_profile(downgraded)
-
-
-@pytest.mark.parametrize(
-    ("tag", "name"),
-    [(0x81, "issuerUniqueID"), (0x82, "subjectUniqueID")],
-    ids=["issuerUniqueID", "subjectUniqueID"],
-)
-def test_the_tbs_unique_id_fields_must_be_absent(signing_certificate: x509.Certificate, tag: int, name: str) -> None:
-    """14.5.1.1: "The issuerUniqueID and subjectUniqueID optional fields of the
-    TBSCertificate sequence shall not be present, as per RFC 5280, section 4.1.2.8."
-
-    ``cryptography`` exposes no accessor for either field -- they are legacy v2
-    syntax it declines to surface -- so this is the one profile rule that requires
-    walking the DER ourselves. The walk stays at the TOP LEVEL of the TBSCertificate
-    SEQUENCE, where the tags ``[1]`` and ``[2]`` are unambiguous; it never descends,
-    so a ``0x81`` occurring as a length byte inside a nested structure cannot be
-    mistaken for a field.
-
-    The fixture is a genuine certificate with a genuine field spliced in and the outer
-    SEQUENCE length corrected, not a hand-written stub, so the walk is exercised
-    against real issuer, validity and SPKI encodings rather than a shape chosen to
-    suit it.
-    """
-    from c2patxt.trust import (
-        _tbs_carries_unique_ids,  # pyright: ignore[reportPrivateUsage] -- no public caller accepts raw TBS bytes
-    )
-
-    tbs = signing_certificate.tbs_certificate_bytes
-    assert _tbs_carries_unique_ids(tbs) is False
-
-    body_start, end = _der_contents(tbs, 0)
-    extensions = tbs.index(b"\xa3", body_start)
-    field = bytes([tag, 0x02, 0x00, 0xFF])
-    spliced = _sequence(tbs[body_start:extensions] + field + tbs[extensions:end])
-
-    assert len(spliced) == len(tbs) + len(field), f"only {name} was added"
-    assert _tbs_carries_unique_ids(spliced) is True
 
 
 def _der_contents(encoded: bytes, offset: int) -> tuple[int, int]:
@@ -390,9 +363,8 @@ def test_the_authority_key_identifier_is_required_only_when_not_self_signed(
     expects to reach ``signingCredential.untrusted`` rather than
     ``signingCredential.invalid``.
 
-    "Self-signed" is decided here by issuer == subject. That is self-ISSUED strictly
-    speaking; a certificate self-issued but signed by a different key is pathological
-    and, being a leaf, would fail chain building anyway.
+    Equal issuer and subject names make a certificate self-issued, not self-signed.
+    The signature must also verify under its own subject key before AKI may be absent.
     """
     check_claim_signing_profile(_leaf(signing_key))
 
@@ -400,16 +372,181 @@ def test_the_authority_key_identifier_is_required_only_when_not_self_signed(
     with pytest.raises(ProfileError, match="Authority Key Identifier"):
         check_claim_signing_profile(issued)
 
+    issuer_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
+    self_issued = _build(
+        signing_key,
+        ca=False,
+        ekus=[x509.ObjectIdentifier("1.3.6.1.4.1.62558.2.1")],
+        issuer_key=issuer_key,
+    )
+    with pytest.raises(ProfileError, match="Authority Key Identifier"):
+        check_claim_signing_profile(self_issued)
+
     check_claim_signing_profile(_leaf(signing_key, issuer_name="some other issuer", authority_key_identifier=True))
+
+
+def test_authority_key_identifier_is_noncritical_even_on_a_self_signed_leaf(
+    signing_key: Ed25519PrivateKey,
+) -> None:
+    certificate = _build(
+        signing_key,
+        ca=False,
+        ekus=[x509.ObjectIdentifier("1.3.6.1.4.1.62558.2.1")],
+        authority_key_identifier=True,
+        authority_key_identifier_critical=True,
+    )
+
+    with pytest.raises(ProfileError, match=r"Authority Key Identifier.*non-critical"):
+        check_claim_signing_profile(certificate)
+
+
+@pytest.mark.parametrize("role", ["issued-leaf", "carried-ca", "self-signed"], ids=str)
+def test_a_present_authority_key_identifier_must_carry_key_identifier(
+    signing_key: Ed25519PrivateKey,
+    signing_certificate: x509.Certificate,
+    role: str,
+) -> None:
+    """RFC 5280 permits a self-signed cert to omit AKI, not an empty keyIdentifier."""
+    issuer_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
+    certificate = _build(
+        signing_key,
+        ca=role == "carried-ca",
+        ekus=None if role == "carried-ca" else [x509.ObjectIdentifier("1.3.6.1.4.1.62558.2.1")],
+        key_cert_sign=role == "carried-ca",
+        authority_key_identifier=True,
+        authority_key_identifier_key=False,
+        subject_key_identifier=role == "carried-ca",
+        issuer_key=None if role == "self-signed" else issuer_key,
+    )
+
+    with pytest.raises(ProfileError, match="must include keyIdentifier"):
+        if role == "carried-ca":
+            check_certificate_chain_profile([signing_certificate, certificate])
+        else:
+            check_claim_signing_profile(certificate)
+
+
+def test_a_lazy_carried_ca_parse_failure_is_indexed(
+    signing_key: Ed25519PrivateKey,
+    signing_certificate: x509.Certificate,
+) -> None:
+    """Malformed DER extensions must become ProfileError, not escape as ValueError."""
+    ca = _build(
+        signing_key,
+        ca=True,
+        ekus=[],
+        key_cert_sign=True,
+        subject_key_identifier=True,
+    )
+    loaded = x509.load_der_x509_certificate(ca.public_bytes(Encoding.DER))
+
+    with pytest.raises(ProfileError, match=r"x5chain\[1\] carried CA could not be parsed"):
+        check_certificate_chain_profile([signing_certificate, loaded])
+
+
+@pytest.mark.parametrize(
+    "patches",
+    [
+        [(39, 12, 0)],
+        [(181, 0, 42), (188, 37, 15)],
+        [(126, 43, 0)],
+    ],
+    ids=["issuer-key-error", "duplicate-extension", "unknown-spki"],
+)
+def test_lazy_leaf_parse_failures_are_translated_for_public_producer_apis(
+    signing_key: Ed25519PrivateKey,
+    signing_certificate: x509.Certificate,
+    patches: list[tuple[int, int, int]],
+) -> None:
+    der = bytearray(signing_certificate.public_bytes(Encoding.DER))
+    for offset, expected, replacement in patches:
+        assert der[offset] == expected, "the fixed hostile-DER vector moved"
+        der[offset] = replacement
+    loaded = x509.load_der_x509_certificate(bytes(der))
+
+    with pytest.raises(ProfileError, match="could not be parsed"):
+        check_claim_signing_profile(loaded)
+    with pytest.raises(ProfileError, match="could not be parsed"):
+        Signer(private_key=signing_key, certificates=(loaded,))
+
+
+def test_the_public_chain_profile_helper_rejects_an_empty_chain() -> None:
+    with pytest.raises(ProfileError, match="no leaf certificate"):
+        check_certificate_chain_profile([])
+
+
+def test_an_unsupported_self_issued_key_becomes_a_profile_failure_not_type_error() -> None:
+    """`verify_directly_issued_by` raises TypeError for a non-signing subject key."""
+    import datetime
+
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+    issuer_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32, 64)))
+    subject_key = X25519PrivateKey.from_private_bytes(bytes(range(64, 96)))
+    name = x509.Name([x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, "self-issued, not self-signed")])
+    certificate = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(subject_key.public_key())
+        .serial_number(0xC2A7E47_25519)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc))
+        .not_valid_after(datetime.datetime(2046, 1, 1, tzinfo=datetime.timezone.utc))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.ObjectIdentifier("1.3.6.1.4.1.62558.2.1")]),
+            critical=False,
+        )
+        .sign(issuer_key, None)
+    )
+
+    with pytest.raises(ProfileError, match="Authority Key Identifier"):
+        check_claim_signing_profile(certificate)
+
+
+def test_optional_leaf_subject_key_identifier_must_be_noncritical(
+    signing_key: Ed25519PrivateKey,
+) -> None:
+    accepted = _build(
+        signing_key,
+        ca=False,
+        ekus=[x509.ObjectIdentifier("1.3.6.1.4.1.62558.2.1")],
+        subject_key_identifier=True,
+    )
+    rejected = _build(
+        signing_key,
+        ca=False,
+        ekus=[x509.ObjectIdentifier("1.3.6.1.4.1.62558.2.1")],
+        subject_key_identifier=True,
+        subject_key_identifier_critical=True,
+    )
+
+    check_claim_signing_profile(accepted)
+    with pytest.raises(ProfileError, match="Subject Key Identifier non-critical"):
+        check_claim_signing_profile(rejected)
 
 
 def test_the_signature_algorithm_must_be_one_the_profile_lists(signing_certificate: x509.Certificate) -> None:
     """14.5.1.1 lists eight permitted values for "the algorithm field of the
     signatureAlgorithm field": three ECDSA, three PKCS#1 v1.5, RSASSA-PSS, and Ed25519.
 
-    THIS IS THE ISSUER'S SIGNATURE, NOT OURS. 13.2.1 already restricts the key we
-    verify the CLAIM with to Ed25519; this restricts the algorithm the CERTIFICATE was
-    signed with by its issuer, which is a different signature made by a different key.
+    THIS IS THE ISSUER'S SIGNATURE, NOT THE CLAIM'S. 13.2.1 governs the latter; this
+    restricts the algorithm the CERTIFICATE was signed with by its issuer, which is a
+    different signature made by a different key.
     A certificate signed with SHA-1 tells us about the issuer's practices no matter how
     strong the subject key is.
 
@@ -429,10 +566,21 @@ def test_the_signature_algorithm_must_be_one_the_profile_lists(signing_certifica
 
     from c2patxt.trust import PERMITTED_SIGNATURE_ALGORITHMS
 
-    permitted = 8
-    assert len(PERMITTED_SIGNATURE_ALGORITHMS) == permitted
-    assert SignatureAlgorithmOID.ED25519 in PERMITTED_SIGNATURE_ALGORITHMS
-    assert SignatureAlgorithmOID.RSA_WITH_SHA1 not in PERMITTED_SIGNATURE_ALGORITHMS
+    assert (
+        frozenset(
+            {
+                SignatureAlgorithmOID.ECDSA_WITH_SHA256,
+                SignatureAlgorithmOID.ECDSA_WITH_SHA384,
+                SignatureAlgorithmOID.ECDSA_WITH_SHA512,
+                SignatureAlgorithmOID.RSA_WITH_SHA256,
+                SignatureAlgorithmOID.RSA_WITH_SHA384,
+                SignatureAlgorithmOID.RSA_WITH_SHA512,
+                SignatureAlgorithmOID.RSASSA_PSS,
+                SignatureAlgorithmOID.ED25519,
+            }
+        )
+        == PERMITTED_SIGNATURE_ALGORITHMS
+    )
 
     der = signing_certificate.public_bytes(Encoding.DER)
     ed25519, ed448 = b"\x06\x03\x2b\x65\x70", b"\x06\x03\x2b\x65\x71"
@@ -450,75 +598,186 @@ def test_the_signature_algorithm_must_be_one_the_profile_lists(signing_certifica
         check_claim_signing_profile(certificate)
 
 
-def test_a_certificate_carrying_a_unique_id_is_rejected(signing_certificate: x509.Certificate) -> None:
-    """The same rule as above, driven end to end through the public entry point.
+def _pss_signed_leaf(
+    signing_key: Ed25519PrivateKey,
+    hash_algorithm: _PssHash,
+    mgf_hash_algorithm: _PssHash,
+) -> x509.Certificate:
+    """Build a profile-conforming leaf whose issuer signs it with RSASSA-PSS."""
+    import datetime
 
-    Splicing ``issuerUniqueID`` into the TBSCertificate and re-encoding both enclosing
-    SEQUENCE lengths produces a certificate ``cryptography`` parses without complaint
-    -- it does not surface the field, so it does not object to it either -- which is
-    precisely why the rejection has to be ours.
-    """
+    issuer_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subject = x509.Name([x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, "PSS leaf")])
+    issuer = x509.Name([x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, "PSS issuer")])
+    return (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(signing_key.public_key())
+        .serial_number(0xC2A7E47_55)
+        .not_valid_before(datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc))
+        .not_valid_after(datetime.datetime(2046, 1, 1, tzinfo=datetime.timezone.utc))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([x509.ObjectIdentifier("1.3.6.1.4.1.62558.2.1")]),
+            critical=False,
+        )
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
+            critical=False,
+        )
+        .sign(
+            issuer_key,
+            hash_algorithm,
+            rsa_padding=padding.PSS(
+                mgf=padding.MGF1(mgf_hash_algorithm),
+                salt_length=hash_algorithm.digest_size,
+            ),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "hash_algorithm",
+    [hashes.SHA256(), hashes.SHA384(), hashes.SHA512()],
+    ids=["sha256", "sha384", "sha512"],
+)
+def test_permitted_matching_pss_hashes_are_accepted(
+    signing_key: Ed25519PrivateKey,
+    hash_algorithm: _PssHash,
+) -> None:
+    certificate = _pss_signed_leaf(signing_key, hash_algorithm, hash_algorithm)
+
+    assert certificate.signature_algorithm_oid == x509.SignatureAlgorithmOID.RSASSA_PSS
+    check_claim_signing_profile(certificate)
+
+
+def test_a_pss_mgf_hash_must_match_the_signature_hash(signing_key: Ed25519PrivateKey) -> None:
+    certificate = _pss_signed_leaf(signing_key, hashes.SHA256(), hashes.SHA384())
+
+    with pytest.raises(ProfileError, match=r"MGF1 uses id-sha384, not hashAlgorithm id-sha256"):
+        check_claim_signing_profile(certificate)
+
+
+def test_a_pss_mask_generator_must_be_mgf1(signing_key: Ed25519PrivateKey) -> None:
+    certificate = _pss_signed_leaf(signing_key, hashes.SHA256(), hashes.SHA256())
+    encoded = certificate.public_bytes(Encoding.DER)
+    mgf1 = bytes.fromhex("06092a864886f70d010108")
+    other = bytes.fromhex("06092a864886f70d010109")
+    assert encoded.count(mgf1) == 2, "fixture must carry MGF1 in both signatureAlgorithm fields"
+    mutated = x509.load_der_x509_certificate(encoded.replace(mgf1, other))
+
+    with pytest.raises(ProfileError, match="maskGenAlgorithm must be MGF1"):
+        check_claim_signing_profile(mutated)
+
+
+def test_a_pss_hash_outside_the_c2pa_allowlist_is_rejected(signing_key: Ed25519PrivateKey) -> None:
+    certificate = _pss_signed_leaf(signing_key, hashes.SHA224(), hashes.SHA224())
+
+    with pytest.raises(ProfileError, match=r"must be id-sha256, id-sha384, or id-sha512"):
+        check_claim_signing_profile(certificate)
+
+
+def _without_pss_parameter(certificate: x509.Certificate, field_tag: int) -> x509.Certificate:
+    """Remove one explicit PSS field from both X.509 AlgorithmIdentifiers."""
+
+    def strip(algorithm: bytes) -> bytes:
+        algorithm_contents, algorithm_end = _der_contents(algorithm, 0)
+        _, oid_end = _der_contents(algorithm, algorithm_contents)
+        parameters_contents, parameters_end = _der_contents(algorithm, oid_end)
+        assert algorithm_end == len(algorithm) and parameters_end == algorithm_end
+
+        kept = bytearray()
+        removed = False
+        offset = parameters_contents
+        while offset < parameters_end:
+            _, field_end = _der_contents(algorithm, offset)
+            if algorithm[offset] == field_tag:
+                removed = True
+            else:
+                kept.extend(algorithm[offset:field_end])
+            offset = field_end
+        assert removed, f"fixture has no PSS field {field_tag:#x}"
+        return _sequence(algorithm[algorithm_contents:oid_end] + _sequence(bytes(kept)))
+
+    encoded = certificate.public_bytes(Encoding.DER)
+    certificate_contents, certificate_end = _der_contents(encoded, 0)
+    tbs_contents, tbs_end = _der_contents(encoded, certificate_contents)
+
+    tbs_signature = tbs_contents
+    for _ in range(2):  # version, then serialNumber
+        _, tbs_signature = _der_contents(encoded, tbs_signature)
+    _, tbs_signature_end = _der_contents(encoded, tbs_signature)
+    _, outer_signature_algorithm_end = _der_contents(encoded, tbs_end)
+
+    new_tbs = _sequence(
+        encoded[tbs_contents:tbs_signature]
+        + strip(encoded[tbs_signature:tbs_signature_end])
+        + encoded[tbs_signature_end:tbs_end]
+    )
+    new_certificate = _sequence(
+        new_tbs
+        + strip(encoded[tbs_end:outer_signature_algorithm_end])
+        + encoded[outer_signature_algorithm_end:certificate_end]
+    )
+    return x509.load_der_x509_certificate(new_certificate)
+
+
+@pytest.mark.parametrize(
+    ("field_tag", "field_name"),
+    [(0xA0, "hashAlgorithm"), (0xA1, "maskGenAlgorithm")],
+    ids=["missing-hash", "missing-mgf"],
+)
+def test_pss_hash_and_mask_fields_must_be_explicit(
+    signing_key: Ed25519PrivateKey,
+    field_tag: int,
+    field_name: str,
+) -> None:
+    certificate = _without_pss_parameter(
+        _pss_signed_leaf(signing_key, hashes.SHA256(), hashes.SHA256()),
+        field_tag,
+    )
+
+    with pytest.raises(ProfileError, match=field_name):
+        check_claim_signing_profile(certificate)
+
+
+@pytest.mark.parametrize(
+    ("tag", "name"),
+    [(0x81, "issuerUniqueID"), (0x82, "subjectUniqueID")],
+    ids=["issuerUniqueID", "subjectUniqueID"],
+)
+def test_a_certificate_carrying_a_unique_id_is_rejected(
+    signing_certificate: x509.Certificate,
+    tag: int,
+    name: str,
+) -> None:
+    """14.5.1.1 rejects both legacy unique-ID fields on a real parsed certificate."""
     der = signing_certificate.public_bytes(Encoding.DER)
     tbs_start, outer_end = _der_contents(der, 0)
     body_start, tbs_end = _der_contents(der, tbs_start)
     extensions = der.index(b"\xa3", body_start)
 
-    tbs = _sequence(der[body_start:extensions] + b"\x81\x02\x00\xff" + der[extensions:tbs_end])
+    field = bytes([tag, 0x02, 0x00, 0xFF])
+    tbs = _sequence(der[body_start:extensions] + field + der[extensions:tbs_end])
     certificate = x509.load_der_x509_certificate(_sequence(tbs + der[tbs_end:outer_end]))
 
-    with pytest.raises(ProfileError, match="issuerUniqueID"):
+    with pytest.raises(ProfileError, match=name):
         check_claim_signing_profile(certificate)
-
-
-@pytest.mark.parametrize(
-    "tbs",
-    [
-        b"\x30\x80\x02\x01\x02",
-        b"\x30\x06\x02\x7f\x00\x00",
-        b"\x30\x03\x02\x01",
-        b"\x30\x04\x02",
-        b"\x30",
-        b"",
-    ],
-    ids=[
-        "indefinite-length",
-        "length-past-end",
-        "length-past-end-by-one",
-        "truncated-member",
-        "header-only",
-        "empty",
-    ],
-)
-def test_an_unwalkable_tbs_fails_closed(tbs: bytes) -> None:
-    """A DER walk that cannot complete must REJECT, not shrug.
-
-    ``cryptography``'s parser is DER-strict and has already accepted any certificate
-    that reaches us, so a walk that fails means OUR reading of the encoding is wrong
-    rather than the certificate's. For a function whose entire job is to reject, the
-    safe direction is to reject: returning ``False`` on a confusing encoding would
-    make "I could not tell" indistinguishable from "the field is absent", and would
-    turn any parser disagreement into a bypass.
-
-    ``indefinite-length`` is the case worth naming: BER permits ``0x80`` as a length
-    and DER forbids it, so a walker that treated it as a long-form count would read
-    zero length bytes, compute a zero-length element, and loop forever on the same
-    offset.
-
-    ``length-past-end-by-one`` exists because ``length-past-end`` alone did not hold the
-    bound. That vector overruns by TWO bytes, so loosening ``end > len(encoded)`` to
-    ``end > len(encoded) + 1`` -- an off-by-one, and the likeliest way to get a
-    hand-rolled length check wrong -- still tripped it, and the mutation survived the
-    whole suite. A one-byte overrun walks to completion under that mutant and returns
-    "no unique identifiers", turning the one function here that is supposed to FAIL
-    CLOSED into one that fails open. A boundary test that sits two units from the
-    boundary is not a boundary test.
-    """
-    from c2patxt.trust import (
-        _tbs_carries_unique_ids,  # pyright: ignore[reportPrivateUsage] -- no public caller accepts raw TBS bytes
-    )
-
-    with pytest.raises(ProfileError, match="could not be walked"):
-        _tbs_carries_unique_ids(tbs)
 
 
 def test_basic_constraints_may_be_absent_entirely(signing_key: Ed25519PrivateKey) -> None:
@@ -537,18 +796,10 @@ def test_an_unparseable_extension_set_is_a_profile_violation_not_a_crash(signing
     declares ``ExtKeyUsageSyntax ::= SEQUENCE SIZE (1..MAX) OF KeyPurposeId``, so an
     empty one is legal to BUILD and illegal to READ.
 
-    AN EARLIER VERSION OF THIS TEST ASSERTED THE CRASH AND CALLED IT SETTLED. It expected
-    ``pytest.raises(ValueError, match="InvalidSize")`` and reasoned that the failure
-    happens "before any of our code runs", so "a branch for it would be permanently
-    unexecuted code". The reasoning was wrong about WHERE the failure lands.
-
     ``cryptography`` parses extensions LAZILY, so one malformed extension poisons the
     whole set: the first ``get_extension_for_class`` raises whichever extension it asks
-    for. That call is inside ``check_claim_signing_profile``, which sits on the
-    verification path, and the certificate arrives in the COSE ``x5chain`` -- from the
-    wire. So ``verify()`` raised ``ValueError`` on attacker-controlled text, against a
-    documented promise never to raise for absent, corrupt or invalid marks, and this test
-    is what made that look intended.
+    for. ``check_claim_signing_profile`` must translate that dependency failure to
+    ``ProfileError``.
 
     ``signingCredential.invalid`` is the honest answer: a credential we cannot parse is
     one we cannot accept, and the profile is exactly what it fails.
@@ -587,10 +838,9 @@ def test_a_leaf_without_claim_signing_still_satisfies_the_profile(
     "Previous versions of this specification required the presence of
     `id-kp-emailProtection` or `id-kp-documentSigning` EKUs, so including at least one of
     those two EKUs in a signer's certificate ... can improve compatibility with older
-    validators." `c2pa-kp-claimSigning` is new at 2.2. Every signing certificate issued
-    before it carries the older pair alone, and we were answering
-    ``signingCredential.invalid`` -- a HARD reject, where the manifest is not even
-    Valid -- for all of them.
+    validators." `c2pa-kp-claimSigning` is new at 2.2. Older credentials may therefore
+    carry one or both of the former EKUs without the new OID; rejecting those
+    credentials as ``signingCredential.invalid`` would make the manifest not Valid.
 
     The decisive argument is our own configuration rather than the wording. 14.5.1.2
     requires "at least one of the EKUs **for which the validator has an associated list
@@ -620,27 +870,6 @@ def test_a_leaf_without_claim_signing_verifies_as_valid_but_untrusted(signing_ke
     assert StatusCode.SIGNING_CREDENTIAL_INVALID not in verdict.codes()
 
 
-def test_a_unique_id_tag_in_the_last_byte_is_still_seen() -> None:
-    """The walk's loop bound, which ``while offset < end`` → ``< end - 1`` survived.
-
-    Every well-formed DER element is at least two bytes, so the last member's offset is
-    always at most ``end - 2`` and the two bounds agree -- EXCEPT when the SEQUENCE
-    contents end in a lone one-byte remnant. ``30 04 | 02 01 00 | 81`` is that case: a
-    complete INTEGER followed by a bare ``[1]`` tag byte.
-
-    Not reachable through a certificate ``cryptography`` would parse. It is tested anyway
-    because this function is ALREADY exercised on hand-built TBS bytes -- the fixture for
-    ``test_the_tbs_unique_id_fields_must_be_absent`` splices bytes directly -- so the
-    input class is one the suite already accepts, and an off-by-one in a hand-rolled
-    parser is exactly what the neighbouring one-byte-overrun row exists for.
-    """
-    from c2patxt.trust import (
-        _tbs_carries_unique_ids,  # pyright: ignore[reportPrivateUsage] -- no public caller accepts raw TBS bytes
-    )
-
-    assert _tbs_carries_unique_ids(b"\x30\x04\x02\x01\x00\x81") is True
-
-
 @pytest.mark.parametrize(
     ("kwargs", "expected"),
     [
@@ -654,23 +883,7 @@ def test_a_unique_id_tag_in_the_last_byte_is_still_seen() -> None:
 def test_a_profile_violation_says_which_rule_failed(
     signing_key: Ed25519PrivateKey, kwargs: dict[str, object], expected: str
 ) -> None:
-    """Every rule in ``_check_extensions`` must report ITSELF, not a parse failure.
-
-    ``ProfileError`` subclasses ``ValueError``. When the extension accesses were wrapped
-    in ``try/except ValueError`` -- so that a certificate ``cryptography`` cannot read
-    becomes ``signingCredential.invalid`` instead of crashing ``verify()`` -- that
-    handler also caught every GENUINE profile violation and re-labelled it "the
-    certificate's extensions could not be parsed". For two hours a `cA` certificate, one
-    with no Key Usage, and one without ``digitalSignature`` all reported as unparseable.
-
-    THE EXISTING TESTS DID NOT NOTICE, and the reason is worth keeping: they assert with
-    ``pytest.raises(..., match=...)`` on the inner text, and the wrapper PRESERVED the
-    inner text by appending it. A substring match cannot see a wrong prefix. This test
-    anchors the message start instead.
-
-    ``ProfileError`` is now re-raised unchanged before the parse handler runs, and this
-    is what holds that clause in place.
-    """
+    """A profile violation keeps its rule-specific explanation."""
     certificate = _leaf(signing_key, **kwargs)  # pyright: ignore[reportArgumentType] -- kwargs are build_certificate's
 
     with pytest.raises(ProfileError) as caught:

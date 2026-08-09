@@ -11,10 +11,11 @@ This is Duale AI's implementation of C2PA text marking. It is not a C2PA consort
 release and carries no conformance certification; see the README for what is and is
 not claimed.
 
-No network access, no credential store, no ambient configuration is ever consulted.
-Verification is a pure function of its arguments when the caller supplies
-``VerifyContext.now``; with the default it reads the clock, because certificate validity
-is judged at validation time (15.8), and no log records are emitted.
+Package-owned verification performs no network access, consults no credential store
+or ambient configuration, and emits no log records. It is a pure function of its
+arguments when the caller supplies ``VerifyContext.now`` and an offline deterministic
+trust evaluator; with the defaults it reads the clock because certificate validity is
+judged at validation time (15.8).
 
 Usage::
 
@@ -26,8 +27,8 @@ Usage::
         Disclosure(media_type="text/plain", model_type=ModelType.GENERIC),
     )
 
-``marked`` renders exactly as ``text`` does -- the mark is zero-width -- and carries
-a signed Content Credential any third party can check::
+``marked`` is ``NFC(text)`` followed by selectors designed to be visually
+non-rendering, and carries a signed Content Credential any third party can check::
 
     from c2patxt import Provenance, verify
 
@@ -36,7 +37,7 @@ a signed Content Credential any third party can check::
         case Provenance.TRUSTED:
             ...  # signature verifies and chains to an anchor you supplied
         case Provenance.VALID:
-            ...  # intact, but the signer is not corroborated -- see below
+            ...  # signature and normalized-text binding validate; signer not corroborated
         case Provenance.INVALID:
             ...  # a mark is present and failed validation
         case Provenance.UNMARKED:
@@ -61,8 +62,8 @@ from c2patxt._embed import AlreadyMarkedError, EmbedContext, embed
 from c2patxt._extract import extract
 from c2patxt._locate import Span, locate, strip
 from c2patxt._verify import VerifyContext, verify
-from c2patxt.constants import MAX_JUMBF_DEPTH, MAX_MANIFEST_LENGTH, MAX_SELECTOR_RUN
-from c2patxt.exceptions import C2paTextError, MarkCorruptError, UnencodableTextError
+from c2patxt.constants import MAX_CBOR_DEPTH, MAX_MANIFEST_LENGTH, MAX_NONSTARTERS, MAX_SELECTOR_RUN
+from c2patxt.exceptions import C2paTextError, MarkCorruptError, TextNormalizationError, UnencodableTextError
 from c2patxt.manifest import ManifestStore
 from c2patxt.signing import C2PA_CLAIM_SIGNING_EKU, MODEL_TYPES, Disclosure, ModelType, Signer
 from c2patxt.status import Status, StatusCode, StatusKind
@@ -71,12 +72,11 @@ from c2patxt.verdict import Provenance, Verdict
 
 __all__ = [
     "C2PA_CLAIM_SIGNING_EKU",
-    # The three allocation bounds. Exported because SECURITY.md commits to bounded
-    # allocation and an operator sizing a deployment needs the numbers, not a promise
-    # -- and because there is deliberately NO bound on input length, so the caller owns
-    # body-size limiting and has to know where our bounds stop and theirs must start.
-    "MAX_JUMBF_DEPTH",
+    # The four component bounds. There is deliberately no input-length bound, so the
+    # caller still owns request-body limiting.
+    "MAX_CBOR_DEPTH",
     "MAX_MANIFEST_LENGTH",
+    "MAX_NONSTARTERS",
     "MAX_SELECTOR_RUN",
     "MODEL_TYPES",
     "AlreadyMarkedError",
@@ -93,6 +93,7 @@ __all__ = [
     "Status",
     "StatusCode",
     "StatusKind",
+    "TextNormalizationError",
     "TrustEvaluator",
     "UnencodableTextError",
     "Verdict",

@@ -15,25 +15,38 @@ raises on the common case is one people wrap in a bare ``except``, and a bare
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 from c2patxt import _cbor, _jumbf
 from c2patxt._jumbf import JumbfBox, JumbfError, parse_superbox
 from c2patxt._locate import find_wrappers
 from c2patxt.exceptions import MarkCorruptError
 from c2patxt.manifest import (
+    ASSERTION_REPOSITORY_RECEIPT,
     LABEL_ASSERTION_STORE,
     LABEL_CLAIM,
     LABEL_CLAIM_SIGNATURE,
+    LABEL_MANIFEST_STORE,
+    UUID_ASSERTION_STORE,
+    UUID_CLAIM,
+    UUID_CLAIM_SIGNATURE,
+    UUID_MANIFEST,
+    UUID_MANIFEST_STORE,
     ManifestStore,
 )
 from c2patxt.status import StatusCode
 
-__all__ = [
-    "extract",
-    "parse_manifest_store",
-]
-
 _SUPERBOX_HEADER = 8
+_UUID_LEGACY_MANIFEST = _jumbf.content_type_uuid(b"c2md")
+_UUID_COMPRESSED_MANIFEST = _jumbf.content_type_uuid(b"c2cm")
+_UUID_UPDATE_MANIFEST = _jumbf.content_type_uuid(b"c2um")
+_STANDARD_MANIFEST_UUIDS = frozenset((UUID_MANIFEST, _UUID_LEGACY_MANIFEST))
+_C2PA_MANIFEST_UUIDS = frozenset((*_STANDARD_MANIFEST_UUIDS, _UUID_COMPRESSED_MANIFEST, _UUID_UPDATE_MANIFEST))
+_MANIFEST_PART_UUIDS = {
+    LABEL_ASSERTION_STORE: UUID_ASSERTION_STORE,
+    LABEL_CLAIM: UUID_CLAIM,
+    LABEL_CLAIM_SIGNATURE: UUID_CLAIM_SIGNATURE,
+}
 
 
 def _reparse(payload: bytes) -> tuple[JumbfBox, int]:
@@ -46,23 +59,35 @@ def _reparse(payload: bytes) -> tuple[JumbfBox, int]:
     return parse_superbox(header + payload)
 
 
-def _children(box: JumbfBox, what: str) -> dict[str, JumbfBox]:
-    """Parse every nested superbox child, keyed by its label.
+def _require_c2pa_description(box: JumbfBox, what: str) -> str:
+    """Return the label after requiring both C2PA description toggles."""
+    label = box.description.label
+    if label is not None and box.description.requestable:
+        return label
+    msg = f"{what} must set both the JUMBF Label Present and Requestable toggles"
+    raise MarkCorruptError(msg, 0, code=StatusCode.GENERAL_ERROR)
 
-    Children whose type UUID we do not recognise are not rejected, per C2PA 11.1.2's
-    processing rules -- a conforming producer may emit boxes a given consumer has never
-    heard of. Boxes are keyed by LABEL and the type UUID is never consulted here.
 
-    That is also how C2PA 11.2.2 is satisfied: "Manifest Consumers shall also accept
-    standard C2PA Manifests specified with JUMBF type UUID 63326D64-... (c2md), but
-    claim generators shall not create manifests with this JUMBF type UUID." We read a
-    manifest under either type and continue to emit c2ma, without a UUID list -- a
-    constant naming c2md would assert a check that does not exist.
+def _children(
+    box: JumbfBox,
+    what: str,
+    recognizes: Callable[[JumbfBox], bool] | None = None,
+) -> dict[str, JumbfBox]:
+    """Parse recognized nested superboxes, keyed by label.
+
+    C2PA 11.1.2 requires a consumer to skip the contents of an unrecognized JUMBF
+    type. Recognition therefore happens before duplicate-label handling: an unknown
+    future box cannot shadow a known structural box merely by copying its label.
     """
-    return {label: child for label, (child, _) in _children_with_bytes(box, what).items()}
+    return {label: child for label, (child, _) in _children_with_bytes(box, what, recognizes=recognizes).items()}
 
 
-def _children_with_bytes(box: JumbfBox, what: str) -> dict[str, tuple[JumbfBox, bytes]]:
+def _children_with_bytes(
+    box: JumbfBox,
+    what: str,
+    *,
+    recognizes: Callable[[JumbfBox], bool] | None = None,
+) -> dict[str, tuple[JumbfBox, bytes]]:
     """As :func:`_children`, but keeping each child's RAW hashable bytes.
 
     The bytes are the nested superbox payload -- the serialized box with its own
@@ -71,34 +96,70 @@ def _children_with_bytes(box: JumbfBox, what: str) -> dict[str, tuple[JumbfBox, 
     would hash OUR encoding of the box, not the bytes that actually arrived, and an
     attacker who can make those two differ can substitute an assertion at will.
 
-    A DUPLICATE LABEL IS REJECTED, NOT OVERWRITTEN. This returns a label-keyed map,
-    and plainly assigning into it -- last write wins -- silently discards a box and
-    defeats three separate checks built on top:
-
-      * the "more than one manifest" count, since two manifests sharing a label
-        collapsed to one and never tripped it;
-      * the "every assertion in the store is linked by the claim" guard, since the
-        smuggled box vanished from the set being compared;
-      * 15.6.1's "only one c2pa.claim.v2 box per manifest" rule, for the same reason.
-
-    Beyond those, collapsing is a producer/consumer DIVERGENCE in its own right: a
-    third-party JUMBF reader may take the FIRST box where we took the last, so two
-    conforming implementations would authenticate different content from identical
-    bytes. Rejecting is the only answer that keeps them in agreement.
+    A duplicate label inside one structural map is rejected, not overwritten. Otherwise
+    a later assertion or claim box could silently replace the bytes the signed links
+    name. Manifest-store selection is handled separately by 15.5.1, before this helper.
     """
     out: dict[str, tuple[JumbfBox, bytes]] = {}
     for tbox, payload in box.content:
         if tbox != _jumbf.TBOX_SUPERBOX:
             continue
         child, _ = _reparse(payload)
-        label = child.description.label
-        if label is None:
+        label = _require_c2pa_description(child, f"a child of {what}")
+        if recognizes is not None and not recognizes(child):
             continue
         if label in out:
             msg = f"{what} contains more than one box labelled {label!r}"
-            raise MarkCorruptError(msg, "", 0, StatusCode.CLAIM_MULTIPLE)
+            if label == LABEL_CLAIM:
+                code = StatusCode.CLAIM_MULTIPLE
+            elif what == "the assertion store":
+                # 8.4.1 makes a duplicated assertion-label path unresolved. It is not
+                # a second claim box, so 15.6.1's claim.multiple does not apply.
+                code = StatusCode.ASSERTION_MISSING
+            else:
+                code = StatusCode.GENERAL_ERROR
+            raise MarkCorruptError(msg, 0, code=code)
         out[label] = (child, payload)
     return out
+
+
+def _is_standard_manifest(box: JumbfBox) -> bool:
+    """Recognize the current and legacy Standard Manifest UUIDs from 11.2.2."""
+    return box.description.uuid in _STANDARD_MANIFEST_UUIDS
+
+
+def _is_c2pa_manifest(box: JumbfBox) -> bool:
+    """Recognize every C2PA Manifest type that participates in active selection."""
+    return box.description.uuid in _C2PA_MANIFEST_UUIDS
+
+
+def _is_manifest_part(box: JumbfBox) -> bool:
+    """Recognize a structural manifest child by both its label and type UUID."""
+    label = box.description.label
+    return label is not None and _MANIFEST_PART_UUIDS.get(label) == box.description.uuid
+
+
+def _active_manifest(store: JumbfBox) -> JumbfBox:
+    """Select the last C2PA Manifest, then require a manifest type we implement."""
+    manifest: JumbfBox | None = None
+    for tbox, payload in store.content:
+        if tbox != _jumbf.TBOX_SUPERBOX:
+            continue
+        child, _ = _reparse(payload)
+        if not _is_c2pa_manifest(child):
+            continue
+        _require_c2pa_description(child, "a C2PA Manifest")
+        manifest = child
+    if manifest is None:
+        msg = "manifest store contains no manifest"
+        raise MarkCorruptError(msg, 0)
+
+    # 15.5.1 selects the last C2PA Manifest before its type-specific validation.
+    if not _is_standard_manifest(manifest):
+        kind = manifest.description.uuid[:4].decode("ascii")
+        msg = f"active C2PA Manifest type {kind} is not supported"
+        raise MarkCorruptError(msg, 0, code=StatusCode.GENERAL_ERROR)
+    return manifest
 
 
 def _base_label(label: str) -> str:
@@ -117,119 +178,63 @@ def _base_label(label: str) -> str:
     return base if separator and index.isdigit() else label
 
 
+def _reject_json_constant(value: str) -> object:
+    """Reject the non-finite number names accepted by Python but forbidden by JSON."""
+    msg = f"{value} is not an RFC 8259 JSON number"
+    raise ValueError(msg)
+
+
 def _json_ld_assertion(box: JumbfBox, label: str) -> _cbor.CborValue | None:
-    """Decode a ``c2pa.metadata`` assertion's JSON-LD box, or None if this is not one.
+    """Decode an assertion whose specified content type is JSON-LD.
 
-    ONE EXCEPTION TO THE CBOR RULE, and it is required rather than tolerated. 18.17.2:
-    "Each metadata assertion shall contain a single JSON content type box containing
-    the JSON-LD serialization of one or more metadata values." Table 7 (18.4) lists
-    ``c2pa.metadata`` as JSON-LD -- along with ``c2pa.repository-receipt``, which we
-    neither emit nor read, and Embedded File entries for ingredients and thumbnails. So
-    the scoping below is ours: ``c2pa.metadata`` is the only JSON-LD assertion this
-    package handles, not the only one the specification defines.
-    Refusing it made a CONFORMING producer's manifest read as invalid here -- and it
-    is the very assertion the text conformance rubric's ``text:is_text_asset`` check
-    reads.
-
-    Scoped to labels whose BASE ends ``.metadata`` -- 18.17.2's own naming rule, read
-    through 6.4's ``__N`` convention, so ``c2pa.metadata__1`` is recognised. It was
-    scoped to the bare label, so a second metadata assertion landed in
-    ``assertion_bytes`` and never in ``assertions``: a store with two conflicting
-    ``dc:format`` values verified VALID while a consumer saw one of them. NOT
-    widened to "any json box" -- the caller's guard against unparseable assertions
-    keeps doing its job everywhere else.
+    C2PA 18.17.2 requires each metadata assertion to contain exactly one JSON
+    content box. Table 7 also defines ``c2pa.repository-receipt`` as JSON-LD. The
+    ``__N`` suffix handling follows 6.4, while other custom JSON assertions remain
+    opaque to this standard-assertion parser.
 
     Raises:
-        MarkCorruptError: the JSON is not well-formed, or is well-formed and not an
-            object. Both carry ``assertion.json.invalid``, which 15.10.3.1 names for
-            exactly this ("not well-formed CBOR or is non-conforming JSON"). Returning
-            None for either would report the assertion as carrying no JSON-LD, which is
-            a different and untrue statement.
+        MarkCorruptError: the JSON is not well-formed. It carries
+            ``assertion.json.invalid``, which 15.10.3.1 names for non-conforming JSON.
+            RFC 8259 defines a JSON text as any serialized JSON value, so arrays,
+            strings, numbers, booleans and null are not rejected here as a schema
+            check.
     """
-    if not _base_label(label).endswith(".metadata"):
+    base = _base_label(label)
+    if not base.endswith(".metadata") and base != ASSERTION_REPOSITORY_RECEIPT:
         return None
-    payload = _content(box, b"json")
-    if payload is None:
-        return None
+    if len(box.content) != 1 or box.content[0][0] != b"json":
+        msg = f"assertion {label!r} must contain exactly one JSON content box"
+        raise MarkCorruptError(msg, 0, code=StatusCode.ASSERTION_JSON_INVALID)
+    payload = box.content[0][1]
     try:
-        decoded: object = json.loads(payload)
-    except ValueError as exc:
+        # json.loads without object hooks returns exactly the scalar/list/text-keyed
+        # map union CborValue accepts. Traversing the full attacker tree again merely
+        # to restate that stdlib contract would double the parse work.
+        return json.loads(payload, parse_constant=_reject_json_constant)  # pyright: ignore[reportAny]
+    except (RecursionError, ValueError) as exc:
         # 15.10.3.1 names a code for each serialization: "not well-formed CBOR or is
         # non-conforming JSON... assertion.cbor.invalid or assertion.json.invalid".
         # assertion.missing would say the store LACKS an assertion the claim named; the
         # store has it, and it does not parse.
         msg = f"assertion {label!r} is not well-formed JSON"
-        raise MarkCorruptError(msg, "", 0, StatusCode.ASSERTION_JSON_INVALID) from exc
-    if not isinstance(decoded, dict):
-        msg = f"assertion {label!r} is not a JSON object"
-        raise MarkCorruptError(msg, "", 0, StatusCode.ASSERTION_JSON_INVALID)
-    return _as_cbor_map(decoded)  # pyright: ignore[reportUnknownArgumentType]
+        raise MarkCorruptError(msg, 0, code=StatusCode.ASSERTION_JSON_INVALID) from exc
 
 
-def _as_cbor_map(mapping: object) -> dict[int | str | bytes, _cbor.CborValue]:
-    """THE ONE Any BOUNDARY IN THIS PACKAGE, confined to three lines.
-
-    ``json.loads`` is typed as returning ``Any``, so pyright cannot see the element
-    types of a decoded object no matter how it is annotated. The suppressions below
-    are scoped to the two expressions that touch that value; every element then goes
-    through :func:`_as_cbor_value`, which narrows by ``isinstance`` at RUNTIME, so
-    nothing untyped escapes this function.
-
-    The alternative -- ``cast`` -- is banned repo-wide precisely because it asserts a
-    type instead of checking one. This checks.
-    """
-    if not isinstance(mapping, dict):  # pragma: no cover - caller has already checked
-        msg = "expected a JSON object"
-        raise MarkCorruptError(msg, "", 0, StatusCode.ASSERTION_MISSING)
-    pairs = mapping.items()  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-    out: dict[int | str | bytes, _cbor.CborValue] = {}
-    for key, value in pairs:  # pyright: ignore[reportUnknownVariableType]
-        out[str(key)] = _as_cbor_value(value)  # pyright: ignore[reportUnknownArgumentType]
-    return out
-
-
-def _as_cbor_value(value: object) -> _cbor.CborValue:
-    """Narrow a JSON-decoded value into the CBOR value union.
-
-    JSON and CBOR agree on every type we can receive here -- null, bool, number,
-    string, array, object -- so this is a typing bridge, not a conversion.
-
-    FLOATS ARE CARRIED AS FLOATS. They were rendered as their text form, on the
-    reasoning that "a float is the one JSON type our CBOR union does not carry" -- true
-    until ``CborValue`` gained ``float``, after which the same signed coordinate had two
-    Python types depending on which box carried it: 0.5 from a CBOR assertion, "0.5"
-    from a JSON-LD one. A consumer comparing a region across the two forms would find
-    them unequal.
-
-    The final ``repr`` remains for anything neither branch admits -- which ``json``
-    cannot currently produce, and which is narrowed rather than trusted.
-    """
-    if value is None or isinstance(value, (bool, int, float, str, bytes)):
-        return value
-    if isinstance(value, list):
-        items = list(value)  # pyright: ignore[reportUnknownArgumentType, reportUnknownVariableType]
-        return [_as_cbor_value(item) for item in items]  # pyright: ignore[reportUnknownVariableType, reportUnknownArgumentType]
-    if isinstance(value, dict):
-        return _as_cbor_map(value)  # pyright: ignore[reportUnknownArgumentType]
-    return repr(value)
-
-
-def _content(box: JumbfBox, tbox: bytes) -> bytes | None:
+def _content(
+    box: JumbfBox,
+    tbox: bytes,
+    *,
+    duplicate_code: StatusCode = StatusCode.GENERAL_ERROR,
+) -> bytes | None:
     """The single content box of type ``tbox``, or None if the box carries none.
 
-    A DUPLICATE IS REJECTED, NOT RESOLVED FIRST-WINS. `_children_with_bytes` rejects
-    two boxes under one LABEL and states the reason: "a third-party JUMBF reader may
-    take the FIRST box where we took the last, so two conforming implementations would
-    authenticate different content from identical bytes." That argument applies
-    unchanged one level down -- two cbor boxes in one assertion is the same ambiguity
-    at a smaller scale, and the bytes hash identically either way -- so resolving it silently is not an option here
-    either.
+    A duplicate is rejected rather than resolved first-wins because two content boxes
+    of the same type leave no defined authenticated value.
 
     Raises:
         MarkCorruptError: the box carries more than one content box of that type,
-            reported as ``claim.multiple`` for the same reason a duplicated label is:
-            15.6.1 names it for a duplicate, and the fault is ambiguity rather than
-            byte damage to the carrier.
+            reported with the caller's format-specific code. C2PA 15.6.1 reserves
+            ``claim.multiple`` for multiple recognized claim boxes, not content boxes.
     """
     found: bytes | None = None
     for kind, payload in box.content:
@@ -238,7 +243,7 @@ def _content(box: JumbfBox, tbox: bytes) -> bytes | None:
         if found is not None:
             label = box.description.label
             msg = f"assertion {label!r} carries more than one {tbox.decode('ascii')} content box"
-            raise MarkCorruptError(msg, "", 0, StatusCode.CLAIM_MULTIPLE)
+            raise MarkCorruptError(msg, 0, code=duplicate_code)
         found = payload
     return found
 
@@ -246,7 +251,7 @@ def _content(box: JumbfBox, tbox: bytes) -> bytes | None:
 def _parse_assertions(assertion_store: JumbfBox | None) -> tuple[dict[str, _cbor.CborValue], dict[str, bytes]]:
     """Decode every assertion, returning both the values and the raw box bytes.
 
-    The RAW BYTES are what 8.4.2.3 hashes, so they are carried alongside the decoded
+    The raw bytes are what 8.4.2.3 hashes, so they are carried alongside the decoded
     values rather than re-serialized later: re-encoding a decoded assertion would hash
     our encoder's output instead of what actually arrived, which is the whole point of
     the hashed-URI check.
@@ -255,23 +260,16 @@ def _parse_assertions(assertion_store: JumbfBox | None) -> tuple[dict[str, _cbor
     is where that is reported.
 
     Raises:
-        MarkCorruptError: an assertion's ``cbor`` box is not well-formed CBOR
-            (``assertion.cbor.invalid``, 15.10.3.1), or a ``.metadata`` assertion's
-            ``json`` box is not a well-formed JSON object (``assertion.json.invalid``),
-            or the assertion store holds TWO BOXES UNDER ONE LABEL, which
-            ``_children_with_bytes`` reports as ``claim.multiple``.
+        MarkCorruptError: an assertion's ``cbor`` box is invalid CBOR
+            (``assertion.cbor.invalid``, 15.10.3.1), or a JSON-LD assertion's ``json``
+            box is not well-formed JSON (``assertion.json.invalid``),
+            or the assertion store holds two boxes under one label, which makes the
+            claim's linked assertion path unresolved and reports ``assertion.missing``.
 
-            That third path was missing here, and its absence is worse than an ordinary
-            gap: the code says *claim*, so a reader handed ``claim.multiple`` for a
-            duplicated ASSERTION label goes looking at the claim box. The code is the
-            one 15.6.1 names for a duplicated label and we apply it to both, but a
-            reader cannot infer that from a block that does not mention it.
-
-    An assertion carrying NEITHER -- a ``bfdb``/``bidb``/``uuid`` box, say -- does not
+    An assertion carrying neither -- a ``bfdb``/``bidb``/``uuid`` box, for example -- does not
     raise. It keeps its raw bytes, so the hashed URI still authenticates it and the
     undeclared check still sees it, and simply has no decoded value. 11.1.4 permits any
-    JUMBF content type in an assertion, and refusing them made a conforming manifest
-    unparseable.
+    JUMBF content type in an assertion.
     """
     assertions: dict[str, _cbor.CborValue] = {}
     assertion_bytes: dict[str, bytes] = {}
@@ -279,22 +277,18 @@ def _parse_assertions(assertion_store: JumbfBox | None) -> tuple[dict[str, _cbor
         return assertions, assertion_bytes
 
     for label, (box, raw_box) in _children_with_bytes(assertion_store, "the assertion store").items():
-        # EVERY assertion is recorded by its raw bytes, whatever it carries. That is
-        # what keeps the guard closed: the hole fixed earlier was a non-cbor box
-        # vanishing from this map, so the claim's "every assertion is linked" check
-        # never saw it. Hashing works on bytes and never needed the decode.
+        # Record every assertion by raw bytes, whatever content type it carries.
         assertion_bytes[label] = raw_box
 
-        # JSON-LD FIRST for a metadata assertion. 18.17.2: it "shall contain a single
-        # JSON content type box". Trying cbor first meant that an assertion carrying
-        # BOTH decoded as CBOR here while a peer following 18.17.2 read the JSON --
-        # identical bytes, different content, both hash-matching, neither side raising.
+        # JSON-LD FIRST for a metadata assertion. 18.17.2 says it "shall contain a
+        # single JSON content type box". A second content representation would leave
+        # the authenticated assertion value ambiguous.
         metadata = _json_ld_assertion(box, label)
         if metadata is not None:
             assertions[label] = metadata
             continue
 
-        payload = _content(box, b"cbor")
+        payload = _content(box, b"cbor", duplicate_code=StatusCode.ASSERTION_CBOR_INVALID)
         if payload is None:
             # 11.1.4: an assertion's content box "should be CBOR ..., JSON ..., Embedded
             # File Content Type (bfdb & bidb) or UUID Content Type (uuid) though any
@@ -305,7 +299,14 @@ def _parse_assertions(assertion_store: JumbfBox | None) -> tuple[dict[str, _cbor
             # unable to reach the box it validates.
             continue
         try:
-            assertions[label] = _cbor.loads(payload)
+            # 18.1 constrains what a claim generator EMITS. The validator rule in
+            # 15.10.3.1 is narrower: reject content that is not well-formed CBOR,
+            # with well-formed defined by RFC 8949 Appendix C. Accept a well-formed,
+            # non-deterministic serialization and authenticate its exact raw box bytes;
+            # re-encoding here would change what the hashed URI covers. The decoder
+            # also rejects duplicate map keys, which RFC 8949 calls invalid even when
+            # their bytes satisfy the well-formed grammar.
+            assertions[label] = _cbor.loads(payload, deterministic=False)
         except _cbor.CborDecodeError as exc:
             # 15.10.3.1: "If the content of a standard assertion is not well-formed
             # CBOR or is non-conforming JSON, the claim shall be rejected with a
@@ -314,8 +315,8 @@ def _parse_assertions(assertion_store: JumbfBox | None) -> tuple[dict[str, _cbor
             # handler in parse_manifest_store would report
             # manifest.text.corruptedWrapper, which is 15.12.1.3.2's code for a damaged
             # selector run, not for an intact wrapper around a malformed assertion.
-            msg = f"assertion {label!r} is not well-formed CBOR: {exc}"
-            raise MarkCorruptError(msg, "", 0, StatusCode.ASSERTION_CBOR_INVALID) from exc
+            msg = f"assertion {label!r} is not valid CBOR: {exc}"
+            raise MarkCorruptError(msg, 0, code=StatusCode.ASSERTION_CBOR_INVALID) from exc
     return assertions, assertion_bytes
 
 
@@ -329,29 +330,21 @@ def parse_manifest_store(raw: bytes) -> ManifestStore:
             the C2PA status code.
     """
     try:
-        store, _ = parse_superbox(raw)
-        manifests = _children(store, "the manifest store")
-        if not manifests:
-            msg = "manifest store contains no manifest"
-            raise MarkCorruptError(msg, "", 0)
+        store, end = parse_superbox(raw)
+        if end != len(raw):
+            msg = f"the C2PA Manifest Store ends at byte {end}, before its {len(raw)}-byte payload"
+            raise MarkCorruptError(msg, 0)
+        if store.description.uuid != UUID_MANIFEST_STORE or store.description.label != LABEL_MANIFEST_STORE:
+            msg = "the outer superbox is not a recognized C2PA manifest store"
+            raise MarkCorruptError(msg, 0)
+        _require_c2pa_description(store, "the C2PA Manifest Store")
 
         # 15.5.1: "The last C2PA Manifest superbox in the C2PA Manifest Store
-        # superbox shall be considered the active manifest." We follow it rather than
-        # rejecting plural manifests, and the reasoning changed once the duplicate-
-        # Rejecting len(manifests) > 1 looks safer -- picking one silently seems to
-        # let an attacker append a manifest and have different consumers read
-        # different claims -- but the rule is DETERMINISTIC, so every conforming
-        # consumer picks the same one, and the divergence would come from our own
-        # departure rather than from the rule. Appending anything also grows the
-        # wrapper, which breaks the exclusion range, so the hard binding rejects it
-        # regardless.
-        #
-        # Duplicate LABELS are the exploitable case, and _children_with_bytes refuses
-        # them outright. That is the check doing the security work here; this line is
-        # spec conformance.
-        label = list(manifests)[-1]
-        manifest = manifests[label]
-        parts = _children(manifest, f"manifest {label}")
+        # superbox shall be considered the active manifest." Do not collapse the store
+        # into a label-keyed map before applying that ordered rule.
+        manifest = _active_manifest(store)
+        label = _require_c2pa_description(manifest, "the active C2PA Manifest")
+        parts = _children(manifest, f"manifest {label}", _is_manifest_part)
 
         # 15.11.3.3: "Locate the claim, as described in Locating and Validating the
         # Claim. If unable to, reject claim with a claim.missing failure code." BOTH
@@ -363,11 +356,11 @@ def parse_manifest_store(raw: bytes) -> ManifestStore:
         claim_box = parts.get(LABEL_CLAIM)
         if claim_box is None:
             msg = f"manifest carries no {LABEL_CLAIM} box"
-            raise MarkCorruptError(msg, "", 0, StatusCode.CLAIM_MISSING)
-        claim_bytes = _content(claim_box, b"cbor")
+            raise MarkCorruptError(msg, 0, code=StatusCode.CLAIM_MISSING)
+        claim_bytes = _content(claim_box, b"cbor", duplicate_code=StatusCode.CLAIM_MALFORMED)
         if claim_bytes is None:
             msg = "claim box carries no cbor content box"
-            raise MarkCorruptError(msg, "", 0, StatusCode.CLAIM_MISSING)
+            raise MarkCorruptError(msg, 0, code=StatusCode.CLAIM_MISSING)
 
         signature_box = parts.get(LABEL_CLAIM_SIGNATURE)
         signature = _content(signature_box, b"cbor") if signature_box is not None else None
@@ -375,33 +368,39 @@ def parse_manifest_store(raw: bytes) -> ManifestStore:
             # 15.7 names a code for exactly this, so the carrier's default is wrong
             # here: the wrapper is intact and the signature box is the thing absent.
             msg = f"manifest carries no {LABEL_CLAIM_SIGNATURE} box"
-            raise MarkCorruptError(msg, "", 0, StatusCode.CLAIM_SIGNATURE_MISSING)
+            raise MarkCorruptError(msg, 0, code=StatusCode.CLAIM_SIGNATURE_MISSING)
 
         try:
-            claim = _cbor.loads(claim_bytes)
+            # 10.1 requires deterministic output from a generator. Validation in
+            # 15.6.2 instead rejects claims that are not well-formed CBOR, as RFC
+            # 8949 Appendix C defines that term. Keep the received bytes verbatim
+            # for signature verification and accept well-formed alternative encodings
+            # rather than imposing the producer rule on a reader. Duplicate map keys
+            # remain invalid under RFC 8949 even when the grammar can parse them.
+            claim = _cbor.loads(claim_bytes, deterministic=False)
         except _cbor.CborDecodeError as exc:
             # 15.6.2: "If the content of the claim is not well-formed CBOR, the claim
             # shall be rejected with a failure code of claim.cbor.invalid." Caught
             # HERE rather than by the blanket handler below, which would report
             # manifest.text.corruptedWrapper and send an investigator looking for
             # selector-run damage that is not present.
-            msg = f"the claim is not well-formed CBOR: {exc}"
-            raise MarkCorruptError(msg, "", 0, StatusCode.CLAIM_CBOR_INVALID) from exc
+            msg = f"the claim is not valid CBOR: {exc}"
+            raise MarkCorruptError(msg, 0, code=StatusCode.CLAIM_CBOR_INVALID) from exc
         if not isinstance(claim, dict):
             # 15.6.2 separates the two: claim.cbor.invalid is for bytes that are not
             # well-formed CBOR, claim.malformed for a claim that DECODED and is the
             # wrong shape. An array where a map belongs is the second -- the CBOR is
             # impeccable and the claim is not a claim.
             msg = "claim is not a CBOR map"
-            raise MarkCorruptError(msg, "", 0, StatusCode.CLAIM_MALFORMED)
+            raise MarkCorruptError(msg, 0, code=StatusCode.CLAIM_MALFORMED)
 
         assertion_store = parts.get(LABEL_ASSERTION_STORE)
         assertions, assertion_bytes = _parse_assertions(assertion_store)
 
-    except (JumbfError, _cbor.CborDecodeError) as exc:
+    except JumbfError as exc:
         # One exception type for the caller. The underlying position is preserved in
         # the message rather than being silently dropped.
-        raise MarkCorruptError(f"malformed manifest store: {exc}", "", 0) from exc
+        raise MarkCorruptError(f"malformed manifest store: {exc}", 0) from exc
 
     return ManifestStore(
         manifest_label=label,
@@ -426,18 +425,15 @@ def extract(text: str) -> ManifestStore | None:
             (``manifest.text.multipleWrappers``). Absence of a mark is not an error and
             never raises.
 
-    PLURAL WRAPPERS ARE REFUSED, matching :func:`verify`. Returning the first would hand
-    back attacker-chosen provenance: an attacker appends the second wrapper, so they
-    choose which is first by choosing what to prepend, and docs/deviations.md rejects
-    exactly that reading -- "lets an attacker append a wrapper and choose which one a
-    given consumer reads". A caller who wants to INSPECT a suspicious document should use
-    :func:`locate`, which returns a span rather than a manifest and documents its own
-    first-wrapper choice.
+    Plural wrappers are refused because extraction performs no binding validation and
+    therefore cannot apply 15.12.1.3.1's exclusion-based selection. Use :func:`verify`
+    to select and authenticate a matching manifest. Use :func:`locate` to inspect
+    wrapper spans without choosing a manifest.
     """
     matches = find_wrappers(text)
     if not matches:
         return None
     if len(matches) > 1:
         msg = f"text carries {len(matches)} wrappers; exactly one is required"
-        raise MarkCorruptError(msg, "", 0, StatusCode.TEXT_MULTIPLE_WRAPPERS)
+        raise MarkCorruptError(msg, 0, code=StatusCode.TEXT_MULTIPLE_WRAPPERS)
     return parse_manifest_store(matches[0].payload)
