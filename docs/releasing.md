@@ -9,9 +9,8 @@ filter excludes tag pushes.
    stale in a checkout.
 2. Tag that commit `vX.Y.Z` and push the tag. Nothing runs yet; the tag exists so the
    next step can point at it, and so `cicd/version.sh` can find it.
-3. Create a GitHub Release for that tag. **This is the step that publishes.** Write the
-   notes there, and say what was evaluated and rejected as well as what shipped — a
-   release nobody can read the reasoning for gets the same question asked again.
+3. Create a GitHub Release for that tag. **This is the step that publishes.** Put the
+   user-visible changes and compatibility notes in the release body.
 
 The workflow file is read from the **tagged commit**, not from `main`. A fix landed on
 `main` after the tag does nothing for that release, and re-running the failed run
@@ -27,16 +26,13 @@ What then happens. Every job needs `build`, and the publish chain is sequential:
 | `upload-release` | attaches artifacts and SBOMs to the Release | `release` event, after PyPI |
 
 **`build` runs again at release time, and that run is the one that ships.**
-`publish-testpypi` downloads the `dist` artifact with no `run-id`, so it takes it from
-the current workflow run — not from the earlier push to `main`. Two consequences a
-maintainer should expect rather than discover:
+`publish-testpypi` downloads `dist` from that workflow run. Two consequences follow:
 
-- the build's two hard assertions are live gates at release time, not formalities
-  already passed: the wheel-content check and `test "$COMPONENTS" -le 8` on the SBOM;
-- the two builds inject **different versions**. On a push to `main`, `git describe`
-  resolves to the *previous* tag; on the release event the checkout is at the tagged
-  commit and resolves to the new one. So the `main` build exercises the chain — which
-  is why it exists — but it is not the artifact.
+- the build's artifact-presence checks, `twine check`, and
+  `test "$COMPONENTS" -le 8` SBOM cap are live release gates, not formalities already
+  passed;
+- a push to `main` may resolve the previous tag, while the release event resolves the
+  release tag. The push build exercises the chain but is not the published artifact.
 
 TestPyPI gating PyPI is deliberate: an upload that fails only on the real index is one
 that cannot be retried under the same version, because PyPI filenames are immutable.
@@ -44,17 +40,10 @@ that cannot be retried under the same version, because PyPI filenames are immuta
 `workflow_dispatch` runs `build` alone. Useful for exercising the chain without
 publishing.
 
-**Before the first release**, both the `testpypi` and `pypi` environments need a
-trusted publisher configured on the respective index. Three fields have to match
-exactly, and a mismatch in any of them is the standard first-release failure:
+Both the `testpypi` and `pypi` environments require a trusted publisher configured on
+the respective index. Three fields must match exactly:
 `dualeai/c2patxt`, the workflow filename `release.yml`, and the environment name
 (`testpypi` or `pypi`). No API token exists or should; see [SECURITY.md](../SECURITY.md).
-
-> **The repository was renamed** from `dualeai/c2pa-text` to `dualeai/c2patxt`. If a
-> trusted publisher was configured under the old name it must be updated on **both**
-> indexes: the OIDC token the workflow mints carries the *current* repository, and the
-> index compares that claim against what it has stored. GitHub's rename redirect does
-> not help. Nothing published predates the rename, so delete this note once 0.1.0 ships.
 
 **The version comes from the tag**, via `cicd/version.sh`, which falls back to `0.1.0`
 when `git describe` finds nothing. `fetch-depth: 0` in the workflow is what makes tags

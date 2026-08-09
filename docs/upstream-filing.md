@@ -1,14 +1,10 @@
 # Four ambiguities in Annex A.8
 
-Four defects in C2PA 2.4 Annex A.8 that cause **silent divergence**: two conforming
-implementations produce different bytes and neither is wrong. Each is written up here
-as it would be filed.
+Four ambiguities in C2PA 2.4 Annex A.8 that permit different wire interpretations.
+Each is written here in issue-ready form.
 
 **Not yet filed.** Posting public issues on a specification repository is an
-outward-facing act on behalf of Duale AI, so it needs a person to press send. The other
-**fourteen** ambiguities we found are deliberately not separate issues — filing eighteen
-against an annex maintained by a small task force is noise, and noise gets ignored. They
-are listed once, inside issue 1.
+outward-facing act on behalf of Duale AI, so a maintainer must approve it.
 
 Target: `c2pa-org/specifications`. All quotations are from 2.4 build `c7e55d5a`.
 
@@ -32,32 +28,15 @@ Computed from the Unicode Character Database:
 | `A` + wrapper + U+030A | `c3 85` | `41 cc 8a` |
 
 It is resolvable — A.8.5 delegates to the Validation clause for the normative
-procedure — but the contradictory sentence is unretracted and has survived from 2.3's
-A.7 through every published 2.4 build.
-
-**Likely cause, offered as a lead:** A.8.7.2 and A.8.7.3 carry `shall` requirements
-while nested under a heading titled *"Validation Status Codes"*. Normative text
-mis-filed under a status-code heading is easy to miss in review, which would explain
-why it survived.
+procedure — but the contradictory sentence remains in the reviewed 2.4 build.
 
 **Suggested fix:** delete the sentence from A.8.7.3, or replace it with an explicit
 cross-reference to 15.12.1.3.1.
 
-Fourteen further ambiguities we resolved locally, listed here rather than filed
-separately, with their [deviation](deviations.md) numbers: 18.5.1 forbidding what A.8
-requires of exclusion ranges (7); A.8 defining no padding mechanism while `pad` is
-mandatory in `data-hash-map` (8); 15.12.1.3.2 naming a wrapper `algorithm` field A.8.2.2
-does not define (5); no status code for "detected but absent" (6); undefined update-manifest
-offset arithmetic for a non-linear selector run (9); A.8 assigning no media type (10);
-`scientificDomain` declared as a list in CDDL and shown as a bare string in the
-example (13); `manifest.text.*` absent from the normative `$status-code` enum (14); no Ed25519
-SPKI constraint in the certificate profile (11); "Rejected" (15.7) versus "Valid but not
-Trusted" (14.3.5/14.3.6) for `signingCredential.untrusted` (12); the unresolved
-`[_embedding_manifests_into_html]` cross-reference at A.1 and A.9.2 (16); an inception
-action in a *gathered* actions assertion, where two clauses and a change log cannot all
-three be satisfied (25); a reference into a data box, which 10.2.3.2 makes a SHOULD we
-decline (26); and no status code for a manifest store that fails to parse at all,
-recorded in [open-questions.md](open-questions.md).
+Related implementation choices and unresolved status-code questions are recorded by
+section title in [deviations.md](deviations.md) and
+[open-questions.md](open-questions.md). Those documents, not numeric issue shorthand,
+are the maintained inventory.
 
 **U+FEFF is not on this list**, because it is Issue 3 below.
 
@@ -71,17 +50,14 @@ A.8.2.2 declares `unsigned int(64) magic`, `unsigned int(8) version` and
 `unsigned int(32) manifestLength` in ISO-BMFF class syntax with no byte order stated
 anywhere in the clause or its prose.
 
-This appears to be the only place in the specification that omits it — clause 11,
-clause 18.6 and A.3.x all state it explicitly.
-
 The magic number resolves itself in practice, since a little-endian writer produces a
 visibly wrong `\0TXTAP2C`. **`manifestLength` does not**, and a disagreement there is
 a silent interop failure rather than a visible one.
 
-Both public implementations use big-endian (`struct.Struct("!8sBI")`;
-`len.to_be_bytes()`), so the fix is to write down what everyone already does.
+The ISO BMFF/JUMBF box structures surrounding this field use big-endian fields. The
+local literal A.8 fixture applies that same byte order.
 
-**Suggested fix:** add "All multi-byte fields are big-endian." to A.8.2.3.
+**Suggested fix:** add "All multi-byte fields are big-endian." to A.8.2.2.
 
 ---
 
@@ -93,13 +69,9 @@ A.8.2.2 defines the wrapper structure beginning at `magic`. A.8.4.2 describes th
 preceding U+FEFF as the detection marker. No clause states whether the `c2pa.hash.data`
 exclusion covers it.
 
-The two readings differ by exactly 3 UTF-8 bytes. Two otherwise-correct implementations
-that choose differently will fail to verify each other's marks, with no diagnostic
-that points at the cause — the hash simply does not match.
-
-Both public implementations include it. **Suggested fix:** state it in A.8.5,
-whichever way the task force prefers; the value of the answer is entirely in its
-existence.
+The two readings differ by exactly 3 UTF-8 bytes. A producer and validator that choose
+differently will report a hash mismatch with no diagnostic that identifies this
+choice. **Suggested fix:** state the required boundary in A.8.5.
 
 ---
 
@@ -124,25 +96,3 @@ implementation and a strict one disagree about whether an attacker-appended wrap
 invalidates a document.
 
 **Suggested fix:** state one rule in A.8.2.1 and have the other clauses reference it.
-
----
-
-## Offering the vectors
-
-We publish a wire-format conformance vector file — `A8ConformanceTest-1.2.1.txt`, 29
-records, CC0 — because the C2PA text conformance rubric v0.1.0 has none. Format
-modelled on `NormalizationTest.txt`: ASCII-only data, one record per line, semicolon
-separated, `#` comments.
-
-Offered **once**, to C2PA or to C2SP under the CCTV model (*"All cryptography-related
-test vectors are welcome… projects are encouraged to reuse them and contribute back"*).
-If there is no uptake we keep it in-repo and move on.
-
-## What we do not do
-
-**Byte-for-byte agreement is a better contribution than correspondence.** So: no
-coordinated engagement programme with the other implementations, no direct query to
-CAWG (its specification index is [already conclusive](open-questions.md)), and no
-scheduled tracking of `c2pa-rs` PR #2117, which has been open since 2026-05-05. Instead
-we cross-validate against their published vectors in CI and open an issue only on a
-genuine disagreement.

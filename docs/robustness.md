@@ -20,17 +20,15 @@ Measured 2026-08-05.
 | identity | **1.000** | 1.000 |
 | NFKD + casefold + whitespace collapse | 0.000 | **1.000** |
 | strip invisible characters | 0.000 | 0.000 |
-| retype (visible text only) | 0.000 | 0.000 |
 | truncate to 50% | 0.000 | 1.000 |
 | excerpt 30% | 0.000 | 1.000 |
 | delete 15% of words | 0.000 | 1.000 |
 | typos in 5% of tokens | 0.000 | 1.000 |
-| paraphrase | 0.000 | 1.000 |
-| translate round-trip | 0.000 | 1.000 |
+| synthetic word substitution | 0.000 | 1.000 |
 | whitespace collapse (NBSP folding) | 0.500 | 1.000 |
 
-The two bolded cells are the only ones that gate a build. Everything else is a
-measurement and gates nothing.
+The manual command exits nonzero if either bolded cell falls below 1.000. It is not a
+CI build gate; everything else is a measurement.
 
 ## Read the two columns separately
 
@@ -40,14 +38,8 @@ that unless both columns are shown.
 - **Mark still found** asks whether the variation-selector run survived.
 - **Still verifies** asks whether the hard binding held.
 
-The **whitespace collapse (NBSP folding)** row is where the distinction bites, and it
-is also the row whose name had to change. It was added to model a transform that leaves
-every selector intact while rewriting the visible text — a `pandoc md → html → md` pass,
-or an email MIME round trip — so the mark is still found and the binding correctly fails.
-
-**On this corpus it models no such thing.** It reads 0.500, and what it measures is
-whitespace collapse and nothing else, which is what it is now named for. Measured
-against the corpus above:
+The **whitespace collapse (NBSP folding)** row leaves every selector intact while
+rewriting visible text. It reads 0.500 on this corpus. The input facts are:
 
 | | count |
 | --- | ---: |
@@ -56,34 +48,31 @@ against the corpus above:
 | containing U+00A0 | **150** (444 occurrences) |
 | altered by `" ".join(text.split())` | **150** |
 
-`tools/robustness.py:157` implements the transform as `" ".join(visible.split())`. Every
-document in this corpus is already a single line, so there is no line structure to
-reflow — and `str.split()` splits on U+00A0 as well as ASCII whitespace. The 150
-documents that fail are exactly the 150 containing a non-breaking space, which is what
-the row is named for. It was once labelled "markdown round-trip (reflow)", and that
-label was wrong for this corpus: a transform that genuinely rewrapped lines would change
-nothing here and the row would read 1.000.
+`whitespace_collapse` is `" ".join(visible.split())`. Every document is already one
+line, and `str.split()` treats U+00A0 as whitespace. The 150 documents whose binding
+fails are exactly those containing a non-breaking space.
 
 ## Why almost every row is 0.000, and why that is not a defect
 
-**A hard binding is not a watermark.** It is a cryptographic hash over the exact
-bytes. Any edit to the visible text invalidates it — that is the entire mechanism, and
-a row that survived paraphrase would mean the binding was not doing its job.
+**A hard binding is not a watermark.** It is a cryptographic hash over the
+NFC-normalized covered text. An edit that changes that normalized text invalidates the
+binding. A canonically equivalent rewrite can change stored UTF-8 bytes without
+changing the binding input; a changed byte offset can still make the declared wrapper
+exclusion malformed.
 
-EU AI Act Article 50(2) requires marking to be effective "as far as this is
-technically feasible", and a hash binding is the technically feasible option that
-gives a third party a *verifiable* answer rather than a probabilistic one. A
-statistical watermark survives paraphrase and cannot tell you who generated the text
-or prove the text is unaltered. This can do both, and cannot survive paraphrase. Those
-are the same trade, seen from two ends.
+This implementation provides a cryptographic binding to normalized text bytes. It does
+not survive edits, and signer identity depends on caller-supplied trust policy. Whether
+a deployment satisfies EU AI Act Article 50(2) depends on its effectiveness,
+interoperability, robustness, reliability, costs, limitations, and the state of the
+art; this corpus does not answer that legal or deployment question.
 
 The NFKD row is the one to understand before reading the rest: it is 0.000 in the
 first column and 1.000 in the second, deliberately. Casefolding and collapsing
 whitespace rewrite the hashed bytes, so the binding must fail. What must *never*
 happen is the mark disappearing, and it does not: U+FEFF and every variation selector
 have combining class 0 and no decomposition mapping, canonical or compatibility, so no
-normalization form touches them. Aggressive normalization on ingest does **not**
-destroy provenance.
+normalization form removes the carrier. The changed covered bytes still invalidate the
+hard binding, so the carrier remains detectable but the provenance no longer validates.
 
 ## False positives
 
@@ -91,23 +80,21 @@ Balanced accuracy is deliberately **not** reported as a headline. For a hard bin
 the true-negative rate is near-trivially 1.0, so a balanced-accuracy figure is
 dominated by the true-positive rate and tells a reader nothing this table does not.
 
-The honest form of the same claim is analytic: a false positive requires U+FEFF
-followed by eight variation selectors decoding to exactly `0x4332504154585400`.
-Treating each selector as uniform over its 256 reachable values, that is 2⁻⁶⁴ per
-U+FEFF encountered. No natural-language process emits that sequence.
+The analytic candidate-detection model assumes each selector byte is independent and
+uniform over 256 values. Under that model, U+FEFF followed by eight selectors decoding
+to `0x4332504154585400` has probability 2⁻⁶⁴ per U+FEFF encountered. This is not a
+measured natural-language false-positive rate and does not imply a valid credential;
+the wrapper and signed manifest must still parse and verify.
 
 ## Limitations, stated rather than buried
 
 - **One corpus.** The attack harness we borrowed the list from states its own
   limitation plainly: single-dataset robustness does not transfer. We used one dataset
   and we are not claiming otherwise.
-- **The attack list is reused verbatim** from `writerslogic/c2pa-text-binding`'s
-  disclosed list, so these numbers are directly comparable to the only other published
-  set. Their `ROBUSTNESS.md` is the comparison point.
-- **Paraphrase and translation are stand-ins.** Both are implemented as deterministic
-  visible-text rewrites rather than by calling a model. For a hash binding the answer
-  does not depend on *how* the bytes changed, only that they did, so a model would add
-  cost and non-determinism without changing a single cell.
+- **The deterministic transforms are literal.** The table is not a model-backed
+  paraphrase or translation evaluation.
+- **Synthetic word substitution is literal.** It applies three fixed replacements and
+  does not claim to measure paraphrase or translation quality.
 - **Copy-paste survival through third-party applications is untested.** We have not
   measured Slack, Notion, Discord or Google Docs and we do not repeat vendor claims
   about them. X is known to strip U+200B, which is a different character from the ones
