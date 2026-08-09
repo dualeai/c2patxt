@@ -44,7 +44,7 @@ classifiers = [
 # RFC 8949 4.2.1 bytewise map ordering while cbor2's canonical=True implements
 # 4.2.3 length-first ordering, and because producer wire tests need a reader mode that
 # rejects non-deterministic encodings without narrowing the validator's read mode.
-dependencies = ["cryptography~=48.0"]
+dependencies = ["cryptography>=48,<51"]
 
 [project.optional-dependencies]
 # Preserves the published c2patxt[trust] install contract while backend adoption is
