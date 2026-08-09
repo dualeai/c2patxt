@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+from typing import TypeGuard
 
 import cbor2
 import pytest
@@ -185,17 +186,21 @@ def test_truncated_input_is_rejected() -> None:
         loads(bytes.fromhex("4401"))  # declares 4 bytes, supplies 1
 
 
-def test_nesting_is_bounded_both_ways() -> None:
-    """A small input must not describe unbounded recursion."""
-    deep: object = 0
-    for _ in range(MAX_CBOR_DEPTH + 2):
-        deep = [deep]
-    with pytest.raises(ValueError, match="nesting deeper"):
-        dumps(deep)
+def test_nesting_limit_is_inclusive_for_encoder_and_decoder() -> None:
+    """Thirty-two arrays accept; the thirty-third is the first rejected level."""
+    at_limit: object = 0
+    for _ in range(MAX_CBOR_DEPTH):
+        at_limit = [at_limit]
+    literal = b"\x81" * MAX_CBOR_DEPTH + b"\x00"
 
-    bomb = b"\x81" * (MAX_CBOR_DEPTH + 2) + b"\x00"
+    assert dumps(at_limit) == literal
+    assert loads(literal) == at_limit
+
+    over_limit = [at_limit]
+    with pytest.raises(ValueError, match="nesting deeper"):
+        dumps(over_limit)
     with pytest.raises(CborDecodeError, match="nesting deeper"):
-        loads(bomb)
+        loads(b"\x81" + literal)
 
 
 def test_bool_is_not_encoded_as_an_integer() -> None:
@@ -337,6 +342,28 @@ _WELL_FORMED_BUT_TAG_INVALID = {
 _BAD_ITEM_COUNT = 47
 _STREAMING_ITEM_COUNT = 11
 
+_VENDORED_CORPORA = (
+    "bad",
+    "mt0",
+    "mt1",
+    "mt2",
+    "mt3",
+    "mt4",
+    "mt5",
+    "mt6",
+    "mt7-float",
+    "mt7-simple",
+    "streaming",
+)
+
+
+def _is_object_dict(value: object) -> TypeGuard[dict[object, object]]:
+    return isinstance(value, dict)
+
+
+def _is_object_list(value: object) -> TypeGuard[list[object]]:
+    return isinstance(value, list)
+
 
 @pytest.mark.parametrize(("description", "payload"), _sidecar_items("bad"), ids=lambda item: str(item)[:60])
 def test_the_ill_formed_corpus_is_refused_with_our_own_error(description: str, payload: bytes) -> None:
@@ -371,6 +398,29 @@ def test_neither_vendored_sidecar_has_silently_shrunk() -> None:
     """A glob over a missing corpus parametrizes over nothing and passes."""
     assert len(_sidecar_items("bad")) == _BAD_ITEM_COUNT
     assert len(_sidecar_items("streaming")) == _STREAMING_ITEM_COUNT
+
+
+@pytest.mark.parametrize("name", _VENDORED_CORPORA)
+def test_binary_corpus_and_edn_sidecar_carry_the_same_vectors(name: str) -> None:
+    """Both upstream representations carry the same bytes in the same order."""
+    document: object = cbor2.loads((CBOR_VECTORS / f"{name}.cbor").read_bytes())
+    assert _is_object_dict(document)
+    tests = document.get("tests")
+    assert _is_object_list(tests)
+
+    binary_items: list[bytes] = []
+    for item in tests:
+        assert _is_object_dict(item)
+        encoded = item.get("encoded")
+        assert isinstance(encoded, bytes)
+        binary_items.append(encoded)
+
+    assert binary_items == [encoded for _, encoded in _sidecar_items(name)]
+
+
+def test_the_vendored_cbor_file_inventory_is_exact() -> None:
+    assert tuple(path.stem for path in sorted(CBOR_VECTORS.glob("*.cbor"))) == _VENDORED_CORPORA
+    assert tuple(path.stem for path in sorted(CBOR_VECTORS.glob("*.edn"))) == _VENDORED_CORPORA
 
 
 def test_argument_beyond_the_64_bit_range_is_refused() -> None:

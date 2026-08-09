@@ -16,5 +16,8 @@ The fixture was generated from public `embed()` with:
 - that tag's `tests.conftest.DISCLOSURE`.
 
 Recreate it from a detached worktree at the tag, extract `store.raw` from the public
-`embed()` result, and encode it with `base64.b64encode`. Do not regenerate it with the
-current producer: that would erase the old input shape the test exists to read.
+`embed()` result, and encode it with `base64.b64encode`. The compatibility test rebuilds
+the carrier with its literal A.8 formula and pins the SHA-256 of the complete historical
+UTF-8 document. It never calls the current wrapper producer. Do not regenerate either
+value with the current producer: that would erase the old input shape the test exists
+to read.

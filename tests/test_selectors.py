@@ -65,10 +65,19 @@ def test_lone_surrogate_is_not_a_selector() -> None:
     assert selector_to_byte(0xD800) is None
 
 
-def test_build_wrapper_refuses_what_the_parser_would_refuse() -> None:
-    """Producer and consumer must agree on the limit, or we emit unreadable output."""
+def test_manifest_length_limit_is_inclusive_for_builder_and_parser() -> None:
+    """The exact 2 MiB policy value is accepted; its successor is refused."""
+    payload = bytes(MAX_MANIFEST_LENGTH)
+    wrapper = build_wrapper(payload)
+    assert len(wrapper) == 1 + HEADER_SIZE + MAX_MANIFEST_LENGTH
+
+    body = MAGIC + b"\x01" + struct.pack(">I", MAX_MANIFEST_LENGTH) + payload
+    assert parse_wrapper_body(body) == payload
+
     with pytest.raises(ValueError, match="exceeds"):
         build_wrapper(b"\x00" * (MAX_MANIFEST_LENGTH + 1))
+    with pytest.raises(MarkCorruptError, match="exceeds"):
+        parse_wrapper_body(MAGIC + b"\x01" + struct.pack(">I", MAX_MANIFEST_LENGTH + 1))
 
 
 def test_parse_rejects_a_bad_version() -> None:

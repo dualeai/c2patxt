@@ -64,3 +64,37 @@ def test_an_unreachable_target_raises_rather_than_spinning() -> None:
 
     with pytest.raises(_fixpoint.FixpointError, match="own declared length"):
         _fixpoint.solve(prepare)
+
+
+def test_failure_prepares_at_most_the_documented_33_candidates() -> None:
+    """The probe and target attempts are bounded signing work, not just a loop guard."""
+    prepared: list[int] = []
+
+    def prepare(exclusion_length: int) -> Callable[[int], str]:
+        prepared.append(exclusion_length)
+
+        def never_matches(_pad: int) -> str:
+            return "x" * 100
+
+        return never_matches
+
+    with pytest.raises(_fixpoint.FixpointError):
+        _fixpoint.solve(prepare)
+
+    assert len(prepared) == 33
+    assert prepared[0] == 0
+    assert len(set(prepared)) == 33
+
+
+def test_padding_never_exceeds_the_documented_inclusive_cap() -> None:
+    """A failed target can reach pad 60, but must never ask the builder for 61."""
+    attempted: list[int] = []
+
+    def never_matches(pad: int) -> str:
+        attempted.append(pad)
+        assert pad <= 60
+        return "x" * 100
+
+    assert _fixpoint._try_padding(never_matches, 286) is None
+    assert attempted[0] == 0
+    assert max(attempted) == 60

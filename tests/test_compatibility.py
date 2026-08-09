@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 
 import pytest
 
@@ -62,3 +63,16 @@ def test_the_build_the_claim_names_is_the_one_the_package_carries(document: str)
         assert carrier is not None
         assert SPEC_BUILD in carrier
         assert SPEC_VERSION in carrier
+
+
+def test_the_core_clause_table_is_in_clause_order(document: str) -> None:
+    """Hold the one structural property the compatibility claim says CI checks."""
+    core = document.split("### Core clauses", maxsplit=1)[1].split("\n### ", maxsplit=1)[0]
+    clauses = [
+        match.group(1)
+        for line in core.splitlines()
+        if (match := re.fullmatch(r"\|\s*(\d+(?:\.\d+)*)\s*\|.*", line)) is not None
+    ]
+
+    assert clauses
+    assert clauses == sorted(clauses, key=lambda clause: tuple(int(part) for part in clause.split(".")))

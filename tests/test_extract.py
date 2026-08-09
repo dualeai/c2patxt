@@ -31,6 +31,7 @@ from tests.conftest import mark
 WHEN = datetime.datetime(2026, 8, 5, 12, 0, tzinfo=datetime.timezone.utc)
 _UNKNOWN_STRUCTURAL_UUID = content_type_uuid(b"c2tm")
 _EMBEDDED_FILE_UUID = bytes.fromhex("40CB0C32BB8A489DA70B2AD6F47F4369")
+_LEGACY_MANIFEST_UUID = bytes.fromhex("63326D6400110010800000AA00389B71")
 
 
 def _retype_required_structure(raw: bytes, target: str) -> bytes:
@@ -430,8 +431,16 @@ def test_the_parse_reports_the_code_the_clause_names(signer: Signer, damage: str
     assert caught.value.code is expected
 
 
-@pytest.mark.parametrize("tag", [b"c2ma", b"c2md"], ids=["c2ma", "c2md"])
-def test_a_standard_manifest_is_accepted_under_either_type_uuid(signer: Signer, tag: bytes) -> None:
+@pytest.mark.parametrize(
+    ("type_uuid", "tag"),
+    [(UUID_MANIFEST, b"c2ma"), (_LEGACY_MANIFEST_UUID, b"c2md")],
+    ids=["c2ma", "c2md"],
+)
+def test_a_standard_manifest_is_accepted_under_either_type_uuid(
+    signer: Signer,
+    type_uuid: bytes,
+    tag: bytes,
+) -> None:
     """C2PA 11.2.2: "Manifest Consumers **shall** also accept standard C2PA Manifests
     specified with JUMBF type UUID 63326D64-0011-0010-8000-00AA00389B71 (`c2md`), but
     claim generators shall not create manifests with this JUMBF type UUID."
@@ -453,7 +462,7 @@ def test_a_standard_manifest_is_accepted_under_either_type_uuid(signer: Signer, 
     assert manifest.description.uuid == UUID_MANIFEST, "the producer emits c2ma"
     retyped = JumbfBox(
         description=DescriptionBox(
-            uuid=content_type_uuid(tag),
+            uuid=type_uuid,
             label=manifest.description.label,
             requestable=manifest.description.requestable,
         ),
@@ -466,10 +475,15 @@ def test_a_standard_manifest_is_accepted_under_either_type_uuid(signer: Signer, 
         )
     )
 
-    parsed = parse_manifest_store(forged)
+    marked = "Hello world." + build_wrapper(forged)
+    parsed = extract(marked)
+    assert parsed is not None
+    verdict = verify(marked)
 
     assert parsed.manifest_label == original.manifest_label
     assert parsed.claim_bytes == original.claim_bytes
+    assert verdict.state is Provenance.VALID
+    assert StatusCode.CLAIM_SIGNATURE_VALIDATED in verdict.codes()
 
 
 @pytest.mark.parametrize(

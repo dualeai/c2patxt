@@ -148,7 +148,7 @@ the published heading — open the clause number to read that.
 | 15.4.1 | Hash algorithm for the hard binding, inherited from the claim | `_verify.py` |
 | 15.4.2 | Hash algorithm for a `hashed-uri`, resolved through the enclosing structure | `_verify.py` |
 | 15.5.1 | The last recognized C2PA Manifest is active; unsupported active types fail explicitly | `_extract.py` |
-| 15.5.2.1 | Plural embedded manifest stores are invalid | `_embed.py` |
+| 15.5.2.1 | Producer refuses a second embedded store; validation follows the A.8 exact-exclusion selection — see deviation | `_embed.py`, `_verify.py` |
 | 15.5.2.5 | Special Considerations for Unstructured Text | `_locate.py` |
 | 15.6.1 | Locating (the claim box) | `_extract.py` |
 | 15.6.2 | Validating (required claim fields, and the generator icon reference) | `_extract.py`, `_verify.py` |
@@ -238,8 +238,10 @@ without guessing which. See `_selectors.py`.
 
 ### JUMBF box type UUIDs
 
-Read directly out of the 2.4 build on 2026-08-05 and byte-compared against what we
-emit. All five we use match:
+Read directly out of the 2.4 build on 2026-08-05 and byte-compared against the
+constants used in every emitted description box. `tests/test_compatibility.py` holds
+those values; `tests/test_vector_file.py` separately pins the complete signed producer
+wire. All five we use match:
 
 | Box | UUID | Emitted |
 | --- | --- | --- |

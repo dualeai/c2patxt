@@ -8,6 +8,40 @@ from tests.vectors.loader import VECTOR_FILE, Vector, load_vectors, vector_id
 
 VECTORS = load_vectors()
 
+#: Immutable public vector identities. A removed or replaced row is a wire-corpus
+#: change even when the resulting file remains non-empty and every remaining row passes.
+_EXPECTED_VECTOR_INVENTORY = [
+    ("E0001", "@Part0", "embed", "OK"),
+    ("X0001", "@Part1", "extract", "OK"),
+    ("X0002", "@Part2", "extract", "manifest.text.corruptedWrapper"),
+    ("X0003", "@Part2", "extract", "manifest.text.multipleWrappers"),
+    ("X0004", "@Part2", "extract", "NONE"),
+    ("E0002", "@Part0b", "embed", "OK"),
+    ("E0003", "@Part0b", "embed", "OK"),
+    ("E0004", "@Part0b", "embed", "OK"),
+    ("E0005", "@Part0b", "embed", "OK"),
+    ("E0006", "@Part0b", "embed", "OK"),
+    ("X0005", "@Part1b", "extract", "NONE"),
+    ("X0006", "@Part1b", "extract", "NONE"),
+    ("X0007", "@Part1b", "extract", "NONE"),
+    ("X0008", "@Part1b", "extract", "NONE"),
+    ("X0009", "@Part1b", "extract", "NONE"),
+    ("X0010", "@Part1b", "extract", "NONE"),
+    ("X0011", "@Part1b", "extract", "NONE"),
+    ("X0012", "@Part1b", "extract", "NONE"),
+    ("X0013", "@Part2b", "extract", "OK"),
+    ("X0014", "@Part2c", "extract", "manifest.text.corruptedWrapper"),
+    ("X0015", "@Part2c", "extract", "manifest.text.corruptedWrapper"),
+    ("X0016", "@Part2c", "extract", "manifest.text.corruptedWrapper"),
+    ("X0021", "@Part2e", "extract", "OK"),
+    ("X0022", "@Part2e", "extract", "OK"),
+    ("X0023", "@Part2e", "extract", "OK"),
+    ("X0017", "@Part2d", "extract", "OK"),
+    ("X0018", "@Part2d", "extract", "OK"),
+    ("X0019", "@Part2d", "extract", "manifest.text.corruptedWrapper"),
+    ("X0020", "@Part2d", "extract", "manifest.text.corruptedWrapper"),
+]
+
 
 def test_data_portion_is_pure_ascii() -> None:
     """The file must survive editors, terminals, git diff and code review.
@@ -33,6 +67,11 @@ def test_records_parse_and_ids_are_unique() -> None:
     assert VECTORS, "vector file yielded no records"
     ids = [v.id for v in VECTORS]
     assert len(ids) == len(set(ids)), "record ids must be unique and never reused"
+
+
+def test_the_vector_inventory_is_exact() -> None:
+    """A deleted, substituted, reordered or re-partitioned record is a visible corpus change."""
+    assert [(vector.id, vector.part, vector.op, vector.status) for vector in VECTORS] == _EXPECTED_VECTOR_INVENTORY
 
 
 @pytest.mark.parametrize("vector", VECTORS, ids=vector_id)
@@ -118,6 +157,10 @@ def test_extract_success_records_carry_a_locatable_wrapper() -> None:
 #: ONLY as part of a deliberate MAJOR release.
 _GOLDEN_STORE_SHA256 = "2580096b93b4e4abfc6b12cda78db9a71fcfa33ca6ba5a574ddd8676a2777791"
 
+#: SHA-256 of the complete UTF-8 document emitted by v0.1.2 for the legacy fixture.
+#: The carrier below is rebuilt from the frozen A.8 literals, never current package code.
+_LEGACY_MARKED_SHA256 = "3b51db34f58d4cba6cfbd6b4940583e738b211f821bab06f0e7bf3b0b4a80a01"
+
 
 def test_the_previous_major_wire_still_verifies() -> None:
     """Version 1 changed producer bytes, not the ability to read version-0 marks.
@@ -127,14 +170,15 @@ def test_the_previous_major_wire_still_verifies() -> None:
     """
     import base64
     import datetime
+    import hashlib
 
     from c2patxt import Provenance, VerifyContext, _cose, extract, verify
-    from c2patxt._selectors import build_wrapper
     from c2patxt.status import StatusCode
 
     encoded = (VECTOR_FILE.parent.parent / "fixtures" / "legacy" / "v0.1.2-manifest-store.b64").read_bytes()
     raw = base64.b64decode(b"".join(encoded.splitlines()), validate=True)
-    marked = "Hello world." + build_wrapper(raw)
+    marked = "Hello world." + _wrapper_from_spec_formula(raw)
+    assert hashlib.sha256(marked.encode("utf-8")).hexdigest() == _LEGACY_MARKED_SHA256
 
     store = extract(marked)
     assert store is not None
