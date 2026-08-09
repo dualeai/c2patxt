@@ -32,7 +32,9 @@ from c2patxt.manifest import (
     DEFAULT_HASH_ALGORITHM,
     HASH_ALGORITHMS,
     _prepare_manifest,  # pyright: ignore[reportPrivateUsage] -- both modules are producer internals
+    _rfc3339_tdate,  # pyright: ignore[reportPrivateUsage] -- shared tdate validation
     _serialize_prepared_manifest,  # pyright: ignore[reportPrivateUsage] -- same producer boundary
+    _utf8_size,  # pyright: ignore[reportPrivateUsage] -- shared CDDL tstr validation
 )
 from c2patxt.signing import Disclosure, Signer
 
@@ -85,12 +87,14 @@ class EmbedContext:
     across different documents is a correctness error, not merely untidy."""
 
     instance_id: str | None = None
-    """The claim's required ``instanceID``. Defaults to a fresh ``xmp:iid:`` URN."""
+    """The claim's required ``instanceID``. Defaults to a fresh ``xmp:iid:`` URN.
+    Supplied values must contain 1 to 1,000,000 UTF-8 bytes."""
 
     when: datetime.datetime | None = None
     """Claimed creation time, recorded in ``c2pa.created``. Defaults to now, UTC.
     Pin it only when replaying a known event or building a deterministic fixture. A
-    naive datetime is rejected rather than assumed to be UTC."""
+    naive datetime and a UTC offset with sub-minute precision are rejected because
+    neither has an RFC 3339 representation accepted by C2PA ``tdate``."""
 
     generator_name: str = "c2patxt"
     """Value for ``claim_generator_info.name``. Intended to name the software."""
@@ -112,11 +116,13 @@ class EmbedContext:
         ):
             msg = "EmbedContext.manifest_uuid must be an RFC 4122 variant UUID version 4 (C2PA 8.1)"
             raise ValueError(msg)
-        try:
-            generator_name_size = len(self.generator_name.encode("utf-8"))
-        except (AttributeError, UnicodeEncodeError) as exc:
-            msg = "EmbedContext.generator_name must be a UTF-8 text string"
-            raise ValueError(msg) from exc
+        if self.instance_id is not None:
+            instance_id_size = _utf8_size(self.instance_id, field="EmbedContext.instance_id")
+            if not 1 <= instance_id_size <= _MAX_TSTR_LENGTH:
+                msg = "EmbedContext.instance_id must contain 1 to 1,000,000 UTF-8 bytes (C2PA claim-map-v2)"
+                raise ValueError(msg)
+
+        generator_name_size = _utf8_size(self.generator_name, field="EmbedContext.generator_name")
         if not 1 <= generator_name_size <= _MAX_TSTR_LENGTH:
             msg = "EmbedContext.generator_name must contain 1 to 1,000,000 UTF-8 bytes (C2PA generator-info-map)"
             raise ValueError(msg)
@@ -124,11 +130,9 @@ class EmbedContext:
     def resolve(self) -> tuple[uuid.UUID, str, datetime.datetime]:
         """Fill in the defaults, once, so a single embed uses consistent values."""
         manifest_uuid = self.manifest_uuid or uuid.uuid4()
-        instance_id = self.instance_id or f"xmp:iid:{uuid.uuid4()}"
+        instance_id = self.instance_id if self.instance_id is not None else f"xmp:iid:{uuid.uuid4()}"
         when = self.when or _default_when()
-        if when.tzinfo is None or when.utcoffset() is None:
-            msg = "EmbedContext.when must be timezone-aware; a naive datetime has no defined instant"
-            raise ValueError(msg)
+        _rfc3339_tdate(when)
         return manifest_uuid, instance_id, when
 
 
@@ -163,8 +167,9 @@ def embed(text: str, signer: Signer, disclosure: Disclosure, *, context: EmbedCo
             resource limit.
         UnencodableTextError: ``text`` holds an unpaired surrogate and cannot be
             encoded as UTF-8.
-        ValueError: the algorithm is not one 13.1 permits, or ``context.when`` is
-            naive.
+        ValueError: the algorithm is not one 13.1 permits, ``context.when`` is
+            naive or has a sub-minute UTC offset, or a supplied context string is
+            outside its CDDL UTF-8 byte bounds.
     """
     if context is None:
         context = EmbedContext()

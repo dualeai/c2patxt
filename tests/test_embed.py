@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import datetime
+import hashlib
 import unicodedata
 import uuid
 from collections.abc import Callable
+from typing import TypeGuard
 
+import cbor2
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -23,6 +26,7 @@ from c2patxt import (
     MarkCorruptError,
     Provenance,
     StatusCode,
+    _jumbf,
     embed,
     extract,
     locate,
@@ -31,6 +35,7 @@ from c2patxt import (
 )
 from c2patxt._cose import parse
 from c2patxt._selectors import selector_to_byte
+from c2patxt.manifest import ManifestStore
 from c2patxt.signing import C2PA_CLAIM_SIGNING_EKU, Signer
 from tests.conftest import DISCLOSURE, WHEN, FloatingTimezone
 
@@ -52,14 +57,52 @@ def signer(signing_key: Ed25519PrivateKey, signing_certificate: x509.Certificate
     return Signer(private_key=signing_key, certificates=(signing_certificate,))
 
 
+def _assertion_cbor_bytes(store: ManifestStore, label: str) -> bytes:
+    """Return the received assertion content, leaving CBOR decoding to the caller."""
+    raw_box = store.assertion_bytes[label]
+    box, end = _jumbf.parse_superbox(b"\x00\x00\x00\x00jumb" + raw_box)
+    assert end == len(raw_box) + 8
+    assert len(box.content) == 1
+    kind, payload = box.content[0]
+    assert kind == b"cbor"
+    return payload
+
+
+def _is_object_mapping(value: object) -> TypeGuard[dict[object, object]]:
+    return isinstance(value, dict)
+
+
+def _is_object_list(value: object) -> TypeGuard[list[object]]:
+    return isinstance(value, list)
+
+
 def test_context_refuses_an_empty_generator_name() -> None:
     with pytest.raises(ValueError, match="1 to 1,000,000 UTF-8 bytes"):
         EmbedContext(generator_name="")
 
 
 def test_context_limits_generator_name_by_utf8_bytes() -> None:
+    exact_limit = "é" * 500_000
+    assert EmbedContext(generator_name=exact_limit).generator_name == exact_limit
+
     with pytest.raises(ValueError, match="1 to 1,000,000 UTF-8 bytes"):
-        EmbedContext(generator_name="é" * 500_001)
+        EmbedContext(generator_name=exact_limit + "x")
+
+
+def test_context_enforces_the_instance_id_utf8_byte_bounds() -> None:
+    exact_limit = "é" * 500_000
+    assert EmbedContext(instance_id="x").instance_id == "x"
+    assert EmbedContext(instance_id=exact_limit).instance_id == exact_limit
+
+    for invalid in ("", exact_limit + "x"):
+        with pytest.raises(ValueError, match="instance_id must contain 1 to 1,000,000 UTF-8 bytes"):
+            EmbedContext(instance_id=invalid)
+
+
+def test_context_refuses_a_non_utf8_instance_id() -> None:
+    for invalid in ("\ud800", 7):
+        with pytest.raises(ValueError, match="instance_id must be a UTF-8 text string"):
+            EmbedContext(instance_id=invalid)  # pyright: ignore[reportArgumentType] -- runtime API guard
 
 
 # --------------------------------------------------------------------------------
@@ -170,6 +213,64 @@ def test_the_emitted_disclosure_states_the_model_type(signer: Signer) -> None:
     assert disclosure["modelName"] == DISCLOSURE.model_name
 
 
+def test_non_default_caller_facts_reach_the_signed_wire(signer: Signer) -> None:
+    """Public inputs are held by distinct literals at the serialization boundary."""
+    from c2patxt.signing import Disclosure, ModelType
+
+    disclosure = Disclosure(
+        media_type="text/csv",
+        model_type=ModelType.ONNX,
+        model_name="wire-model",
+        model_identifier="urn:example:model:wire-v7",
+    )
+    context = EmbedContext(
+        manifest_uuid=PINNED.manifest_uuid,
+        instance_id=PINNED.instance_id,
+        when=PINNED.when,
+        generator_name="example-generator",
+        generator_version="7.4.1",
+    )
+    store = extract(embed("heading,value\nanswer,42\n", signer, disclosure, context=context))
+    assert store is not None
+
+    metadata = store.assertion("c2pa.metadata")
+    assert isinstance(metadata, dict)
+    assert metadata == {
+        "@context": {"dc": "http://purl.org/dc/elements/1.1/"},
+        "dc:format": "text/csv",
+    }
+
+    ai_disclosure = store.assertion("c2pa.ai-disclosure")
+    assert isinstance(ai_disclosure, dict)
+    assert ai_disclosure == {
+        "modelType": "c2pa.types.model.onnx",
+        "modelName": "wire-model",
+        "modelIdentifier": "urn:example:model:wire-v7",
+    }
+
+    generator = store.claim["claim_generator_info"]
+    assert isinstance(generator, dict)
+    assert generator["name"] == "example-generator"
+    assert generator["version"] == "7.4.1"
+
+
+def test_the_emitted_claim_keeps_a_supplied_instance_id(signer: Signer) -> None:
+    """The accepted public value reaches the signed claim bytes unchanged."""
+    instance_id = "com.example:instance:é"
+    context = EmbedContext(
+        manifest_uuid=PINNED.manifest_uuid,
+        instance_id=instance_id,
+        when=PINNED.when,
+    )
+    store = extract(embed("Hello world.", signer, DISCLOSURE, context=context))
+    assert store is not None
+
+    independently_decoded = cbor2.loads(store.claim_bytes)
+    assert isinstance(independently_decoded, dict)
+    assert independently_decoded["instanceID"] == instance_id
+    assert store.claim["instanceID"] == instance_id
+
+
 def test_the_emitted_store_carries_exactly_the_four_assertions(signer: Signer) -> None:
     """The label set of a store ``embed`` produced, not of a hand-built fixture.
 
@@ -269,17 +370,33 @@ def test_embedding_over_an_existing_mark_raises(signer: Signer) -> None:
     assert stop == len(encoded)
 
 
+def test_embedding_over_an_independent_a8_carrier_raises(signer: Signer) -> None:
+    """The public guard recognizes a foreign carrier, not only this producer's manifest dialect."""
+    from tests.vectors.loader import load_vectors
+
+    vector = next(item for item in load_vectors() if item.id == "E0001")
+    marked = vector.expect.decode("utf-8")
+
+    with pytest.raises(AlreadyMarkedError) as caught:
+        embed(marked, signer, DISCLOSURE, context=PINNED)
+
+    assert caught.value.span == (len(vector.text), len(vector.expect))
+
+
 def test_the_already_marked_span_is_enough_to_re_mark(signer: Signer) -> None:
     """The reported span must be actionable, not merely informative."""
-    marked = embed("Hello world.", signer, DISCLOSURE, context=PINNED)
+    text = "café 漢字"
+    marked = embed(text, signer, DISCLOSURE, context=PINNED)
     with pytest.raises(AlreadyMarkedError) as excinfo:
         embed(marked, signer, DISCLOSURE, context=PINNED)
 
     start, stop = excinfo.value.span
     encoded = marked.encode("utf-8")
+    assert start == len(text.encode("utf-8"))
+    assert encoded[start:stop].decode("utf-8").startswith(MARKER)
     # The span must name exactly what strip() removes, or the error is telling the
     # caller something the shipped helper contradicts.
-    assert (encoded[:start] + encoded[stop:]).decode("utf-8") == strip(marked)
+    assert (encoded[:start] + encoded[stop:]).decode("utf-8") == text == strip(marked)
     assert verify(embed(strip(marked), signer, DISCLOSURE, context=PINNED)).state is Provenance.VALID
 
 
@@ -298,9 +415,13 @@ def test_an_unsupported_algorithm_is_refused(signer: Signer) -> None:
         embed("Hello world.", signer, DISCLOSURE, context=context)
 
 
-@pytest.mark.parametrize("algorithm", ["sha256", "sha384", "sha512"])
-def test_every_permitted_algorithm_round_trips(algorithm: str, signer: Signer) -> None:
-    """All three permitted algorithms reach an exact, verifiable exclusion."""
+@pytest.mark.parametrize(("algorithm", "digest_size"), [("sha256", 32), ("sha384", 48), ("sha512", 64)])
+def test_every_permitted_algorithm_reaches_every_signed_hash(
+    algorithm: str,
+    digest_size: int,
+    signer: Signer,
+) -> None:
+    """The requested algorithm is observed on wire using only stdlib expected hashes."""
     context = EmbedContext(
         manifest_uuid=uuid.UUID("00000000-0000-4000-8000-000000000007"),
         instance_id="x",
@@ -311,6 +432,31 @@ def test_every_permitted_algorithm_round_trips(algorithm: str, signer: Signer) -
     store = extract(marked)
     assert store is not None
     assert store.hash_data is not None
+
+    assert store.claim["alg"] == algorithm
+    assert store.hash_data["alg"] == algorithm
+    binding_digest = store.hash_data["hash"]
+    assert isinstance(binding_digest, bytes)
+    assert len(binding_digest) == digest_size
+    assert binding_digest == hashlib.new(algorithm, b"Hello world.").digest()
+
+    created_assertions = store.claim["created_assertions"]
+    assert isinstance(created_assertions, list)
+    assert len(created_assertions) == len(store.assertion_bytes)
+    for link in created_assertions:
+        assert isinstance(link, dict)
+        assert link["alg"] == algorithm
+        url = link["url"]
+        assert isinstance(url, str)
+        prefix = "self#jumbf=c2pa.assertions/"
+        assert url.startswith(prefix)
+        label = url.removeprefix(prefix)
+        received = store.assertion_bytes[label]
+        digest = link["hash"]
+        assert isinstance(digest, bytes)
+        assert len(digest) == digest_size
+        assert digest == hashlib.new(algorithm, received).digest()
+
     exclusions = store.hash_data["exclusions"]
     assert isinstance(exclusions, list)
     exclusion = exclusions[0]
@@ -332,6 +478,72 @@ def test_a_tzinfo_without_an_offset_is_still_refused(signer: Signer) -> None:
     floating = datetime.datetime(2026, 6, 1, 12, 0, tzinfo=FloatingTimezone())
     with pytest.raises(ValueError, match="timezone-aware"):
         embed("Hello world.", signer, DISCLOSURE, context=EmbedContext(when=floating))
+
+
+@pytest.mark.parametrize(
+    ("when", "expected_tdate"),
+    [
+        (datetime.datetime(2026, 6, 1, 12, 0, tzinfo=datetime.timezone.utc), "2026-06-01T12:00:00Z"),
+        (
+            datetime.datetime(
+                2026,
+                6,
+                1,
+                12,
+                0,
+                tzinfo=datetime.timezone(datetime.timedelta(hours=5, minutes=30)),
+            ),
+            "2026-06-01T12:00:00+05:30",
+        ),
+    ],
+)
+def test_action_time_is_rfc3339_on_the_actual_wire(
+    signer: Signer,
+    when: datetime.datetime,
+    expected_tdate: str,
+) -> None:
+    context = EmbedContext(
+        manifest_uuid=PINNED.manifest_uuid,
+        instance_id=PINNED.instance_id,
+        when=when,
+    )
+    store = extract(embed("Hello world.", signer, DISCLOSURE, context=context))
+    assert store is not None
+
+    actions = store.assertion("c2pa.actions.v2")
+    assert isinstance(actions, dict)
+    entries = actions["actions"]
+    assert isinstance(entries, list)
+    created = entries[0]
+    assert isinstance(created, dict)
+    tagged = created["when"]
+    assert getattr(tagged, "tag", None) == 0
+    assert getattr(tagged, "value", None) == expected_tdate
+
+    decoded: object = cbor2.loads(_assertion_cbor_bytes(store, "c2pa.actions.v2"))
+    assert _is_object_mapping(decoded)
+    decoded_entries = decoded.get("actions")
+    assert _is_object_list(decoded_entries)
+    decoded_created = decoded_entries[0]
+    assert _is_object_mapping(decoded_created)
+    decoded_when = decoded_created.get("when")
+    assert isinstance(decoded_when, datetime.datetime)
+    assert decoded_when.isoformat() == when.isoformat()
+
+
+def test_a_seconds_resolution_utc_offset_is_refused(signer: Signer) -> None:
+    when = datetime.datetime(
+        2026,
+        6,
+        1,
+        12,
+        0,
+        tzinfo=datetime.timezone(datetime.timedelta(seconds=30)),
+    )
+    context = EmbedContext(when=when)
+
+    with pytest.raises(ValueError, match="whole-minute UTC offset"):
+        embed("Hello world.", signer, DISCLOSURE, context=context)
 
 
 def test_one_signer_marks_correctly_from_many_threads(signer: Signer) -> None:

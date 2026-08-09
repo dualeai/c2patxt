@@ -20,6 +20,7 @@ from c2patxt.manifest import (
     LABEL_CLAIM_SIGNATURE,
     UUID_MANIFEST_STORE,
     Assertion,
+    Claim,
     ManifestStore,
     build_manifest_store,
     hashed_uri,
@@ -136,6 +137,26 @@ def test_representative_signed_inputs_change_the_bytes() -> None:
     assert _store(when=WHEN + datetime.timedelta(seconds=1)) != baseline
 
 
+@pytest.mark.parametrize(
+    "when",
+    [
+        WHEN.replace(tzinfo=None),
+        datetime.datetime(
+            2026,
+            6,
+            1,
+            12,
+            0,
+            tzinfo=datetime.timezone(datetime.timedelta(seconds=30)),
+        ),
+    ],
+    ids=["naive", "seconds-resolution-offset"],
+)
+def test_public_builder_refuses_a_time_without_an_rfc3339_offset(when: datetime.datetime) -> None:
+    with pytest.raises(ValueError, match=r"timezone-aware|whole-minute UTC offset"):
+        _store(when=when)
+
+
 def test_the_created_action_declares_trained_algorithmic_media(signer: Signer) -> None:
     """The public producer emits the exact C2PA action and IPTC vocabulary term."""
     actions = as_mapping(_embedded_store(signer).assertion("c2pa.actions.v2"), "c2pa.actions.v2")
@@ -182,6 +203,26 @@ def test_claim_carries_the_fields_15_6_2_requires(signer: Signer) -> None:
     assert generator["version"] == "0.1.0"
 
 
+def test_public_builder_enforces_instance_id_utf8_byte_bounds() -> None:
+    exact_limit = "é" * 500_000
+    assert parse_manifest_store(_store(instance_id=exact_limit)).claim["instanceID"] == exact_limit
+
+    for invalid in ("", exact_limit + "x", "\ud800"):
+        with pytest.raises(ValueError, match="claim instanceID"):
+            _store(instance_id=invalid)
+
+
+def test_claim_rejects_a_non_text_instance_id() -> None:
+    with pytest.raises(ValueError, match="claim instanceID must be a UTF-8 text string"):
+        Claim(
+            instance_id=7,  # pyright: ignore[reportArgumentType] -- defensive runtime validation
+            claim_generator_name="c2patxt",
+            claim_generator_version=None,
+            created_assertions=(),
+            signature_url="self#jumbf=c2pa.signature",
+        )
+
+
 def test_public_builder_accepts_only_zero_filled_data_hash_padding() -> None:
     """18.5.2: producer data-hash pad bytes are zero-filled."""
     store = parse_manifest_store(_store(pad=bytes(24)))
@@ -213,6 +254,26 @@ def test_only_the_three_permitted_hash_algorithms_exist() -> None:
     assert set(HASH_ALGORITHMS) == {"sha256", "sha384", "sha512"}
     with pytest.raises(ValueError, match="unsupported hash algorithm"):
         hashed_uri(Assertion(label="x", payload=1).to_box(), "self#jumbf=x", "md5")
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "expected"),
+    [
+        ("sha256", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        (
+            "sha384",
+            "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7",
+        ),
+        (
+            "sha512",
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+            "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+        ),
+    ],
+)
+def test_hash_registry_matches_nist_abc_known_answers(algorithm: str, expected: str) -> None:
+    """The name-to-function mapping has an expected value outside this package."""
+    assert HASH_ALGORITHMS[algorithm](b"abc").hexdigest() == expected
 
 
 def test_ai_disclosure_omits_pending_and_oversight_fields(signer: Signer) -> None:
@@ -312,9 +373,16 @@ def test_the_public_manifest_builder_refuses_an_identifier_that_is_not_uuid_v4(
         _store(manifest_uuid=manifest_uuid)
 
 
-def test_the_public_manifest_builder_refuses_an_empty_generator_name() -> None:
-    with pytest.raises(ValueError, match="1 to 1,000,000 UTF-8 bytes"):
-        _store(generator_name="")
+def test_public_builder_enforces_generator_name_utf8_byte_bounds() -> None:
+    exact_limit = "é" * 500_000
+    claim = parse_manifest_store(_store(generator_name=exact_limit)).claim
+    generator = claim["claim_generator_info"]
+    assert isinstance(generator, dict)
+    assert generator["name"] == exact_limit
+
+    for invalid in ("", exact_limit + "x"):
+        with pytest.raises(ValueError, match="1 to 1,000,000 UTF-8 bytes"):
+            _store(generator_name=invalid)
 
 
 def test_the_manifest_label_uses_pythons_lowercase_uuid_form(signer: Signer) -> None:

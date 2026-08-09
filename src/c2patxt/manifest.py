@@ -86,6 +86,30 @@ ASSERTION_METADATA = "c2pa.metadata"
 ASSERTION_REPOSITORY_RECEIPT = "c2pa.repository-receipt"
 
 
+def _utf8_size(value: object, *, field: str) -> int:
+    """Return the encoded size of a CDDL ``tstr``, with a field-specific error."""
+    if not isinstance(value, str):
+        msg = f"{field} must be a UTF-8 text string"
+        raise ValueError(msg)
+    try:
+        return len(value.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        msg = f"{field} must be a UTF-8 text string"
+        raise ValueError(msg) from exc
+
+
+def _rfc3339_tdate(when: datetime.datetime) -> str:
+    """Format a C2PA ``tdate`` after checking RFC 3339's offset grammar."""
+    offset = when.utcoffset() if when.tzinfo is not None else None
+    if offset is None:
+        msg = "when must be timezone-aware; a naive datetime has no defined instant"
+        raise ValueError(msg)
+    if offset % datetime.timedelta(minutes=1):
+        msg = "when must have a whole-minute UTC offset representable by RFC 3339"
+        raise ValueError(msg)
+    return when.isoformat().replace("+00:00", "Z")
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class Assertion:
     """One assertion: a label and its payload, in the serialization its clause requires."""
@@ -151,11 +175,12 @@ class Claim:
     algorithm: str = DEFAULT_HASH_ALGORITHM
 
     def __post_init__(self) -> None:
-        try:
-            name_size = len(self.claim_generator_name.encode("utf-8"))
-        except (AttributeError, UnicodeEncodeError) as exc:
-            msg = "claim generator name must be a UTF-8 text string"
-            raise ValueError(msg) from exc
+        instance_id_size = _utf8_size(self.instance_id, field="claim instanceID")
+        if not 1 <= instance_id_size <= _MAX_TSTR_LENGTH:
+            msg = "claim instanceID must contain 1 to 1,000,000 UTF-8 bytes (C2PA claim-map-v2)"
+            raise ValueError(msg)
+
+        name_size = _utf8_size(self.claim_generator_name, field="claim generator name")
         if not 1 <= name_size <= _MAX_TSTR_LENGTH:
             msg = "claim generator name must contain 1 to 1,000,000 UTF-8 bytes (C2PA generator-info-map)"
             raise ValueError(msg)
@@ -253,7 +278,7 @@ def _actions_assertion(when: datetime.datetime) -> Assertion:
                     "digitalSourceType": DIGITAL_SOURCE_TYPE_TRAINED,
                     # The actions-v2 CDDL types `when` as tdate, encoded with CBOR tag
                     # 0. UTC instants use the `Z` form.
-                    "when": _cbor.Tagged(0, when.isoformat().replace("+00:00", "Z")),
+                    "when": _cbor.Tagged(0, _rfc3339_tdate(when)),
                 }
             ]
         },
