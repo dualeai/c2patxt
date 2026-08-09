@@ -81,6 +81,34 @@ not report them.
   a correct, intact, honestly-signed mark yields `Provenance.VALID` together with
   `signingCredential.untrusted`. That is the specified and expected outcome.
 
+### Cryptographic threat model
+
+C2PA 2.4's
+[Security Considerations](https://spec.c2pa.org/specifications/specifications/2.4/security/Security_Considerations.html#_threat_and_attack_assumptions)
+exclude attacks using quantum cryptanalysis. This package makes no post-quantum
+security claim: generated claims use Ed25519, and every signature algorithm accepted
+by its C2PA 2.4 verifier is classical. [RFC 8032 section
+1](https://www.rfc-editor.org/rfc/rfc8032.html#section-1) states that a sufficiently
+large quantum computer would break Ed25519. [RFC 9958 section
+1](https://www.rfc-editor.org/rfc/rfc9958.html#section-1) reports no practical
+cryptographically relevant quantum computer at publication; that observation is not a
+post-quantum guarantee.
+
+The hard binding and hashed assertion references use SHA-256, SHA-384 or SHA-512.
+Choosing a longer digest does not change the Ed25519 claim signature or the X.509
+credential chain, so it does not make the authenticated mark post-quantum resistant.
+
+Keep these cases separate:
+
+- Removing the wrapper yields `UNMARKED`; it is not a signature forgery.
+- Changing covered text while the wrapper remains yields an invalid binding.
+- Anyone can create a `VALID` but untrusted mark with their own key. A `TRUSTED`
+  identity also depends on certificate issuance and the caller's anchors and evaluator;
+  a signature break is not the only way that trust can fail.
+
+The release attestations under [Supply chain](#supply-chain) describe package-artifact
+provenance. They do not change the cryptographic profile of a marked document.
+
 ## Security properties of this library
 
 - **No package-owned network.** Package-owned verification performs no network I/O.

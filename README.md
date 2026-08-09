@@ -327,6 +327,8 @@ disclosure surface — see
 | Package-owned network access | None. No revocation fetch, OCSP, or timestamp authority |
 | Determinism | With `VerifyContext(now=...)` and an offline deterministic evaluator. By default `verify` reads the clock — see below |
 | Signature algorithm | Generation: Ed25519. Validation: ES256/384/512, PS256/384/512 and Ed25519, the full C2PA 13.2.1 set |
+| Manifest hash algorithm | Generation: SHA-256 by default; SHA-384 and SHA-512 are also permitted for the hard binding and hashed assertion references. This setting does not select the claim-signature algorithm |
+| Quantum resistance | No. Generated marks use Ed25519, and every signature algorithm accepted by the C2PA 2.4 profile is classical. See [Cryptographic profile and quantum scope](docs/c2pa-compatibility.md#cryptographic-profile-and-quantum-scope) |
 | Size cost | Each manifest byte becomes one variation selector costing 3 or 4 UTF-8 bytes, plus the A.8 header and marker. Certificate fields and chain depth determine the manifest size, so measure your own credential |
 | Thread safety | One `Signer` is exercised concurrently by `tests/test_embed.py::test_one_signer_marks_correctly_from_many_threads`; verification caches are per-call |
 | Maximum input length | **None, deliberately — body-size limiting is yours.** See below |

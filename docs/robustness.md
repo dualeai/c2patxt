@@ -95,6 +95,9 @@ the wrapper and signed manifest must still parse and verify.
   paraphrase or translation evaluation.
 - **Synthetic word substitution is literal.** It applies three fixed replacements and
   does not claim to measure paraphrase or translation quality.
+- **This is not a cryptanalysis benchmark.** The transforms test carrier and binding
+  behaviour. They do not test key recovery, claim-signature forgery or post-quantum
+  security.
 - **Copy-paste survival through third-party applications is untested.** We have not
   measured Slack, Notion, Discord or Google Docs and we do not repeat vendor claims
   about them. X is known to strip U+200B, which is a different character from the ones

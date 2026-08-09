@@ -63,6 +63,33 @@ Our encoder emits wrapper version `1`. Our decoder rejects any other value with
 version 2 without changing its own version number, or change clauses without touching
 the wrapper version — so neither number predicts the other.
 
+## Cryptographic profile and quantum scope
+
+The text carrier and the authenticated mark are separate layers:
+
+| Layer | This package | Security consequence |
+| --- | --- | --- |
+| Carrier | A.8 marker and wrapper encoded as U+FEFF plus variation selectors | Encoding only; it has no cryptographic strength |
+| Manifest hashing | SHA-256 by default; SHA-384 and SHA-512 are also permitted for the hard binding and hashed assertion references | Checks the NFC-normalized covered text and signed assertion references; does not authenticate a signer |
+| Claim signature | COSE Sign1 with Ed25519 for generation; ES256/384/512, PS256/384/512 and Ed25519 on validation | Authenticates the signed claim under a key; all accepted algorithms are classical |
+| Credential | A carried X.509 chain evaluated against caller-supplied trust policy | Relates the signing key to that policy; this package implements no post-quantum certificate path |
+
+The authenticated mark is **not post-quantum resistant**. The
+[C2PA 2.4 signature profile](https://spec.c2pa.org/specifications/specifications/2.4/specs/C2PA_Specification.html#_signature_algorithms)
+contains only the classical algorithms in the table, and validators reject a signature
+algorithm outside that set. C2PA's
+[Security Considerations](https://spec.c2pa.org/specifications/specifications/2.4/security/Security_Considerations.html#_threat_and_attack_assumptions)
+put attacks using quantum cryptanalysis outside their scope. [RFC 8032 section
+1](https://www.rfc-editor.org/rfc/rfc8032.html#section-1) states that a sufficiently
+large quantum computer would break Ed25519. The C2PA 2.4
+[Explainer](https://spec.c2pa.org/specifications/specifications/2.4/explainer/Explainer.html#_is_post_quantum_cryptography_supported_by_the_c2pa_standard)
+describes ML-DSA support as planned, not part of the 2.4 profile.
+
+Selecting SHA-384 or SHA-512 through `EmbedContext.algorithm` changes the hard binding,
+the hashed assertion references and the claim's hash-algorithm declaration. It does
+not change the Ed25519 claim signature or the X.509 credential chain, so it cannot make
+the authenticated mark post-quantum resistant.
+
 ## What this claim covers
 
 Clauses implemented. The Title column is a gloss of what we take from each clause, not
@@ -259,6 +286,9 @@ an overclaim.
   `c2pa.metadata` but does not emit the asset-type assertion that 18.21.3 says should
   carry an exact IANA text/application type. Adding it changes the signed producer
   wire and requires the package's wire-major process.
+- **Post-quantum security.** The carrier is an encoding and the authenticated mark
+  uses classical cryptography. See
+  [Cryptographic profile and quantum scope](#cryptographic-profile-and-quantum-scope).
 - **Certification.** This package is not a C2PA consortium release and carries no
   conformance certification.
 
