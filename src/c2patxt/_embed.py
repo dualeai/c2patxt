@@ -101,8 +101,10 @@ class EmbedContext:
     different output for identical input."""
 
     algorithm: str = DEFAULT_HASH_ALGORITHM
-    """Hash algorithm for the hard binding. 13.1 permits sha256, sha384 and sha512
-    and states implementations "shall not support additional algorithms"."""
+    """Hash algorithm for the hard binding and hashed assertion references. 13.1
+    permits sha256, sha384 and sha512 and states implementations "shall not support
+    additional algorithms". This does not select the claim-signature algorithm;
+    generation remains Ed25519."""
 
     def __post_init__(self) -> None:
         if self.manifest_uuid is not None and (
