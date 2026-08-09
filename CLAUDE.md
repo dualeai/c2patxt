@@ -57,6 +57,8 @@ If `seek` is missing:
 
 ## Writing
 
+When you talk to the user, always use ASD-STE100 Simplified Technical English.
+
 Six rules, from Orwell:
 
 1. Never use a metaphor, simile or figure of speech you are used to seeing in print.
