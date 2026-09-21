@@ -64,7 +64,7 @@ dev = [
     "pytest-xdist[psutil]~=3.8",
     "pytest~=9.0",
     "ruff~=0.16",
-    "twine~=6.0",
+    "twine>=6,<8",
     "vulture~=2.14",
 ]
 
